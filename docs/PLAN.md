@@ -264,7 +264,7 @@ Tables are created on startup with `create_all` + `CREATE EXTENSION IF NOT EXIST
 | `GROQ_API_KEY`, `FALLBACK_MODEL` | A Groq model that supports tool calling (check the Groq console) |
 | `SALES_API_KEY` | Sales endpoints + dashboard |
 | `CORS_ORIGINS` | Comma-separated, e.g. `http://localhost:5173` |
-| `KB_PATH` | Defaults to `data/kb/vantis_kb_v2.pdf`, resolved from the repo root. Ingestion only |
+| `KB_PATH` | Defaults to `data/kb/Vantis_Energy_Solutions_Knowledge_Base.pdf`, resolved from the repo root. Ingestion only |
 | `LOG_LEVEL` | `INFO` |
 | `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT` | Optional |
 
@@ -326,7 +326,7 @@ Rule: no extras until the current task's "Done when" passes.
 ---
 
 ## 7. Submission
-- **README sections (all 17):** Project Overview, Problem Statement, Features, Architecture, Tech Stack, Setup Instructions, Environment Variables, RAG Implementation, Agent Workflow, Tools / Function Calling, Database Design, API Documentation, Prompt Engineering, Testing, Deployment, Limitations, Future Improvements. Also list the assumptions (§8) and mark what is built vs future. Setup must tell reviewers to put their copy of the KB PDF at `data/kb/vantis_kb_v2.pdf` before running ingestion.
+- **README sections (all 17):** Project Overview, Problem Statement, Features, Architecture, Tech Stack, Setup Instructions, Environment Variables, RAG Implementation, Agent Workflow, Tools / Function Calling, Database Design, API Documentation, Prompt Engineering, Testing, Deployment, Limitations, Future Improvements. Also list the assumptions (§8) and mark what is built vs future. Setup must tell reviewers to put their copy of the KB PDF at `data/kb/Vantis_Energy_Solutions_Knowledge_Base.pdf` before running ingestion.
 - **Architecture diagram:** the Mermaid diagrams above, kept in `docs/ARCHITECTURE.md` and the README.
 - **Video (≤ 2:00):** 0:00–0:30 problem and solution · 0:30–1:15 demo script steps 1–3 + dashboard · 1:15–1:45 architecture diagram walk-through · 1:45–2:00 live URL + future work. Wake the server before recording.
 - **ZIP:** `git archive --format=zip -o vantis-sales-agent.zip HEAD`. It matches GitHub exactly and leaves out ignored files.

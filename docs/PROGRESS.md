@@ -25,3 +25,13 @@ Adithya pastes the newest entry to the reviewer (Claude chat) after every task.
 - Decisions: stack per PLAN §3; Gemini main + Groq fallback; Neon; Render + Vercel; mock WhatsApp skipped; KB PDF stays out of git (README says where to put it)
 - Open issues: check the submission form fields · check free-tier limits in the AI Studio and Groq consoles
 - Next: T1 Foundation
+
+## T1: Foundation (2026-10-10)
+- Status: done
+- Changed: backend/ skeleton (app/main.py, core/config|logging|db, api/health, scripts/list_models.py, tests/), requirements.txt, .env.example, .gitkeep files, PLAN.md KB path, CLAUDE.md commands
+- Tests: `cd backend && python -m pytest -q` → 5 passed, 0 failed, 0 skipped
+- Also ran: uvicorn + GET /api/health → {"status":"ok","db":"ok"}, startup log "pgvector extension ready"; `python -m scripts.list_models` → 45 chat, 3 embedding models
+- Prompt changes: none
+- Decisions: Python 3.12 venv; KB_PATH default is the original PDF name Vantis_Energy_Solutions_Knowledge_Base.pdf; stdlib JSON logging (no extra lib); health returns 200 "degraded" when DB is down
+- Open issues: pick LLM_MODEL_MAIN / LLM_MODEL_FAST / EMBEDDING_MODEL from list_models and check free-tier limits; EMBEDDING_DIM must match T3 vector column
+- Next: T2 Ingestion part 1
