@@ -2,7 +2,7 @@
 
 The single source of truth for what we build and why.
 Roles: Adithya owns the project. Claude (chat) reviews and writes the tasks. Claude Code builds.
-Last updated: 2026-10-10.
+Last updated: 2026-10-11.
 
 ---
 
@@ -183,13 +183,13 @@ Validation:
   - **Text format:** this model has no `task_type`, so the task goes in the text. Documents: `title: {title} | text: {content}`. Queries: `task: question answering | query: {question}`. The title has no `|` in it.
   - **One vector per text:** several strings passed in `contents` come back as ONE combined embedding. Each text is wrapped in its own `types.Content`, and the vector count is checked against the text count.
   - **Timeouts:** ingest uses 30 s and 2 retries. Query embedding on the chat path uses 10 s and 1 retry, so a failing query falls back to keyword search in about 22 s at worst.
-- **Keyword search:** Postgres `tsvector` (english) ranked with `ts_rank_cd`. The query is `plainto_tsquery` with the `&` between words replaced by `|`, because `websearch_to_tsquery` ANDs every word and a question like "Do you provide installation in Delhi?" would match nothing.
-- **Hybrid:** top 10 from each search → Reciprocal Rank Fusion (k = 60) → top 4.
-- **Relevance gate:** if the best vector similarity is below a threshold (tuned on the eval set) and there are no keyword hits, set `no_context`.
+- **Keyword search:** Postgres `tsvector` (english) ranked with `ts_rank_cd`. The query words are the stemmed words of the question (the same parser that built the stored `tsv`), joined with `|`, because an AND query for "Do you provide installation in Delhi?" would match nothing. `ts_rank_cd` has no IDF, so words found in more than 30% of the searchable chunks are dropped first (document frequency from `ts_stat`, loaded once and cached per process); if that would drop every word, the query is kept as it is.
+- **Hybrid:** top 10 from each search → Reciprocal Rank Fusion (k = 60, keyword list weight 0.5, vector list weight 1) → top 4.
+- **Relevance gate:** when a vector search ran, set `no_context` if the best similarity is below the threshold (0.63; KB questions scored 0.68 to 0.84, off-topic ones 0.49 to 0.58). Keyword hits count only in the keyword-only fallback, because generic words ("India", "list", "price") gave 3 of 8 off-topic questions keyword hits.
 - **Fallback:** if embedding fails, use keyword-only search and set `degraded`. Cache query embeddings (LRU) to save quota.
 - **Service areas:** ingestion parses the KB Section 10 rows into a `service_areas` table (city, region). A small alias map in code covers renamed cities (Gurgaon → Gurugram, Allahabad → Prayagraj, New Delhi → Delhi). `check_service_area` reads the table (cached).
 - **Citations:** each chunk is labelled `[KB Section 8: Product & Service Catalog]`. The API returns structured `sources` (section, title, page, snippet).
-- **Eval:** `data/eval/retrieval_eval.jsonl` (24 questions, already written). `scripts/eval_retrieval.py` prints hit@1, hit@3 and MRR for keyword-only, vector-only and hybrid, and writes `docs/EVAL.md`.
+- **Eval:** `data/eval/retrieval_eval.jsonl` (24 questions) and `data/eval/offtopic_eval.jsonl` (8 off-topic questions, for the gate). `scripts/eval_retrieval.py` prints hit@1, hit@3 and MRR for keyword-only, vector-only and hybrid plus the gate results, and writes `docs/EVAL.md` (T4 result: hybrid hit@3 22/24, MRR 0.907; the tuning notes in that file are hand-written and kept).
 
 ### 3.7 LLM access
 - One module, `app/core/llm.py`, exposes `fast_llm()`, `main_llm()` and `embedder()`. Everything else uses only these.

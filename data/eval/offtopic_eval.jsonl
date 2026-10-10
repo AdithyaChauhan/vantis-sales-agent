@@ -1,0 +1,8 @@
+{"id": "o01", "question": "What's the weather like in London today?", "note": "weather"}
+{"id": "o02", "question": "Who won the last India vs Australia cricket match?", "note": "cricket"}
+{"id": "o03", "question": "Can you give me a recipe for butter chicken?", "note": "recipe"}
+{"id": "o04", "question": "Write me a short poem about the ocean.", "note": "poem"}
+{"id": "o05", "question": "How do I reverse a list in Python?", "note": "coding help"}
+{"id": "o06", "question": "How old is Shah Rukh Khan?", "note": "celebrity"}
+{"id": "o07", "question": "What is the share price of Reliance today?", "note": "stock price"}
+{"id": "o08", "question": "Tell me a joke.", "note": "joke"}

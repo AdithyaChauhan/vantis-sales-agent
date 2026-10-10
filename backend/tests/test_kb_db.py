@@ -16,7 +16,7 @@ from app.rag.chunker import chunk_sections
 from app.rag.ingest import ingest_sections, write_kb
 from app.rag.models import KbChunk, ServiceArea
 from app.rag.pdf_parser import Line, Section, Table
-from app.rag.retriever import keyword_search, search, vector_search
+from app.rag.retriever import keyword_search, search, vector_search, word_doc_counts
 from app.services.service_areas import ServiceAreas
 
 DIM = get_settings().embedding_dim
@@ -139,6 +139,27 @@ def test_keyword_search_excludes_policy(kb):
 
 def test_keyword_search_with_only_stop_words_returns_nothing(kb):
     assert keyword_search(kb.engine, "what is the") == []
+
+
+def test_word_doc_counts_skip_the_policy_chunk(kb):
+    counts, total = word_doc_counts(kb.engine)
+    assert total == 4  # 5 chunks, one of them policy
+    assert counts["panel"] == 2  # solar and warranty chunks
+    assert counts["guarante"] == 1  # the policy chunk also says "guarantee" but is not counted
+    assert "invent" not in counts  # only the policy chunk has this word
+
+
+def test_common_words_are_dropped_from_the_keyword_query(kb):
+    # "panel" is in 2 of the 4 chunks (50%, above the 30% cutoff), so only "guarantee" is searched
+    assert [h.chunk_id for h in keyword_search(kb.engine, "panels guarantee")] == [WARRANTY]
+    # with filtering off, "panel" matches the solar chunk too
+    unfiltered = keyword_search(kb.engine, "panels guarantee", max_word_ratio=1.0)
+    assert {h.chunk_id for h in unfiltered} == {SOLAR, WARRANTY}
+
+
+def test_a_query_of_only_common_words_is_kept(kb):
+    hits = keyword_search(kb.engine, "panels")  # every word is common, so the query stays as it was
+    assert {h.chunk_id for h in hits} == {SOLAR, WARRANTY}
 
 
 def test_vector_ranking_and_similarity(kb):

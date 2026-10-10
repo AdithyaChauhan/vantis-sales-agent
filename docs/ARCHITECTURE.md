@@ -2,7 +2,7 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T3)
+## Backend modules (as of T4)
 | Module | Role |
 |---|---|
 | `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware, CORS, routers |
@@ -15,10 +15,11 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/rag/chunker.py` | `Chunk`, `chunk_sections()`: one chunk per table row (KB Sections 8-12) or FAQ item (15), prose split at ~1,200 chars, Sections 16-19 tagged `policy`; `embed_text()` = `title: ... \| text: ...` |
 | `app/rag/models.py` | `KbChunk` (`kb_chunks`: vector + generated tsvector with GIN index) and `ServiceArea` (`service_areas`, unique on city + region) |
 | `app/rag/ingest.py` | `python -m app.rag.ingest`: parse, chunk, embed all first, then replace all rows in ONE transaction; `--dry-run` prints chunks and touches no DB or key |
-| `app/rag/retriever.py` | `search(query, k, mode)`: keyword (OR'd `plainto_tsquery`, `ts_rank_cd`) + vector (cosine), RRF fusion (k = 60), relevance gate, keyword fallback with `degraded`; policy chunks never returned |
+| `app/rag/retriever.py` | `search(query, k, mode)`: keyword (stemmed words OR'd, words in more than 30% of chunks dropped, `ts_rank_cd`) + vector (cosine), RRF fusion (k = 60, keyword weight 0.5), relevance gate (similarity only when a vector search ran), keyword fallback with `degraded`; policy chunks never returned |
 | `app/services/service_areas.py` | `ServiceAreas.lookup(city, state)`: alias map + rapidfuzz (score 85); loads from the `service_areas` table (`get_service_areas()`, cached) |
 | `scripts/list_models.py` | Lists Gemini chat and embedding models for the key |
 | `scripts/search_kb.py` | Prints the mode, `no_context` and the top chunks with scores and ranks |
+| `scripts/eval_retrieval.py` | Embeds the 24 KB and 8 off-topic questions once, runs `search()` in all three modes (k = 10), prints hit@1, hit@3, MRR, the misses and the gate results, and writes `docs/EVAL.md` (its "Tuning notes" section is hand-written and kept) |
 
 ## Request flow
 ```mermaid
@@ -43,16 +44,28 @@ flowchart LR
   tx --> db[("kb_chunks + service_areas")]
 ```
 
-## Retrieval (T3)
+## Retrieval (T3, tuned in T4)
 ```mermaid
 flowchart LR
-  q["question"] --> kw["keyword search: top 10"]
+  q["question"] --> words["stemmed words"]
+  words --> filter["drop words found in more than 30% of chunks (stats cached)"]
+  filter --> kw["keyword search: top 10, OR query"]
   q --> emb["embed_query (10 s, 1 retry)"]
   emb --> vec["vector search: top 10"]
   emb -.->|"fails"| fb["keyword only, degraded = true"]
-  kw --> rrf["RRF fusion, top k"]
+  kw --> rrf["RRF fusion: keyword weight 0.5, vector 1, top k"]
   vec --> rrf
-  rrf --> gate["relevance gate: no_context"]
+  vec --> gate["relevance gate: best similarity below 0.63 means no_context"]
+  fb -.->|"keyword hits count"| gate
   kw --> db[("kb_chunks")]
   vec --> db
+```
+
+## Retrieval eval (T4)
+```mermaid
+flowchart LR
+  qs["24 KB + 8 off-topic questions"] --> embed["embed each once"]
+  embed --> run["search() in keyword, vector and hybrid mode, k = 10"]
+  run --> metrics["hit@1, hit@3, MRR, misses, gate counts"]
+  metrics --> md["docs/EVAL.md, hand-written notes kept"]
 ```

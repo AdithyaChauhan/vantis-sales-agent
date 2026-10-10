@@ -23,7 +23,8 @@ class Settings(BaseSettings):
     llm_model_fast: str = ""
     embedding_model: str = ""
     embedding_dim: int = 768
-    # Provisional relevance gate (T3: KB questions scored 0.73-0.78, off-topic 0.51-0.54). T4 tunes it.
+    # Relevance gate, checked in T4 (docs/EVAL.md): best similarity was 0.68-0.84 for the 24 KB
+    # questions and 0.49-0.58 for the 8 off-topic ones, so 0.63 sits in the gap.
     retrieval_min_similarity: float = 0.63
 
     groq_api_key: str = ""

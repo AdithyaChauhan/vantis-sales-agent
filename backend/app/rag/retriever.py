@@ -4,6 +4,7 @@ Policy chunks (KB Sections 16-19) are instructions for the assistant, so they ar
 """
 import logging
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Engine, bindparam, text
@@ -17,16 +18,26 @@ logger = logging.getLogger(__name__)
 MODES = ("hybrid", "keyword", "vector")
 CANDIDATES = 10  # how many hits each search contributes before fusion
 RRF_K = 60
+# Tuned in T4 on the 24 eval questions (docs/EVAL.md):
+KEYWORD_WEIGHT = 0.5  # in RRF the keyword list counts half as much as the vector list
+COMMON_WORD_RATIO = 0.30  # keyword search drops query words found in more than 30% of the chunks
 
 _COLUMNS = "chunk_id, section_no, section_title, page, chunk_type, content"
 
-# plainto_tsquery ANDs every word ("Do you provide installation in Delhi?" would match nothing),
-# so the ' & ' between terms is replaced by ' | '. Stop words are dropped by the 'english' config.
+# The question as stemmed words, from the same parser that built kb_chunks.tsv. Stop words are gone.
+_QUERY_WORDS_SQL = text("SELECT tsvector_to_array(to_tsvector('english', CAST(:q AS text)))")
+
+# How many searchable chunks contain each stemmed word (ndoc), and how many chunks there are.
+_WORD_STATS_SQL = text(
+    "SELECT word, ndoc FROM ts_stat('SELECT tsv FROM kb_chunks WHERE chunk_type <> ''policy''')"
+)
+_CHUNK_COUNT_SQL = text("SELECT count(*) FROM kb_chunks WHERE chunk_type <> 'policy'")
+
+# :tsq is a ready-made OR query such as 'provid' | 'delhi' (see or_query). A plain AND query would
+# match nothing for a question like "Do you provide installation in Delhi?".
 _KEYWORD_SQL = text(
     f"""
-    WITH q AS (
-        SELECT CAST(replace(plainto_tsquery('english', :q)::text, ' & ', ' | ') AS tsquery) AS tsq
-    )
+    WITH q AS (SELECT CAST(:tsq AS tsquery) AS tsq)
     SELECT {_COLUMNS}, ts_rank_cd(tsv, tsq) AS score
     FROM kb_chunks, q
     WHERE tsv @@ tsq AND chunk_type <> 'policy'
@@ -74,18 +85,22 @@ class SearchResult:
 
 
 def rrf_fuse(
-    keyword: list[RetrievedChunk], vector: list[RetrievedChunk], k: int = RRF_K
+    keyword: list[RetrievedChunk],
+    vector: list[RetrievedChunk],
+    k: int = RRF_K,
+    keyword_weight: float = KEYWORD_WEIGHT,
 ) -> list[RetrievedChunk]:
-    """Reciprocal Rank Fusion: score = sum of 1 / (k + rank) over the lists a chunk appears in.
+    """Reciprocal Rank Fusion: score = sum of weight / (k + rank) over the lists a chunk appears in.
 
-    Ranks start at 1 (the position in each list). Inputs are not changed.
-    Ties are broken by chunk_id so the order is stable.
+    Ranks start at 1 (the position in each list). The vector list has weight 1 and the keyword list
+    has `keyword_weight`, because on this KB vector search is the stronger of the two (docs/EVAL.md).
+    Inputs are not changed. Ties are broken by chunk_id so the order is stable.
     """
     merged: dict[str, RetrievedChunk] = {}
     for rank, hit in enumerate(keyword, start=1):
         entry = merged.setdefault(hit.chunk_id, replace(hit, rrf_score=0.0))
         entry.keyword_rank, entry.keyword_score = rank, hit.keyword_score
-        entry.rrf_score += 1 / (k + rank)
+        entry.rrf_score += keyword_weight / (k + rank)
     for rank, hit in enumerate(vector, start=1):
         entry = merged.setdefault(hit.chunk_id, replace(hit, rrf_score=0.0))
         entry.vector_rank, entry.similarity = rank, hit.similarity
@@ -94,16 +109,67 @@ def rrf_fuse(
 
 
 def has_context(best_similarity: float | None, keyword_hits: int, min_similarity: float) -> bool:
-    """Relevance gate: there is context if any keyword matched or the best similarity is high enough."""
-    if keyword_hits > 0:
-        return True
-    return best_similarity is not None and best_similarity >= min_similarity
+    """Relevance gate.
+
+    When a vector search ran, only its best similarity counts: generic words ("price", "India", "list")
+    give off-topic questions keyword hits (3 of 8 in the T4 eval). Keyword hits count only when there
+    is no similarity, which is the keyword-only fallback.
+    """
+    if best_similarity is None:
+        return keyword_hits > 0
+    return best_similarity >= min_similarity
 
 
-def keyword_search(engine: Engine, query: str, limit: int = CANDIDATES) -> list[RetrievedChunk]:
-    """Top chunks by ts_rank_cd, matching ANY of the query words."""
+def drop_common_words(
+    words: list[str], doc_counts: dict[str, int], total: int, max_ratio: float
+) -> list[str]:
+    """Remove words found in more than max_ratio of the chunks (ts_rank_cd has no IDF).
+
+    If that would remove every word, or the chunk total is unknown, the words are returned as they are.
+    Words missing from doc_counts appear in no chunk, so they are kept.
+    """
+    if total <= 0:
+        return list(words)
+    kept = [w for w in words if doc_counts.get(w, 0) / total <= max_ratio]
+    return kept or list(words)
+
+
+def or_query(words: list[str]) -> str:
+    """tsquery text matching any word: 'provid' | 'delhi'. Quotes and backslashes are escaped."""
+    quoted = ("'" + w.replace("\\", "\\\\").replace("'", "''") + "'" for w in words)
+    return " | ".join(quoted)
+
+
+@lru_cache
+def word_doc_counts(engine: Engine) -> tuple[dict[str, int], int]:
+    """(chunks containing each stemmed word, number of searchable chunks), read from Postgres.
+
+    Cached per engine until the server restarts, so run it again after a re-ingest.
+    """
     with engine.connect() as conn:
-        rows = conn.execute(_KEYWORD_SQL, {"q": query, "limit": limit}).mappings().all()
+        counts = {row.word: row.ndoc for row in conn.execute(_WORD_STATS_SQL)}
+        total = conn.execute(_CHUNK_COUNT_SQL).scalar_one()
+    return counts, int(total)
+
+
+def keyword_search(
+    engine: Engine,
+    query: str,
+    limit: int = CANDIDATES,
+    max_word_ratio: float = COMMON_WORD_RATIO,
+) -> list[RetrievedChunk]:
+    """Top chunks by ts_rank_cd, matching ANY of the query words.
+
+    Words found in more than max_word_ratio of the chunks are dropped first (1.0 keeps them all),
+    so a rare word like "Delhi" is not outweighed by common ones like "installation".
+    """
+    counts, total = word_doc_counts(engine)
+    with engine.connect() as conn:
+        words = conn.execute(_QUERY_WORDS_SQL, {"q": query}).scalar_one()
+        words = drop_common_words(words, counts, total, max_word_ratio)
+        if not words:  # the question was only stop words
+            return []
+        rows = conn.execute(_KEYWORD_SQL, {"tsq": or_query(words), "limit": limit}).mappings().all()
     return [
         RetrievedChunk(**_chunk_fields(row), keyword_rank=rank, keyword_score=float(row["score"]))
         for rank, row in enumerate(rows, start=1)
@@ -147,6 +213,7 @@ def search(
     """Find the top k KB chunks for a question.
 
     If embedding the query fails, falls back to keyword-only and sets degraded=True (no raise).
+    no_context comes from has_context: with a vector search only the best similarity counts.
     Chunks are returned even when no_context is True, so callers can see the near misses;
     the answering code must check no_context. Database errors are not caught here.
     """
