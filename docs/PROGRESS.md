@@ -46,3 +46,13 @@ Adithya pastes the newest entry to the reviewer (Claude chat) after every task.
 - Open issues: none (service-area lookup reads the PDF for now; T3 moves it to the DB table)
 - Next: T3 Embeddings, tables, hybrid retriever
 
+
+## T3: Embeddings, tables, full ingest, hybrid retriever (2026-10-11)
+- Status: done
+- Changed: app/core/llm.py (embedder), app/rag/models.py (kb_chunks, service_areas), retriever.py, ingest.py (full run), service_areas.py (reads the table), health (kb_chunks), scripts/search_kb.py, 4 new test files, pgvector 0.5.1 pinned (Vector column type, binds lists), PLAN.md 3.6/3.7, .env.example
+- Tests: `cd backend && python -m pytest -q` → 77 passed, 0 failed; `python -m pytest -m live` → 1 passed
+- Also ran: probe (2 texts → 2 vectors of 768); `python -m app.rag.ingest` once → 52 chunks, 19 service-area rows, doc_version fb9fc76a08fe; `search_kb "Is there a guarantee on the panels?"` → KB Section 11 is #1; "Do you provide installation in Delhi?" → KB Section 10 is only #4 (Sections 6, 1, 15 above it); GET /api/health → kb_chunks 52; --dry-run still 52 chunks with no DB or key
+- Prompt changes: none
+- Decisions: models gemini-3.5-flash-lite (main), gemini-3.1-flash-lite (fast), gemini-embedding-2 at 768 dims, openai/gpt-oss-120b fallback (from T5). Free tier: Gemini Flash only 20 req/day; the two Flash-Lite models 15/min and 500/day each (separate quotas); embedding 100/min, 30K tokens/min, 1,000/day; Groq 30/min, 1,000/day, 8K tokens/min. One Content per text (else one merged vector). Query embedding 10 s + 1 retry, ingest 30 s + 2 retries. All DB write functions take the engine as an argument; test_engine skips if it equals DATABASE_URL. Gate threshold 0.63 (KB questions 0.73-0.78, off-topic 0.51-0.54, off-topic had 0 keyword hits)
+- Open issues: OR'd keyword search lets generic words ("provide", "installation") match 10 chunks and push Section 10 to #4 for the Delhi question; T4 to tune. Retriever returns chunks even when no_context is true, so T5 must check the flag
+- Next: T4 Retrieval eval script + docs/EVAL.md

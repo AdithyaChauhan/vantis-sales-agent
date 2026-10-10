@@ -40,7 +40,8 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - Tests: `cd backend && python -m pytest -q` (real-LLM tests: `python -m pytest -m live`)
 - List Gemini models: `cd backend && python -m scripts.list_models`
 - Ingest KB dry run (parse and print chunks, no DB): `cd backend && python -m app.rag.ingest --dry-run`
-- Ingest KB (writes to the DB, from T3): `cd backend && python -m app.rag.ingest`
+- Ingest KB (embeds, then replaces the KB rows in one transaction): `cd backend && python -m app.rag.ingest`
+- Search the KB: `cd backend && python -m scripts.search_kb "question" [--mode keyword|vector|hybrid]`
 - Retrieval eval: `cd backend && python -m scripts.eval_retrieval`
 - Frontend: `cd frontend && npm run dev`
 These commands appear as their tasks get built. Keep this list in sync.

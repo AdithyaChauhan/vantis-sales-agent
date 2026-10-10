@@ -5,9 +5,12 @@ from functools import lru_cache
 from pathlib import Path
 
 from rapidfuzz import fuzz, process
+from sqlalchemy import Engine, select
+from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
-from app.rag.pdf_parser import parse_kb, table_dicts
+from app.core.db import get_engine
+from app.rag.models import ServiceArea
+from app.rag.pdf_parser import Section, parse_kb, table_dicts
 
 SOURCE = "KB Section 10"
 FUZZY_MIN_SCORE = 85
@@ -51,10 +54,33 @@ class ServiceAreas:
         return cls(city_regions)
 
     @classmethod
+    def from_sections(cls, sections: list[Section]) -> "ServiceAreas":
+        """Build from the Section 10 table of already-parsed KB sections."""
+        section = next((s for s in sections if s.number == 10), None)
+        if section is None:
+            raise ValueError("KB Section 10 (service areas) was not found in the parsed KB")
+        return cls.from_rows([row for table in section.tables for row in table_dicts(table)])
+
+    @classmethod
     def from_kb(cls, path: Path) -> "ServiceAreas":
         """Parse the KB PDF and build from its Section 10 table."""
-        section = next(s for s in parse_kb(path) if s.number == 10)
-        return cls.from_rows([row for table in section.tables for row in table_dicts(table)])
+        return cls.from_sections(parse_kb(path))
+
+    @classmethod
+    def from_db(cls, engine: Engine) -> "ServiceAreas":
+        """Build from the service_areas table, in the order the rows were written."""
+        with Session(engine) as session:
+            found = session.execute(
+                select(ServiceArea.city, ServiceArea.region).order_by(ServiceArea.id)
+            ).all()
+        city_regions: dict[str, list[str]] = {}
+        for city, region in found:
+            city_regions.setdefault(city, []).append(region)
+        return cls(city_regions)
+
+    def rows(self) -> list[tuple[str, str]]:
+        """Every (city, region) pair, the shape stored in the service_areas table."""
+        return [(city, region) for city, regions in self.city_regions.items() for region in regions]
 
     @property
     def cities(self) -> list[str]:
@@ -92,5 +118,14 @@ class ServiceAreas:
 
 @lru_cache
 def get_service_areas() -> ServiceAreas:
-    """Cached lookup built from the KB PDF. T3 will read the database table instead."""
-    return ServiceAreas.from_kb(get_settings().kb_file)
+    """Cached lookup built from the service_areas table, so the server never needs the PDF.
+
+    Raises RuntimeError (not cached) if the database is not set up or ingest has not run.
+    """
+    engine = get_engine()
+    if engine is None:
+        raise RuntimeError("DATABASE_URL is not set; cannot load service areas")
+    areas = ServiceAreas.from_db(engine)
+    if not areas.cities:
+        raise RuntimeError("service_areas table is empty; run python -m app.rag.ingest")
+    return areas

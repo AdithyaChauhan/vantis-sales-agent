@@ -99,8 +99,15 @@ def test_chunk_ids_unique_and_stable(chunks):
 def test_embed_text_has_header(chunks):
     chunk = next(c for c in chunks if c.chunk_id == "s08-vantis-homepro-5")
     text = chunk.embed_text()
-    assert text.startswith("Vantis KB Section 8: Product & Service Catalog | Vantis HomePro 5 | ")
+    assert text.startswith(
+        "title: KB Section 8: Product & Service Catalog - Vantis HomePro 5 | text: "
+    )
     assert "5 kW rooftop solution" in text
+
+
+def test_embed_title_has_no_pipe(chunks):
+    for chunk in chunks:
+        assert "|" not in chunk.embed_title()
 
 
 def test_prose_paragraphs_are_joined(chunks):

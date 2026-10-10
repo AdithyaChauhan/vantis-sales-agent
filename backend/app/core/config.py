@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     llm_model_fast: str = ""
     embedding_model: str = ""
     embedding_dim: int = 768
+    # Provisional relevance gate (T3: KB questions scored 0.73-0.78, off-topic 0.51-0.54). T4 tunes it.
+    retrieval_min_similarity: float = 0.63
 
     groq_api_key: str = ""
     fallback_model: str = ""

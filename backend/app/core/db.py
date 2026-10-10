@@ -3,10 +3,15 @@ import logging
 from functools import lru_cache
 
 from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+class Base(DeclarativeBase):
+    """Base class for all tables."""
 
 
 @lru_cache
@@ -34,13 +39,19 @@ def check_db(engine: Engine | None) -> bool:
 
 
 def init_db(engine: Engine | None) -> None:
-    """Enable pgvector. Logs and returns on failure so startup never crashes."""
+    """Enable pgvector and create missing tables on the given engine.
+
+    Logs and returns on failure so startup never crashes. Existing tables are left as they are.
+    """
     if engine is None:
         logger.warning("DATABASE_URL not set; skipping db init")
         return
     try:
+        import app.rag.models  # noqa: F401  (registers the tables on Base)
+
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        logger.info("db init ok: pgvector extension ready")
+        Base.metadata.create_all(engine)
+        logger.info("db init ok: pgvector extension and tables ready")
     except Exception as exc:
         logger.error("db init failed: %s", type(exc).__name__)

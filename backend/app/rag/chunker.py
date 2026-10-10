@@ -23,14 +23,17 @@ class Chunk:
     content: str
     metadata: dict = field(default_factory=dict)
 
-    def embed_text(self) -> str:
-        """Text to embed: a short header with the section and row label, then the content."""
-        parts = [f"Vantis KB Section {self.section_no}: {self.section_title}"]
+    def embed_title(self) -> str:
+        """Title for the embedding text: the section, plus the row or question label. No '|'."""
+        title = f"KB Section {self.section_no}: {self.section_title}"
         label = self.metadata.get("label")
         if label:
-            parts.append(label)
-        parts.append(self.content)
-        return " | ".join(parts)
+            title += f" - {label}"
+        return title.replace("|", "/")
+
+    def embed_text(self) -> str:
+        """Text to embed, in the document format gemini-embedding-2 expects."""
+        return f"title: {self.embed_title()} | text: {self.content}"
 
 
 def slugify(text: str, max_chars: int = MAX_SLUG_CHARS) -> str:

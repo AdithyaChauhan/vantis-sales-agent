@@ -35,9 +35,14 @@ def unreachable_engine():
 
 @pytest.fixture
 def test_engine():
-    """Engine for TEST_DATABASE_URL; skips the test when it is not set."""
+    """Engine for TEST_DATABASE_URL; skips the test when it is not set.
+
+    Also skips if it points at the same database as DATABASE_URL, so tests never write to it.
+    """
     settings = get_settings()
     if not settings.test_database_url:
         pytest.skip("TEST_DATABASE_URL not set")
+    if to_sqlalchemy_url(settings.test_database_url) == settings.sqlalchemy_database_url:
+        pytest.skip("TEST_DATABASE_URL is the same as DATABASE_URL; refusing to run DB tests")
     url = to_sqlalchemy_url(settings.test_database_url)
     return create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})

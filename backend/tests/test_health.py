@@ -5,21 +5,24 @@ def test_health_ok_with_reachable_db(client, use_engine, test_engine):
     use_engine(test_engine)
     response = client.get("/api/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok"}
+    body = response.json()
+    assert (body["status"], body["db"]) == ("ok", "ok")
+    # kb_chunks is a row count, or null if the test database has no kb_chunks table yet
+    assert body["kb_chunks"] is None or isinstance(body["kb_chunks"], int)
 
 
 def test_health_degraded_when_db_unreachable(client, use_engine, unreachable_engine):
     use_engine(unreachable_engine)
     response = client.get("/api/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "degraded", "db": "error"}
+    assert response.json() == {"status": "degraded", "db": "error", "kb_chunks": None}
 
 
 def test_health_degraded_when_db_not_configured(client, use_engine):
     use_engine(None)
     response = client.get("/api/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "degraded", "db": "error"}
+    assert response.json() == {"status": "degraded", "db": "error", "kb_chunks": None}
 
 
 def test_init_db_survives_unreachable_db(unreachable_engine):

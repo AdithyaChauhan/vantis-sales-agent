@@ -177,9 +177,13 @@ Validation:
   - prose: one chunk per section, split above ~1,200 characters at paragraph boundaries
 - **Chunk record:** `chunk_id` (stable, e.g. `s08-homepro-5`), `section_no`, `section_title`, `page`, `chunk_type (prose|table_row|faq|policy)`, `content`, `metadata`, `embedding`, `tsv`, `doc_version`.
 - **Policy sections:** KB Sections 16–19 are instructions for the assistant, not customer facts. Tag them `policy` and exclude them from customer-answer retrieval. They shape the system prompt and the tests instead.
-- **Contextual header:** embed the text with a short prefix, e.g. "Vantis KB Section 8: Product & Service Catalog | Vantis HomePro 5 | …". This helps small chunks match.
-- **Embeddings:** the Gemini embedding model from env. Use the document/query task types if supported. Use 768 dimensions if the size is configurable; otherwise use the model default. With ~60 chunks, exact search is fast enough, so no vector index is needed.
-- **Keyword search:** Postgres `tsvector` (english) + `websearch_to_tsquery`, ranked with `ts_rank_cd`.
+- **Contextual header:** embed the text with a short title, e.g. "title: KB Section 8: Product & Service Catalog - Vantis HomePro 5 | text: …". This helps small chunks match.
+- **Embeddings:** the Gemini embedding model from env. Use 768 dimensions if the size is configurable; otherwise use the model default. With ~60 chunks, exact search is fast enough, so no vector index is needed.
+  - **Model choice (T3):** `gemini-embedding-2`, 768 dimensions. Free tier: 100 requests/min, 30K tokens/min, 1,000/day. A full ingest is 3 calls.
+  - **Text format:** this model has no `task_type`, so the task goes in the text. Documents: `title: {title} | text: {content}`. Queries: `task: question answering | query: {question}`. The title has no `|` in it.
+  - **One vector per text:** several strings passed in `contents` come back as ONE combined embedding. Each text is wrapped in its own `types.Content`, and the vector count is checked against the text count.
+  - **Timeouts:** ingest uses 30 s and 2 retries. Query embedding on the chat path uses 10 s and 1 retry, so a failing query falls back to keyword search in about 22 s at worst.
+- **Keyword search:** Postgres `tsvector` (english) ranked with `ts_rank_cd`. The query is `plainto_tsquery` with the `&` between words replaced by `|`, because `websearch_to_tsquery` ANDs every word and a question like "Do you provide installation in Delhi?" would match nothing.
 - **Hybrid:** top 10 from each search → Reciprocal Rank Fusion (k = 60) → top 4.
 - **Relevance gate:** if the best vector similarity is below a threshold (tuned on the eval set) and there are no keyword hits, set `no_context`.
 - **Fallback:** if embedding fails, use keyword-only search and set `degraded`. Cache query embeddings (LRU) to save quota.
@@ -191,6 +195,8 @@ Validation:
 - One module, `app/core/llm.py`, exposes `fast_llm()`, `main_llm()` and `embedder()`. Everything else uses only these.
 - Timeout 30 s, 2 retries with backoff, then fall back to Groq (LangChain `.with_fallbacks`, built separately for `bind_tools` and `with_structured_output`). Record which provider answered in `steps` and the logs.
 - Model names come only from env. `scripts/list_models.py` lists what the key can use.
+- **Model choice and free-tier limits** (checked in AI Studio and the Groq docs): every Gemini Flash model allows only 20 requests/day, so the agent uses the Flash-Lite models. `LLM_MODEL_MAIN=gemini-3.5-flash-lite` and `LLM_MODEL_FAST=gemini-3.1-flash-lite` each allow 15/min and 500/day, with a separate quota per model. `EMBEDDING_MODEL=gemini-embedding-2` allows 100/min, 30K tokens/min, 1,000/day. The Groq fallback `FALLBACK_MODEL=openai/gpt-oss-120b` allows 30/min, 1,000/day, 8K tokens/min (used from T5).
+- T3 builds `embedder()` only, with the `google-genai` SDK directly. T5 adds `fast_llm()` and `main_llm()`.
 - Tests swap in a fake through this module and never call a real LLM (except tests marked `live`).
 
 ### 3.8 Memory
