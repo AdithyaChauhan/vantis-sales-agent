@@ -1,0 +1,24 @@
+{"id": "q01", "question": "What solar systems do you provide?", "expected_sections": ["8", "9"], "note": "assignment example"}
+{"id": "q02", "question": "How much does a 5kW system cost?", "expected_sections": ["5", "15"], "note": "assignment example"}
+{"id": "q03", "question": "Do you provide installation in Delhi?", "expected_sections": ["10"], "note": "assignment example"}
+{"id": "q04", "question": "What is your installation process?", "expected_sections": ["6"], "note": "assignment example"}
+{"id": "q05", "question": "What warranty do you provide?", "expected_sections": ["11", "15"], "note": "assignment example"}
+{"id": "q06", "question": "Tell me about the HomePro 5 package.", "expected_sections": ["8", "9"], "note": "product"}
+{"id": "q07", "question": "Which package is meant for a small shop or office?", "expected_sections": ["8", "9"], "note": "product"}
+{"id": "q08", "question": "Do you serve customers in Kota?", "expected_sections": ["10"], "note": "listed city"}
+{"id": "q09", "question": "Can you install solar panels in Pune?", "expected_sections": ["10", "7"], "note": "unlisted city rule"}
+{"id": "q10", "question": "How long will the installation take?", "expected_sections": ["6", "15"], "note": "timeline"}
+{"id": "q11", "question": "Will I get a government subsidy?", "expected_sections": ["13", "15"], "note": "subsidy"}
+{"id": "q12", "question": "Do you offer EMI or financing?", "expected_sections": ["13", "15"], "note": "financing"}
+{"id": "q13", "question": "My inverter has stopped working. What should I do?", "expected_sections": ["12", "11"], "note": "support"}
+{"id": "q14", "question": "Do you provide maintenance after installation?", "expected_sections": ["15", "8", "11", "12"], "note": "support"}
+{"id": "q15", "question": "How much money will I save on my electricity bill?", "expected_sections": ["15"], "note": "savings"}
+{"id": "q16", "question": "What details do you need from me to prepare a quote?", "expected_sections": ["14", "15"], "note": "lead info"}
+{"id": "q17", "question": "Do you work with clinics and small offices?", "expected_sections": ["2", "8"], "note": "segments"}
+{"id": "q18", "question": "What happens during a site assessment?", "expected_sections": ["6", "8"], "note": "process"}
+{"id": "q19", "question": "How many years is the warranty on solar panels?", "expected_sections": ["11", "15"], "note": "warranty"}
+{"id": "q20", "question": "What does Vantis Energy Solutions do?", "expected_sections": ["1", "15"], "note": "company"}
+{"id": "q21", "question": "Is there a guarantee on the panels?", "expected_sections": ["11", "15"], "note": "paraphrase of warranty"}
+{"id": "q22", "question": "Do you install in Gurgaon?", "expected_sections": ["10"], "note": "old city name"}
+{"id": "q23", "question": "Can you recommend the right system size for my home?", "expected_sections": ["3", "9", "15"], "note": "sizing"}
+{"id": "q24", "question": "What does Vantis Care cover?", "expected_sections": ["8", "11"], "note": "product"}

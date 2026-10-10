@@ -1,0 +1,38 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Node
+node_modules/
+frontend/dist/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code personal settings
+.claude/settings.local.json
+
+# Assessment material: never commit the assignment PDF
+*Assignment*.pdf
+
+# Vantis KB PDF: assessment material, kept out of the repo.
+# The README tells reviewers where to put their own copy.
+data/kb/*.pdf
+
+# Submission zip and other build outputs
+*.zip
