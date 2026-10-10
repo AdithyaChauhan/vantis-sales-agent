@@ -39,7 +39,8 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - API: `cd backend && uvicorn app.main:app --reload --port 8000`
 - Tests: `cd backend && python -m pytest -q` (real-LLM tests: `python -m pytest -m live`)
 - List Gemini models: `cd backend && python -m scripts.list_models`
-- Ingest KB: `cd backend && python -m app.rag.ingest`
+- Ingest KB dry run (parse and print chunks, no DB): `cd backend && python -m app.rag.ingest --dry-run`
+- Ingest KB (writes to the DB, from T3): `cd backend && python -m app.rag.ingest`
 - Retrieval eval: `cd backend && python -m scripts.eval_retrieval`
 - Frontend: `cd frontend && npm run dev`
 These commands appear as their tasks get built. Keep this list in sync.

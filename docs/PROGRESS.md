@@ -22,7 +22,7 @@ Adithya pastes the newest entry to the reviewer (Claude chat) after every task.
 - Status: done
 - Changed: CLAUDE.md, docs/PLAN.md, docs/PROGRESS.md, .claude/settings.json, .claude/skills/handoff/SKILL.md, data/eval/retrieval_eval.jsonl, .gitignore, .gitattributes
 - Tests: none (no code yet)
-- Decisions: stack per PLAN §3; Gemini main + Groq fallback; Neon; Render + Vercel; mock WhatsApp skipped; KB PDF stays out of git (README says where to put it)
+- Decisions: stack per PLAN.md part 3; Gemini main + Groq fallback; Neon; Render + Vercel; mock WhatsApp skipped; KB PDF stays out of git (README says where to put it)
 - Open issues: check the submission form fields · check free-tier limits in the AI Studio and Groq consoles
 - Next: T1 Foundation
 
@@ -35,3 +35,14 @@ Adithya pastes the newest entry to the reviewer (Claude chat) after every task.
 - Decisions: Python 3.12 venv; KB_PATH default is the original PDF name Vantis_Energy_Solutions_Knowledge_Base.pdf; stdlib JSON logging (no extra lib); health returns 200 "degraded" when DB is down
 - Open issues: pick LLM_MODEL_MAIN / LLM_MODEL_FAST / EMBEDDING_MODEL from list_models and check free-tier limits; EMBEDDING_DIM must match T3 vector column
 - Next: T2 Ingestion part 1
+
+## T2: Ingestion part 1 (2026-10-10)
+- Status: done
+- Changed: app/rag/ (pdf_parser, chunker, ingest), app/services/service_areas.py, 3 test files, requirements.txt (pdfplumber 0.11.10, rapidfuzz 3.14.6), docs (no section sign; citation format [KB Section N: Title]), CLAUDE.md commands
+- Tests: `cd backend && python -m pytest -q` → 37 passed, 0 failed, 0 skipped (with the PDF absent: 14 passed, 19 skipped)
+- Also ran: `python -m app.rag.ingest --dry-run` → 19 sections, 52 chunks (prose 11, table_row 26, faq 11, policy 4); KB Section 8: 7 rows + 1 prose, 9: 5, 10: 5 + 1 prose, 11: 5, 12: 4, 15: 11 faq, 16-19: 1 policy each, 1-7 and 13-14: 1 prose each; missing PDF → clear message, exit 1
+- Prompt changes: none
+- Decisions: PDF quirks fixed in the parser (bullet shown as "(cid:127)", arrow extracted as "fi"); rapidfuzz `ratio` scorer (not WRatio) to avoid partial-match false positives; alias target must be in the KB list; state only narrows regions
+- Open issues: none (service-area lookup reads the PDF for now; T3 moves it to the DB table)
+- Next: T3 Embeddings, tables, hybrid retriever
+

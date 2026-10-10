@@ -16,27 +16,27 @@ Last updated: 2026-10-10.
 
 ## 1. Requirements checklist (from the assignment PDF)
 
-| PDF § | Requirement | Where we cover it |
+| PDF Section | Requirement | Where we cover it |
 |---|---|---|
 | 4A | Chat assistant answering Vantis questions from the KB (their 5 example questions) | `/api/chat` + chat page; all 5 are in the eval set |
-| 4B | RAG: processing, chunking, embeddings, vector store, retrieval, context, generation; no invented facts | §3.6 |
+| 4B | RAG: processing, chunking, embeddings, vector store, retrieval, context, generation; no invented facts | part 3.6 |
 | 4C | Source attribution | `sources[]` in `/api/chat`; source chips in the UI |
 | 4D | Lead detection + natural collection (name, phone, email, location, property type, requirement, usage/bill, timeline, other) | `understand` node + agent prompt |
-| 4E | Qualification: score + HOT/WARM/COLD + reason + recommended action, logic documented | §3.4 |
-| 4F | Agentic workflow driven by conversation state | LangGraph graph, §3.1 |
-| 4G | 2+ tools the agent decides to call | 6 tools, §3.2 |
-| 4H | Lead DB with structured fields + timestamps | `leads` table, §3.10 |
+| 4E | Qualification: score + HOT/WARM/COLD + reason + recommended action, logic documented | part 3.4 |
+| 4F | Agentic workflow driven by conversation state | LangGraph graph, part 3.1 |
+| 4G | 2+ tools the agent decides to call | 6 tools, part 3.2 |
+| 4H | Lead DB with structured fields + timestamps | `leads` table, part 3.10 |
 | 4I | Sales dashboard | dashboard page |
-| 4J | Organized, documented API (/chat, /leads, /leads/{id}, /callback, /health) | FastAPI + `/docs`, §3.9 |
+| 4J | Organized, documented API (/chat, /leads, /leads/{id}, /callback, /health) | FastAPI + `/docs`, part 3.9 |
 | 5 | `/prompts` folder with real prompts + purpose + iterations | `prompts/` + `prompts/README.md` |
 | 7 | Frontend: customer chat + sales lead view | React app |
-| 8 | Missing, unknown and invalid info; LLM/API/DB failures | §3.11 |
+| 8 | Missing, unknown and invalid info; LLM/API/DB failures | part 3.11 |
 | 9, 10 | Explain stack and architecture: LLM, RAG, embeddings, vector DB, agent, tools, DB, memory | README + `docs/ARCHITECTURE.md` |
-| 11 | Tests: retrieval, chat, extraction, qualification, tools, API | §5 |
-| 12 | Deployment (optional), URL in README | Render + Vercel, §6 |
-| 13 | Deliverables: repo, ZIP, prompts, README, diagram, video ≤ 2 min | §7 |
-| 14 | README with 17 sections | §7 |
-| 18 | No secrets, `.env.example`, local run docs, assumptions, built vs future, KB as source | CLAUDE.md + §7 |
+| 11 | Tests: retrieval, chat, extraction, qualification, tools, API | part 5 |
+| 12 | Deployment (optional), URL in README | Render + Vercel, part 6 |
+| 13 | Deliverables: repo, ZIP, prompts, README, diagram, video ≤ 2 min | part 7 |
+| 14 | README with 17 sections | part 7 |
+| 18 | No secrets, `.env.example`, local run docs, assumptions, built vs future, KB as source | CLAUDE.md + part 7 |
 
 Extra credit we go for: Docker, API-key auth, evaluation numbers, observability (steps panel, structured logs, optional LangSmith), strong tests, careful error handling, clean UI.
 Skipped on purpose: mock WhatsApp (optional in the PDF), streaming.
@@ -51,20 +51,20 @@ Skipped on purpose: mock WhatsApp (optional in the PDF), streaming.
 
 ### Flows
 - **F1 Knowledge question.** Answer from the KB with sources. If the KB doesn't cover it, say so plainly and offer a sales follow-up.
-- **F2 Buying intent.** First answer any question in the message. Then ask for 1–2 missing details per turn, in this order: location → requirement (size, bill or usage) → timeline → name → phone or email → property details. Once the minimum fields are present (§3.4), create the lead, describe the next step without promises, and offer a callback.
+- **F2 Buying intent.** First answer any question in the message. Then ask for 1–2 missing details per turn, in this order: location → requirement (size, bill or usage) → timeline → name → phone or email → property details. Once the minimum fields are present (part 3.4), create the lead, describe the next step without promises, and offer a callback.
 - **F3 Callback.** Requires a lead. Save the request with status `requested`. Reply: "I've logged a callback request for <time>; our team will confirm." Never say it is booked.
 - **F4 Existing customer issue** (e.g. inverter fault). Collect name, contact, project details and the issue, then create a support request and share its id. This is not a sales lead.
 - **F5 Off-topic or prompt injection.** Give a short, polite redirect. The rules don't change.
 - **F6 Sales rep.** Dashboard list (filter by status, sort by score or newest). Lead detail shows all fields, the score breakdown, reason, recommended action and callbacks.
 
 ### Rules from the KB (they drive prompts and tests)
-- **Never invent** (KB §16): exact price, savings, subsidy amount or eligibility, financing approval or EMI, installation date, warranty length when the equipment is unspecified, service in an unlisted city, specs not in the KB, appointments that weren't made, human actions that didn't happen.
-- **No package recommendation** without bill or usage info (KB §3, §9). Packages are reference options pending a site assessment.
-- **Unlisted city** (KB §7, §10): say availability isn't confirmed, collect details, offer verification by sales.
-- **Tone** (KB §17): short, friendly, honest, not pushy. At most 1–2 questions per turn.
+- **Never invent** (KB Section 16): exact price, savings, subsidy amount or eligibility, financing approval or EMI, installation date, warranty length when the equipment is unspecified, service in an unlisted city, specs not in the KB, appointments that weren't made, human actions that didn't happen.
+- **No package recommendation** without bill or usage info (KB Sections 3, 9). Packages are reference options pending a site assessment.
+- **Unlisted city** (KB Sections 7, 10): say availability isn't confirmed, collect details, offer verification by sales.
+- **Tone** (KB Section 17): short, friendly, honest, not pushy. At most 1–2 questions per turn.
 
 ### Demo script (also the main end-to-end test)
-1. "What solar systems do you offer for homes?" → HomeStart 3 / HomePro 5 / HomeMax 10 as reference options, with sources §8/§9.
+1. "What solar systems do you offer for homes?" → HomeStart 3 / HomePro 5 / HomeMax 10 as reference options, with sources KB Sections 8/9.
 2. "I'm interested in a 5 kW system for my house in Lucknow. My bill is about ₹4,000 a month and I'd like it installed next month." → `check_service_area` says Lucknow is listed → asks for name and phone.
 3. "Rahul Sharma, 9876543210, rahul.sharma@example.com" → `create_lead` → HOT → the reply explains the next step and offers a callback.
 4. "Yes, call me tomorrow evening." → `schedule_callback` → "logged; the team will confirm".
@@ -104,8 +104,8 @@ flowchart TD
 Reset the per-turn fields (`intents`, `search_query`, `retrieved`, `steps`, `sources`, `validation_errors`, `degraded`) at the start of every turn so nothing bleeds into the next turn.
 
 **Nodes**
-1. **understand.** The fast LLM, with structured output (`prompts/lead_extraction_prompt.md`), reads the last user message, the last 6 messages and the current lead draft. It returns intents, the fields the customer explicitly stated, signals, and `search_query`: a standalone English rewrite when the message asks about Vantis, so a follow-up like "and in Kanpur?" works. Code then merges the non-null fields and validates them (§3.3). Invalid values go to `validation_errors` and are never stored.
-2. **retrieve.** Runs only when `search_query` is set. Hybrid search returns the top 4 chunks (§3.6). If nothing is relevant, it sets `no_context`.
+1. **understand.** The fast LLM, with structured output (`prompts/lead_extraction_prompt.md`), reads the last user message, the last 6 messages and the current lead draft. It returns intents, the fields the customer explicitly stated, signals, and `search_query`: a standalone English rewrite when the message asks about Vantis, so a follow-up like "and in Kanpur?" works. Code then merges the non-null fields and validates them (part 3.3). Invalid values go to `validation_errors` and are never stored.
+2. **retrieve.** Runs only when `search_query` is set. Hybrid search returns the top 4 chunks (part 3.6). If nothing is relevant, it sets `no_context`.
 3. **agent.** The main LLM gets `system_prompt.md`, the context block from `rag_prompt.md`, a lead status block (known fields, missing fields, validation errors, location status) and the last 12 messages, with the tools bound. At most 4 tool rounds per turn.
 4. **tools.** The LangGraph ToolNode runs the calls. Each call is recorded in `steps`.
 5. **finalize.** If a lead exists and new details arrived, update it and re-score (the step is logged as `auto-sync`). Then collect `sources` and `steps`.
@@ -116,8 +116,8 @@ Reset the per-turn fields (`intents`, `search_query`, `retrieved`, `steps`, `sou
 
 | Tool | Args | What it does |
 |---|---|---|
-| `search_knowledge_base` | `query: str` | Extra KB lookup for the agent. Returns the top chunks with § labels |
-| `check_service_area` | `city: str, state: str \| None` | Returns `listed` or `unverified`, the matched city, the region(s) and the source "KB §10". Handles aliases and typos |
+| `search_knowledge_base` | `query: str` | Extra KB lookup for the agent. Returns the top chunks with KB Section labels |
+| `check_service_area` | `city: str, state: str \| None` | Returns `listed` or `unverified`, the matched city, the region(s) and the source "KB Section 10". Handles aliases and typos |
 | `create_lead` | none | Saves the validated lead draft from graph state. If the minimum fields are missing it refuses and returns `missing_fields`. Idempotent per session. Runs scoring |
 | `update_lead` | none | Saves newly validated fields and re-scores |
 | `schedule_callback` | `preferred_time: str, notes: str \| None` | Needs a lead. Stores status `requested`. Returns "pending team confirmation" |
@@ -165,26 +165,26 @@ Validation:
 
 ### 3.5 Prompts (`/prompts`)
 - `system_prompt.md`: role, tone, KB-only rule, the never-invent list, tool-use policy, honest callback wording, 1–2 questions per turn.
-- `rag_prompt.md`: how the retrieved context is presented, the citation format `[§<n> <title>]`, and what to do when nothing relevant was found.
+- `rag_prompt.md`: how the retrieved context is presented, the citation format `[KB Section <n>: <title>]`, and what to do when nothing relevant was found.
 - `lead_extraction_prompt.md`: the `understand` step (intents, fields stated explicitly, signals, query rewrite).
 - `lead_qualification_prompt.md`: writes the reason from the breakdown.
 - `README.md`: the purpose of each prompt plus a change log (what, why, the example that failed before).
 
 ### 3.6 Retrieval (RAG)
 - **Ingestion** (`python -m app.rag.ingest`): parse the actual PDF (pdfplumber or PyMuPDF; don't hand-copy KB text into code). If the PDF is missing, stop with a clear message saying where to put it. Skip the cover page. Detect numbered sections ("8. Product & Service Catalog"). Chunk by structure:
-  - tables (§8, §9, §10, §11, §12): one chunk per row
-  - FAQ (§15): one chunk per Q&A
+  - tables (KB Sections 8–12): one chunk per row
+  - FAQ (KB Section 15): one chunk per Q&A
   - prose: one chunk per section, split above ~1,200 characters at paragraph boundaries
 - **Chunk record:** `chunk_id` (stable, e.g. `s08-homepro-5`), `section_no`, `section_title`, `page`, `chunk_type (prose|table_row|faq|policy)`, `content`, `metadata`, `embedding`, `tsv`, `doc_version`.
-- **Policy sections:** §16–§19 are instructions for the assistant, not customer facts. Tag them `policy` and exclude them from customer-answer retrieval. They shape the system prompt and the tests instead.
-- **Contextual header:** embed the text with a short prefix, e.g. "Vantis KB §8 Product & Service Catalog | Vantis HomePro 5 | …". This helps small chunks match.
+- **Policy sections:** KB Sections 16–19 are instructions for the assistant, not customer facts. Tag them `policy` and exclude them from customer-answer retrieval. They shape the system prompt and the tests instead.
+- **Contextual header:** embed the text with a short prefix, e.g. "Vantis KB Section 8: Product & Service Catalog | Vantis HomePro 5 | …". This helps small chunks match.
 - **Embeddings:** the Gemini embedding model from env. Use the document/query task types if supported. Use 768 dimensions if the size is configurable; otherwise use the model default. With ~60 chunks, exact search is fast enough, so no vector index is needed.
 - **Keyword search:** Postgres `tsvector` (english) + `websearch_to_tsquery`, ranked with `ts_rank_cd`.
 - **Hybrid:** top 10 from each search → Reciprocal Rank Fusion (k = 60) → top 4.
 - **Relevance gate:** if the best vector similarity is below a threshold (tuned on the eval set) and there are no keyword hits, set `no_context`.
 - **Fallback:** if embedding fails, use keyword-only search and set `degraded`. Cache query embeddings (LRU) to save quota.
-- **Service areas:** ingestion parses the §10 rows into a `service_areas` table (city, region). A small alias map in code covers renamed cities (Gurgaon → Gurugram, Allahabad → Prayagraj, New Delhi → Delhi). `check_service_area` reads the table (cached).
-- **Citations:** each chunk is labelled `[§8 Product & Service Catalog]`. The API returns structured `sources` (section, title, page, snippet).
+- **Service areas:** ingestion parses the KB Section 10 rows into a `service_areas` table (city, region). A small alias map in code covers renamed cities (Gurgaon → Gurugram, Allahabad → Prayagraj, New Delhi → Delhi). `check_service_area` reads the table (cached).
+- **Citations:** each chunk is labelled `[KB Section 8: Product & Service Catalog]`. The API returns structured `sources` (section, title, page, snippet).
 - **Eval:** `data/eval/retrieval_eval.jsonl` (24 questions, already written). `scripts/eval_retrieval.py` prints hit@1, hit@3 and MRR for keyword-only, vector-only and hybrid, and writes `docs/EVAL.md`.
 
 ### 3.7 LLM access
@@ -207,7 +207,7 @@ Response:
 ```json
 {
   "session_id": "6f1c2a90-...",
-  "reply": "Yes, Delhi is in our reference service area ... [§10 Reference Service Locations]",
+  "reply": "Yes, Delhi is in our reference service area ... [KB Section 10: Reference Service Locations]",
   "sources": [{"section": "10", "title": "Reference Service Locations", "page": 3, "snippet": "Delhi NCR: Delhi, Gurugram, ..."}],
   "steps": [
     {"node": "understand", "detail": "intents: question"},
@@ -230,9 +230,9 @@ Response:
 | GET | `/api/support-requests` | List of support requests |
 
 ### 3.10 Database (Neon)
-- `kb_chunks`: see §3.6. `embedding vector(D)`, `tsv` generated.
+- `kb_chunks`: see part 3.6. `embedding vector(D)`, `tsv` generated.
 - `service_areas`: `city, region, source`.
-- `leads`: the §3.3 fields + `session_id` (unique, nullable), `source_channel`, `location_status`, `lead_score`, `lead_status`, `score_breakdown` (jsonb), `qualification_reason`, `recommended_action`, `created_at`, `updated_at`.
+- `leads`: the part 3.3 fields + `session_id` (unique, nullable), `source_channel`, `location_status`, `lead_score`, `lead_status`, `score_breakdown` (jsonb), `qualification_reason`, `recommended_action`, `created_at`, `updated_at`.
 - `callbacks`: `id, lead_id (fk), preferred_time, notes, status, created_at`.
 - `support_requests`: `id, session_id, name, phone, email, project_details, issue, status, created_at`.
 - The LangGraph checkpoint tables, created by the library.
@@ -279,17 +279,17 @@ One task = one Claude Code session = one `/handoff`.
 | Task | Day | Build | Done when |
 |---|---|---|---|
 | T1 | Sat | Skeleton: backend venv + pinned requirements, FastAPI `/api/health`, config, request-id logging, Neon + pgvector, pytest, `.env.example`, `scripts/list_models.py` | Tests pass; `/api/health` shows db ok; list_models prints models |
-| T2 | Sat | Ingestion part 1: PDF → sections → structure-aware chunks (dry run), §10 parsing, alias map, service-area lookup, unit tests | Dry run prints clean chunks with § ids; Gurgaon → listed, Pune → unverified |
-| T3 | Sun | Embeddings, `kb_chunks` + `service_areas` tables, full ingest, hybrid retriever, keyword fallback | "guarantee on panels" returns §11 in the top 3 |
+| T2 | Sat | Ingestion part 1: PDF → sections → structure-aware chunks (dry run), KB Section 10 parsing, alias map, service-area lookup, unit tests | Dry run prints clean chunks with section ids; Gurgaon → listed, Pune → unverified |
+| T3 | Sun | Embeddings, `kb_chunks` + `service_areas` tables, full ingest, hybrid retriever, keyword fallback | "guarantee on panels" returns KB Section 11 in the top 3 |
 | T4 | Sun | Retrieval eval script + `docs/EVAL.md` | Table for keyword / vector / hybrid; hybrid hit@3 ≥ 0.9 or misses explained |
 | T5 | Sun | `app/core/llm.py` (Gemini + Groq fallback + retries), `rag_prompt.md`, grounded `/api/chat` v0 (retrieve → answer + sources) | The 5 PDF questions get correct, sourced answers; no invented price |
 | T6 | Sun | Dockerfile + deploy the skeleton to Render | Live `/api/health` returns ok |
 | T7 | Mon | Leads layer: tables, validation, scoring, reason (LLM + template fallback), unit tests | Scoring tests pass for HOT / WARM / COLD / caps |
-| T8 | Mon | LangGraph agent (§3.1), the 6 tools, checkpointer, system + extraction prompts, `/api/chat` v1 | The demo script via the API creates a HOT lead (live test) |
+| T8 | Mon | LangGraph agent (part 3.1), the 6 tools, checkpointer, system + extraction prompts, `/api/chat` v1 | The demo script via the API creates a HOT lead (live test) |
 | T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint |
 | T10 | Tue | Chat page: messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser |
 | T11 | Tue | Dashboard: API-key prompt, leads table + filter, lead detail with breakdown | Rahul shows as HOT with reason and action |
-| T12 | Wed | Edge-case pass, live scenario tests, prompt fixes logged | Every scenario in §5 passes or is documented |
+| T12 | Wed | Edge-case pass, live scenario tests, prompt fixes logged | Every scenario in part 5 passes or is documented |
 | T13 | Wed | GitHub Actions CI, deploy backend (Render) + frontend (Vercel), CORS, live smoke test | CI green; the demo flow works on the live URL |
 | T14 | Thu | README (17 sections), `docs/ARCHITECTURE.md`, ZIP, video | Submitted by 20:00 IST |
 
@@ -326,7 +326,7 @@ Rule: no extras until the current task's "Done when" passes.
 ---
 
 ## 7. Submission
-- **README sections (all 17):** Project Overview, Problem Statement, Features, Architecture, Tech Stack, Setup Instructions, Environment Variables, RAG Implementation, Agent Workflow, Tools / Function Calling, Database Design, API Documentation, Prompt Engineering, Testing, Deployment, Limitations, Future Improvements. Also list the assumptions (§8) and mark what is built vs future. Setup must tell reviewers to put their copy of the KB PDF at `data/kb/Vantis_Energy_Solutions_Knowledge_Base.pdf` before running ingestion.
+- **README sections (all 17):** Project Overview, Problem Statement, Features, Architecture, Tech Stack, Setup Instructions, Environment Variables, RAG Implementation, Agent Workflow, Tools / Function Calling, Database Design, API Documentation, Prompt Engineering, Testing, Deployment, Limitations, Future Improvements. Also list the assumptions (part 8) and mark what is built vs future. Setup must tell reviewers to put their copy of the KB PDF at `data/kb/Vantis_Energy_Solutions_Knowledge_Base.pdf` before running ingestion.
 - **Architecture diagram:** the Mermaid diagrams above, kept in `docs/ARCHITECTURE.md` and the README.
 - **Video (≤ 2:00):** 0:00–0:30 problem and solution · 0:30–1:15 demo script steps 1–3 + dashboard · 1:15–1:45 architecture diagram walk-through · 1:45–2:00 live URL + future work. Wake the server before recording.
 - **ZIP:** `git archive --format=zip -o vantis-sales-agent.zip HEAD`. It matches GitHub exactly and leaves out ignored files.
@@ -335,7 +335,7 @@ Rule: no extras until the current task's "Done when" passes.
 ---
 
 ## 8. Assumptions (copy into the README)
-1. A lead is created only when the minimum fields are present (§3.4).
+1. A lead is created only when the minimum fields are present (part 3.4).
 2. An unlisted city or out-of-catalog need is capped at WARM and flagged for verification. The KB calls it "unverified", not "unsupported".
 3. Callbacks are requests for the team to confirm, not booked appointments.
 4. Package names are reference options, not final recommendations.
