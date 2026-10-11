@@ -1,6 +1,6 @@
 """Chunker rules on small synthetic sections (no PDF needed)."""
 from app.rag.chunker import MAX_PROSE_CHARS, chunk_sections, slugify
-from app.rag.pdf_parser import Line, Section
+from app.rag.pdf_parser import Line, Section, Table
 
 
 def section(number, title, texts):
@@ -50,3 +50,23 @@ def test_duplicate_ids_raise():
     twin = [section(3, "Same", ["a"]), section(3, "Same", ["b"])]
     with pytest.raises(ValueError):
         chunk_sections(twin)
+
+
+def table_section(number, title):
+    table = Table(3, ["Offering", "Customer"], [["Plan A", "Homes"], ["Plan B", "Shops"]])
+    return Section(number, title, 3, tables=[table])
+
+
+def test_summary_chunk_lists_every_row():
+    chunks = chunk_sections([table_section(8, "Catalog")])
+    summary = [c for c in chunks if c.chunk_type == "table_summary"]
+    assert [c.chunk_id for c in summary] == ["s08-table-summary"]
+    assert summary[0].content == "All rows (Offering; Customer):\n- Plan A; Homes\n- Plan B; Shops"
+    assert summary[0].page == 3
+    assert summary[0].metadata == {"label": "Summary of all rows", "rows": 2}
+    assert [c.chunk_type for c in chunks].count("table_row") == 2  # the row chunks are still there
+
+
+def test_other_table_sections_get_no_summary():
+    chunks = chunk_sections([table_section(9, "Guidance")])
+    assert "table_summary" not in [c.chunk_type for c in chunks]

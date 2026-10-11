@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from app.rag.pdf_parser import Line, Section, table_dicts
 
 TABLE_SECTIONS = {8, 9, 10, 11, 12}
+# Tables that also get one chunk listing every row, so broad questions ("What systems do you
+# offer?", "Where do you install?") match one chunk with the whole list (T5, docs/EVAL.md).
+SUMMARY_SECTIONS = {8, 10}
+SUMMARY_LABEL = "Summary of all rows"
 FAQ_SECTION = 15
 POLICY_SECTIONS = {16, 17, 18, 19}
 MAX_PROSE_CHARS = 1200
@@ -19,7 +23,7 @@ class Chunk:
     section_no: int
     section_title: str
     page: int
-    chunk_type: str  # prose | table_row | faq | policy
+    chunk_type: str  # prose | table_row | table_summary | faq | policy
     content: str
     metadata: dict = field(default_factory=dict)
 
@@ -89,6 +93,29 @@ def _table_chunks(section: Section) -> list[Chunk]:
     return chunks
 
 
+def _summary_chunks(section: Section) -> list[Chunk]:
+    """One chunk per table listing every row: a line naming the columns, then one line per row."""
+    chunks = []
+    for table in section.tables:
+        rows = table_dicts(table)
+        if not rows:
+            continue
+        lines = [f"All rows ({'; '.join(table.header)}):"]
+        lines += ["- " + "; ".join(row.values()) for row in rows]
+        chunks.append(
+            Chunk(
+                chunk_id=f"s{section.number:02d}-table-summary",
+                section_no=section.number,
+                section_title=section.title,
+                page=table.page,
+                chunk_type="table_summary",
+                content="\n".join(lines),
+                metadata={"label": SUMMARY_LABEL, "rows": len(rows)},
+            )
+        )
+    return chunks
+
+
 def _faq_chunks(section: Section) -> list[Chunk]:
     """A line ending in '?' starts a question; the lines after it are the answer."""
     qa: list[tuple[str, int, list[Line]]] = []
@@ -136,6 +163,8 @@ def chunk_sections(sections: list[Section]) -> list[Chunk]:
     for section in sections:
         if section.number in TABLE_SECTIONS:
             chunks += _table_chunks(section)
+            if section.number in SUMMARY_SECTIONS:
+                chunks += _summary_chunks(section)
             chunks += _prose_chunks(section)  # intro and rule boxes around the table
         elif section.number == FAQ_SECTION:
             chunks += _faq_chunks(section)

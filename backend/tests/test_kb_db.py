@@ -89,7 +89,7 @@ def count(engine, model):
 
 
 def test_ingest_writes_chunks_and_service_areas(kb):
-    assert count(kb.engine, KbChunk) == len(CHUNKS) == 5
+    assert count(kb.engine, KbChunk) == len(CHUNKS) == 6  # incl. the Section 10 summary chunk
     assert count(kb.engine, ServiceArea) == 4  # Lucknow, Noida x2, Delhi
     with Session(kb.engine) as session:
         row = session.get(KbChunk, WARRANTY)
@@ -143,14 +143,14 @@ def test_keyword_search_with_only_stop_words_returns_nothing(kb):
 
 def test_word_doc_counts_skip_the_policy_chunk(kb):
     counts, total = word_doc_counts(kb.engine)
-    assert total == 4  # 5 chunks, one of them policy
+    assert total == 5  # 6 chunks (incl. the Section 10 summary), one of them policy
     assert counts["panel"] == 2  # solar and warranty chunks
     assert counts["guarante"] == 1  # the policy chunk also says "guarantee" but is not counted
     assert "invent" not in counts  # only the policy chunk has this word
 
 
 def test_common_words_are_dropped_from_the_keyword_query(kb):
-    # "panel" is in 2 of the 4 chunks (50%, above the 30% cutoff), so only "guarantee" is searched
+    # "panel" is in 2 of the 5 chunks (40%, above the 30% cutoff), so only "guarantee" is searched
     assert [h.chunk_id for h in keyword_search(kb.engine, "panels guarantee")] == [WARRANTY]
     # with filtering off, "panel" matches the solar chunk too
     unfiltered = keyword_search(kb.engine, "panels guarantee", max_word_ratio=1.0)

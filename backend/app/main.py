@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import health
+from app.api import chat, health
 from app.core.config import get_settings
 from app.core.db import get_engine, init_db
 from app.core.logging import request_id_var, setup_logging
@@ -66,3 +66,4 @@ app.add_middleware(
 )
 
 app.include_router(health.router)
+app.include_router(chat.router)

@@ -24,7 +24,7 @@ from app.rag.pdf_parser import Section, parse_kb
 from app.services.service_areas import SOURCE as SERVICE_AREA_SOURCE
 from app.services.service_areas import ServiceAreas
 
-CHUNK_TYPES = ("prose", "table_row", "faq", "policy")
+CHUNK_TYPES = ("prose", "table_row", "table_summary", "faq", "policy")
 
 
 @dataclass
@@ -41,12 +41,12 @@ class IngestResult:
 def print_summary(sections: list[Section], chunks: list[Chunk]) -> None:
     """Print chunk counts per section and type, then the totals."""
     counts = Counter((c.section_no, c.chunk_type) for c in chunks)
-    print(f"{'Sec':>3}  {'Page':>4}  {'Title':<40}" + "".join(f"{t:>10}" for t in CHUNK_TYPES))
+    print(f"{'Sec':>3}  {'Page':>4}  {'Title':<40}" + "".join(f"{t:>14}" for t in CHUNK_TYPES))
     for s in sections:
-        row = "".join(f"{counts[(s.number, t)]:>10}" for t in CHUNK_TYPES)
+        row = "".join(f"{counts[(s.number, t)]:>14}" for t in CHUNK_TYPES)
         print(f"{s.number:>3}  {s.page:>4}  {s.title:<40}{row}")
     totals = Counter(c.chunk_type for c in chunks)
-    print(f"{'':>3}  {'':>4}  {'TOTAL':<40}" + "".join(f"{totals[t]:>10}" for t in CHUNK_TYPES))
+    print(f"{'':>3}  {'':>4}  {'TOTAL':<40}" + "".join(f"{totals[t]:>14}" for t in CHUNK_TYPES))
     print(f"\n{len(sections)} sections, {len(chunks)} chunks\n")
 
 

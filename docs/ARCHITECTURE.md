@@ -2,17 +2,20 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T4)
+## Backend modules (as of T5)
 | Module | Role |
 |---|---|
 | `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware, CORS, routers |
 | `app/core/config.py` | `Settings` (pydantic-settings, reads `backend/.env`), `get_settings()` |
 | `app/core/logging.py` | JSON log formatter, `request_id_var` |
 | `app/core/db.py` | `Base`, `get_engine()` (Neon, pre-ping), `check_db()`, `init_db(engine)` (pgvector + `create_all`) |
-| `app/core/llm.py` | `embedder()`: google-genai, one Content per text, batches of 20, vector count and size checks, document vs query timeouts, LRU cache for queries |
+| `app/core/llm.py` | `embedder()`: google-genai, one Content per text, batches of 20, vector count and size checks, document vs query timeouts, LRU cache for queries. `query_embedder()`: the same, or None (request dependency). `main_llm()` / `fast_llm()`: `chat_llm(model)` = Gemini (`thinking_level` minimal, 15 s, 1 retry, none on 429) `.with_fallbacks([Groq])` (15 s, no retry, `reasoning_effort` low); never raises when built. `invoke_llm()` → `LLMReply(text, provider, latency_ms)`, logs provider and latency; `reply_text()` keeps text blocks only and strips `<think>` |
+| `app/core/prompts.py` | `load_prompt(name)`: reads `prompts/<name>.md` (cached) |
 | `app/api/health.py` | `GET /api/health` (status, db, kb_chunks) |
+| `app/api/chat.py` | `POST /api/chat` v0: validates the message (control characters stripped, 1-1,000 chars), `search(k=4)`, `answer()`. DB down → 503; any other error → 200 degraded; `lead` always null |
+| `app/rag/answer.py` | `answer(question, SearchResult, llm)`: no context → fixed reply without an LLM call; else system + RAG prompt → `invoke_llm`; LLM failure → degraded reply. `format_context` (`[KB Section N: Title]` labels), `cited_sections`, `pick_sources` (one per cited section), steps |
 | `app/rag/pdf_parser.py` | `parse_kb(path)`: KB PDF to numbered sections with text lines and tables (pdfplumber; cover, header and footer removed) |
-| `app/rag/chunker.py` | `Chunk`, `chunk_sections()`: one chunk per table row (KB Sections 8-12) or FAQ item (15), prose split at ~1,200 chars, Sections 16-19 tagged `policy`; `embed_text()` = `title: ... \| text: ...` |
+| `app/rag/chunker.py` | `Chunk`, `chunk_sections()`: one chunk per table row (KB Sections 8-12) plus one `table_summary` chunk listing every row (8, 10), one per FAQ item (15), prose split at ~1,200 chars, Sections 16-19 tagged `policy`; `embed_text()` = `title: ... \| text: ...` |
 | `app/rag/models.py` | `KbChunk` (`kb_chunks`: vector + generated tsvector with GIN index) and `ServiceArea` (`service_areas`, unique on city + region) |
 | `app/rag/ingest.py` | `python -m app.rag.ingest`: parse, chunk, embed all first, then replace all rows in ONE transaction; `--dry-run` prints chunks and touches no DB or key |
 | `app/rag/retriever.py` | `search(query, k, mode)`: keyword (stemmed words OR'd, words in more than 30% of chunks dropped, `ts_rank_cd`) + vector (cosine), RRF fusion (k = 60, keyword weight 0.5), relevance gate (similarity only when a vector search ran), keyword fallback with `degraded`; policy chunks never returned |
@@ -30,6 +33,23 @@ flowchart LR
   health --> count["count_kb_chunks"]
   check --> neon[("Neon Postgres + pgvector")]
   count --> neon
+  mw --> chat["POST /api/chat"]
+  chat --> search["search(k = 4)"]
+  search --> neon
+  search -.->|"DB error"| e503["503, friendly message"]
+```
+
+## Chat v0 (T5)
+```mermaid
+flowchart LR
+  msg["message: control chars stripped, 1-1,000 chars"] --> search["search: hybrid, top 4"]
+  search -->|"no_context"| fixed["fixed reply, no LLM call"]
+  search --> prompt["system_prompt.md + rag_prompt.md with [KB Section N: Title] blocks"]
+  prompt --> gemini["Gemini main model: thinking minimal, 15 s, 1 retry, none on 429"]
+  gemini -.->|"any error"| groq["Groq fallback: 15 s, no retry"]
+  gemini --> reply["reply text only, citations → sources (one per section), steps"]
+  groq --> reply
+  groq -.->|"fails too"| degraded["200, degraded reply"]
 ```
 
 ## Ingestion (T3)

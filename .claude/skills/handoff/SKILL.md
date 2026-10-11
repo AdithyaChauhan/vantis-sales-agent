@@ -14,5 +14,5 @@ Wrap up the task you just finished. Do the steps in order and stop at the first 
 5. **Prompt log.** If any file in `prompts/` changed, make sure `prompts/README.md` has a log line for it: what changed, why, and the example that failed before.
 6. **Commands.** If you added a command people need to run, add it to the Commands section of `CLAUDE.md`.
 7. **Safety check.** Run `git status`. Make sure no `.env` file, PDF, key or token is about to be committed.
-8. **Commit.** Stage this task's files and commit with a conventional message, for example `feat(rag): hybrid retriever with RRF`. Do not push.
+8. **Commit.** Stage this task's files and commit with a conventional message, for example `feat(rag): hybrid retriever with RRF`. The commit message must have a blank line after the subject line. Do not push.
 9. **Report.** Print the new PROGRESS.md entry in a code block, then stop.

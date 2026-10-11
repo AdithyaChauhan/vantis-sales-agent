@@ -2,7 +2,7 @@
 
 The single source of truth for what we build and why.
 Roles: Adithya owns the project. Claude (chat) reviews and writes the tasks. Claude Code builds.
-Last updated: 2026-10-11.
+Last updated: 2026-10-11 (T5).
 
 ---
 
@@ -50,6 +50,7 @@ Skipped on purpose: mock WhatsApp (optional in the PDF), streaming.
 - **Sales rep**, using the dashboard.
 
 ### Flows
+- **F0 Welcome.** When the chat opens, before the customer types, show a welcome message: what the assistant can help with (packages, service areas, installation, warranty and support, financing and subsidies, getting a quote) and its main limits from KB Section 16 (no exact prices, savings or subsidy amounts, no guaranteed installation dates; the Vantis team confirms those). Under it, 3 or 4 starter-question buttons. T10 shows it without an LLM call. T8 replies with the same text when the customer only says hi or asks what the assistant can do. The text lives in one place (the backend, which also serves it to the frontend), so both use the same words. Not built yet.
 - **F1 Knowledge question.** Answer from the KB with sources. If the KB doesn't cover it, say so plainly and offer a sales follow-up.
 - **F2 Buying intent.** First answer any question in the message. Then ask for 1–2 missing details per turn, in this order: location → requirement (size, bill or usage) → timeline → name → phone or email → property details. Once the minimum fields are present (part 3.4), create the lead, describe the next step without promises, and offer a callback.
 - **F3 Callback.** Requires a lead. Save the request with status `requested`. Reply: "I've logged a callback request for <time>; our team will confirm." Never say it is booked.
@@ -175,7 +176,8 @@ Validation:
   - tables (KB Sections 8–12): one chunk per row
   - FAQ (KB Section 15): one chunk per Q&A
   - prose: one chunk per section, split above ~1,200 characters at paragraph boundaries
-- **Chunk record:** `chunk_id` (stable, e.g. `s08-homepro-5`), `section_no`, `section_title`, `page`, `chunk_type (prose|table_row|faq|policy)`, `content`, `metadata`, `embedding`, `tsv`, `doc_version`.
+  - summary (T5): KB Sections 8 and 10 also get one `table_summary` chunk listing every row of the table (`s08-table-summary`, `s10-table-summary`), built from the parsed rows. 54 chunks in total. It did not fix q01 on its own (see T8 notes and `docs/EVAL.md`)
+- **Chunk record:** `chunk_id` (stable, e.g. `s08-homepro-5`), `section_no`, `section_title`, `page`, `chunk_type (prose|table_row|table_summary|faq|policy)`, `content`, `metadata`, `embedding`, `tsv`, `doc_version`.
 - **Policy sections:** KB Sections 16–19 are instructions for the assistant, not customer facts. Tag them `policy` and exclude them from customer-answer retrieval. They shape the system prompt and the tests instead.
 - **Contextual header:** embed the text with a short title, e.g. "title: KB Section 8: Product & Service Catalog - Vantis HomePro 5 | text: …". This helps small chunks match.
 - **Embeddings:** the Gemini embedding model from env. Use 768 dimensions if the size is configurable; otherwise use the model default. With ~60 chunks, exact search is fast enough, so no vector index is needed.
@@ -189,14 +191,16 @@ Validation:
 - **Fallback:** if embedding fails, use keyword-only search and set `degraded`. Cache query embeddings (LRU) to save quota.
 - **Service areas:** ingestion parses the KB Section 10 rows into a `service_areas` table (city, region). A small alias map in code covers renamed cities (Gurgaon → Gurugram, Allahabad → Prayagraj, New Delhi → Delhi). `check_service_area` reads the table (cached).
 - **Citations:** each chunk is labelled `[KB Section 8: Product & Service Catalog]`. The API returns structured `sources` (section, title, page, snippet).
-- **Eval:** `data/eval/retrieval_eval.jsonl` (24 questions) and `data/eval/offtopic_eval.jsonl` (8 off-topic questions, for the gate). `scripts/eval_retrieval.py` prints hit@1, hit@3 and MRR for keyword-only, vector-only and hybrid plus the gate results, and writes `docs/EVAL.md` (T4 result: hybrid hit@3 22/24, MRR 0.907; the tuning notes in that file are hand-written and kept).
+- **Eval:** `data/eval/retrieval_eval.jsonl` (24 questions) and `data/eval/offtopic_eval.jsonl` (8 off-topic questions, for the gate). `scripts/eval_retrieval.py` prints hit@1, hit@3 and MRR for keyword-only, vector-only and hybrid plus the gate results, and writes `docs/EVAL.md` (T4 result: hybrid hit@3 22/24, MRR 0.907; unchanged after the T5 summary chunks; the tuning notes in that file are hand-written and kept).
 
 ### 3.7 LLM access
 - One module, `app/core/llm.py`, exposes `fast_llm()`, `main_llm()` and `embedder()`. Everything else uses only these.
-- Timeout 30 s, 2 retries with backoff, then fall back to Groq (LangChain `.with_fallbacks`, built separately for `bind_tools` and `with_structured_output`). Record which provider answered in `steps` and the logs.
+- Gemini: 15 s timeout, one retry on timeouts, 408 and 5xx, **no retry on 429** (quota), then fall back to Groq (LangChain `.with_fallbacks`). Groq: 15 s, no retry. Worst case about 46 s. Build the fallback separately for `bind_tools` and `with_structured_output`. Record which provider answered (from `response_metadata["model_provider"]`) and the latency in `steps` and the logs.
+- Gemini 3.x thinks by default: `thinking_level="minimal"` (lowest; one real call took 1.4 s). Groq gpt-oss: `reasoning_effort="low"`. The reply uses only the text blocks and strips any `<think>…</think>`, so reasoning never reaches the customer. gpt-oss sometimes cites with full-width brackets 【 】; `app/rag/answer.py` turns them into [ ].
+- In langchain-google-genai, `max_retries` means total attempts (first call included) and its default retry list includes 429, so `llm.py` binds its own `http_options` per call.
 - Model names come only from env. `scripts/list_models.py` lists what the key can use.
 - **Model choice and free-tier limits** (checked in AI Studio and the Groq docs): every Gemini Flash model allows only 20 requests/day, so the agent uses the Flash-Lite models. `LLM_MODEL_MAIN=gemini-3.5-flash-lite` and `LLM_MODEL_FAST=gemini-3.1-flash-lite` each allow 15/min and 500/day, with a separate quota per model. `EMBEDDING_MODEL=gemini-embedding-2` allows 100/min, 30K tokens/min, 1,000/day. The Groq fallback `FALLBACK_MODEL=openai/gpt-oss-120b` allows 30/min, 1,000/day, 8K tokens/min (used from T5).
-- T3 builds `embedder()` only, with the `google-genai` SDK directly. T5 adds `fast_llm()` and `main_llm()`.
+- T3 builds `embedder()` only, with the `google-genai` SDK directly. T5 adds `fast_llm()` and `main_llm()` (langchain-google-genai 4.4.1, langchain-groq 1.1.3, langchain-core 1.6.9; google-genai stays 2.29.0).
 - Tests swap in a fake through this module and never call a real LLM (except tests marked `live`).
 
 ### 3.8 Memory
@@ -288,18 +292,27 @@ One task = one Claude Code session = one `/handoff`.
 | T2 | Sat | Ingestion part 1: PDF → sections → structure-aware chunks (dry run), KB Section 10 parsing, alias map, service-area lookup, unit tests | Dry run prints clean chunks with section ids; Gurgaon → listed, Pune → unverified |
 | T3 | Sun | Embeddings, `kb_chunks` + `service_areas` tables, full ingest, hybrid retriever, keyword fallback | "guarantee on panels" returns KB Section 11 in the top 3 |
 | T4 | Sun | Retrieval eval script + `docs/EVAL.md` | Table for keyword / vector / hybrid; hybrid hit@3 ≥ 0.9 or misses explained |
-| T5 | Sun | `app/core/llm.py` (Gemini + Groq fallback + retries), `rag_prompt.md`, grounded `/api/chat` v0 (retrieve → answer + sources) | The 5 PDF questions get correct, sourced answers; no invented price |
+| T5 | Sun | `app/core/llm.py` (Gemini + Groq fallback + retries), `rag_prompt.md`, grounded `/api/chat` v0 (retrieve → answer + sources) | The 5 PDF questions get correct, sourced answers; no invented price. q01 ("What solar systems do you provide?") moved to T8 |
 | T6 | Sun | Dockerfile + deploy the skeleton to Render | Live `/api/health` returns ok |
 | T7 | Mon | Leads layer: tables, validation, scoring, reason (LLM + template fallback), unit tests | Scoring tests pass for HOT / WARM / COLD / caps |
-| T8 | Mon | LangGraph agent (part 3.1), the 6 tools, checkpointer, system + extraction prompts, `/api/chat` v1 | The demo script via the API creates a HOT lead (live test) |
+| T8 | Mon | LangGraph agent (part 3.1), the 6 tools, checkpointer, system + extraction prompts, `/api/chat` v1 | The demo script via the API creates a HOT lead (live test). The q01 reply names the 5 packages (HomeStart 3, HomePro 5, HomeMax 10, Business 15, Business 25) and cites KB Section 8, and the q01 xfail marker in `tests/test_live_chat.py` is gone. The rewritten-query eval keeps hybrid hit@3 at 22/24 or better |
 | T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint |
-| T10 | Tue | Chat page: messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser |
+| T10 | Tue | Chat page: welcome message + starter buttons (F0, no LLM call), messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser |
 | T11 | Tue | Dashboard: API-key prompt, leads table + filter, lead detail with breakdown | Rahul shows as HOT with reason and action |
 | T12 | Wed | Edge-case pass, live scenario tests, prompt fixes logged | Every scenario in part 5 passes or is documented |
 | T13 | Wed | GitHub Actions CI, deploy backend (Render) + frontend (Vercel), CORS, live smoke test | CI green; the demo flow works on the live URL |
 | T14 | Thu | README (17 sections), `docs/ARCHITECTURE.md`, ZIP, video | Submitted by 20:00 IST |
 
 Rule: no extras until the current task's "Done when" passes.
+
+### T8 notes (from T5)
+- **q01 retrieval.** "What solar systems do you provide?" misses KB Sections 8 and 9: its words (solar, system, provide) are not in the catalog rows, so they get no keyword hit, and the Section 8 summary chunk is only 6th on vector similarity (0.708; the best of 4 wordings tried reached 0.736 against 0.751 for the top chunk). Evidence in `docs/EVAL.md` ("T5: summary chunks").
+- **search_query in the KB's own words.** The `understand` step writes `search_query` using the KB's terms. Give its prompt the KB section titles, read from the DB (not typed by hand), so "solar systems" can map to "Product & Service Catalog". In T5, "Which Vantis solar packages and products are offered?" returned 2 Section 8 chunks in the top 4 (HomePro 5 and the summary), and "Vantis product catalog offerings" returned 4 Section 8 chunks.
+- **Small-to-big.** "Vantis product catalog offerings" returned 4 Section 8 row chunks but not the summary, so a reply would name only some packages. Evaluate a rule: when row chunks from KB Section 8 or 10 are retrieved, add that section's summary chunk to the context.
+- **Measure the rewrite.** `eval_retrieval` gets a mode that searches with the rewritten query. It must not fall below today's hybrid hit@3 of 22/24. If the rewrite alone loses hits, try fusing the raw-question and rewritten results.
+- **Tools and timeouts.** `bind_tools()` on the Gemini binding drops `http_options`; pass them again: `bind_tools(tools, http_options=GEMINI_CHAT_HTTP)` (see the `gemini_chat` docstring in `app/core/llm.py`).
+- **Welcome reply.** When the customer only says hi or asks what the assistant can do, reply with the F0 welcome text (same source as the chat page).
+- **Open (T8 or T12):** the 5 kW cost reply is correct but doesn't mention HomePro 5 (the 5 kW package). Possible cause: "5kW" in the question against "5 kW" in the KB.
 
 ---
 

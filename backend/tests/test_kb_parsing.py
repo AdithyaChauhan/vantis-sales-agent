@@ -81,6 +81,18 @@ def test_table_sections_have_one_chunk_per_row(chunks):
     assert counts == {8: 7, 9: 5, 10: 5, 11: 5, 12: 4}
 
 
+def test_summary_chunks_for_sections_8_and_10(sections, chunks):
+    summaries = {c.chunk_id: c for c in chunks if c.chunk_type == "table_summary"}
+    assert sorted(summaries) == ["s08-table-summary", "s10-table-summary"]
+    assert all(c.page == 3 for c in summaries.values())
+    catalog = summaries["s08-table-summary"].content
+    assert all(name in catalog for name in OFFERINGS)
+    locations = summaries["s10-table-summary"].content
+    for row in rows(sections, 10):
+        for city in row["Reference Locations"].split(", "):
+            assert city in locations
+
+
 def test_no_page_header_or_footer_in_chunks(chunks):
     for c in chunks:
         assert "Participant Knowledge Base" not in c.content
