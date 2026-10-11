@@ -127,42 +127,55 @@ Reset the per-turn fields (`intents`, `search_query`, `retrieved`, `steps`, `sou
 The lead tools take no free-form fields: they read the validated draft through injected graph state. The LLM chooses when; it cannot write made-up data to the DB.
 
 ### 3.3 Lead fields and validation
-Draft fields (all optional until saved): `name, phone, email, city, state, customer_type (residential|commercial), property_type, ownership (own|rent|unknown), rooftop_available, monthly_bill_inr, monthly_units_kwh, system_size_kw, requirement, timeline, timeline_bucket, budget, business_type, existing_solar, reason, notes`.
+The contract is one Pydantic model, `LeadData` (`app/leads/schemas.py`): T8's understand step fills it with structured output, T9's `POST /leads` accepts it. Every field is optional and **null means unknown**. Units are in the names. Final names (T7):
+- **Who:** `name`, `phone` (stored as `+91XXXXXXXXXX`), `email`.
+- **Where:** `city` (the matched service city when listed; the customer's own words are kept in `city_input`), `state`.
+- **Property:** `customer_type` (`residential|commercial`, derived from `property_type` when not given), `property_type` (`house|villa|apartment|shop|office|clinic|warehouse|other`, from KB Section 2), `ownership` (`own|rent`), `rooftop_available` (bool).
+- **Energy:** `monthly_bill_inr` (int, ₹ per month), `monthly_units_kwh` (int, kWh per month), `system_size_kw` (float), `existing_solar` (bool), `requirement` (text).
+- **Intent:** `timeline` (customer's words), `timeline_bucket` (`lt_1m` = now, this month or next month; `1_3m`; `3_6m`; `gt_6m`), `intent_level` (`ready|interested|exploring`), `requirement_outside_catalog` (bool), `motivation` (why solar; KB Section 14), `budget_inr` (int), `business_type`.
+- **Other:** `other_info` (any other detail; extra details never go into enum fields).
 
-Signals from `understand`: `intent_level (ready|interested|exploring)`, `timeline_bucket (lt_1m|1_3m|3_6m|gt_6m|unknown)`, `requirement_outside_catalog (bool)`, `is_existing_customer (bool)`.
+Intent levels:
 - `ready`: asks for a quote, installation, site visit or callback, or states a near-term plan to install.
 - `interested`: wants solar for themselves and asks about options.
 - `exploring`: general curiosity, "just checking", far-off plans.
 
-Validation:
-- **Phone:** strip spaces and dashes. Accept a +91, 91 or 0 prefix. Must be 10 digits starting with 6–9. Store as `+91XXXXXXXXXX`.
-- **Email:** syntax check with `email-validator` (no DNS lookup).
-- **Numbers:** positive, within sane ranges (bill ₹100–₹10,00,000; size 0.5–100 kW).
-- **City:** normalize through the alias map + rapidfuzz (score ≥ 85) against the service-area list. Keep the customer's original text too.
+`is_existing_customer` is not a lead field: T8's understand step returns it separately, and it routes to a support request.
+
+Validation (pure functions in `app/leads/validators.py`; each returns a clean value or a plain message the agent can ask about; invalid values are never saved; `LeadData.from_raw` keeps the valid fields and reports the invalid ones):
+- **Phone:** strip spaces, dashes, dots and brackets. Accept a +91, 91 or 0 prefix. Must be 10 digits starting with 6–9 (mobiles only). Store as `+91XXXXXXXXXX`.
+- **Email:** syntax check with `email-validator` 2.3.0 (`check_deliverability=False`, so no network), lowercased.
+- **Numbers:** "₹4,000", "Rs 4000", "4k", "1.2 lakh" are understood; negatives, zero, ranges and out-of-range values are rejected. Limits: bill ₹100–₹10,00,000 per month; size 0.5–100 kW; usage 10–1,00,000 kWh per month; budget ₹10,000–₹10,00,00,000; name 2–100 characters.
+- **City:** the existing service-area lookup (`ServiceAreas.lookup`: alias map + rapidfuzz ≥ 85 against KB Section 10) gives `listed` or `unverified` (`unknown` when there is no city or no list).
 
 ### 3.4 Lead creation and scoring
-**Create a lead only when** name AND (valid phone OR valid email) AND city AND (requirement OR bill OR usage OR system size OR property type) are present. Before that, details stay in the conversation state, not the DB.
+Plain-language version with worked examples: `docs/SCORING.md`. Code: `app/leads/scoring.py` (rules), `app/leads/reason.py` (reason), `app/leads/service.py` (create, update, read, list, callbacks, support requests).
+
+**Create a lead only when** name AND (valid phone OR valid email) AND city AND (requirement OR bill OR usage OR system size OR property type) are present. Before that, details stay in the conversation state, not the DB, and `create_lead` returns the missing fields.
 
 **Score (100 points, rules in code):**
 
 | Signal | Points |
 |---|---|
 | Intent: ready / interested / exploring / unknown | 25 / 15 / 5 / 0 |
-| Requirement: clear (size, bill, usage or a named package) / vague (text only) / none | 20 / 10 / 0 |
+| Requirement: clear (size, bill or usage) / words only / none | 20 / 10 / 0 |
 | Location: listed / unverified / unknown | 20 / 5 / 0 |
 | Timeline: < 1 month / 1–3 / 3–6 / > 6 months / unknown | 20 / 15 / 8 / 3 / 0 |
 | Contact: valid phone + email / one of them | 10 / 6 |
-| Property: owner with rooftop / partly known / renting or no rooftop | 5 / 2 / 0 |
+| Property: owner with rooftop / partly known (type, ownership or rooftop known) / renting or no rooftop, or nothing known | 5 / 2 / 0 |
 
 - **Status:** HOT ≥ 75 · WARM 45–74 · COLD < 45.
-- **Caps:** an unverified city or `requirement_outside_catalog` caps the status at WARM. An existing-customer issue becomes a support request, not a lead.
+- **Caps:** an unverified city or `requirement_outside_catalog` caps the status at WARM **and the score at 74**, so score and status always agree; the breakdown keeps `raw_score` and the cap. An unlisted city is WARM, not COLD, because KB Section 10 says unlisted locations are "unverified" (see `docs/SCORING.md`). An existing-customer issue becomes a support request, not a lead.
+- **Clear requirement** in code = size, bill or usage. A named package counts once T8 turns it into its kW from the KB (no package names in code).
 - **Recommended action** (rules):
-  - HOT: "Call within 1 hour and offer a Vantis Site Assessment."
-  - WARM: "Follow up within 24 hours", plus the specific gap: "collect: <fields>", "verify service availability for <city>", or "confirm owner permission".
-  - COLD: "Add to nurture list, share product info, follow up in 30 days."
-  - If a callback was requested, append "Customer asked for a callback: <time>".
-- **Reason:** 1–2 sentences written by the fast LLM (`prompts/lead_qualification_prompt.md`) from the score breakdown only, never new facts. If the LLM fails, fall back to a fixed template.
-- Store `score_breakdown` as JSON so the dashboard can show where every point came from.
+  - HOT: "Contact the lead within 1 hour and offer a site assessment." (the assignment's example; no product name in code)
+  - WARM: "Follow up within 24 hours." plus the gaps: "Verify service availability for <city>.", "Check whether the requirement fits the reference packages.", "Confirm the owner's permission for a rooftop installation.", "Collect: <missing details>."
+  - COLD: "Add to the nurture list, share product information and follow up in 30 days."
+  - If a callback was requested, append "Customer asked for a callback: <time>."
+- **Reason:** one sentence by the fast LLM (`prompts/lead_qualification_prompt.md`) from the breakdown only: status, score, rule labels, caps and city. No name, phone, email or money amount is sent. A template sentence is used when the LLM fails or its reply is empty, too long, more than one sentence, names another status, or mentions prices, savings, subsidies, financing, EMIs or guarantees (KB Section 16). It is regenerated only when the status or breakdown changes.
+- Store `score_breakdown` as JSON (each rule with its points, maximum and label; `raw_score`; caps; `lead_score`; `lead_status`) so the dashboard can show where every point came from.
+- Output names match the assignment: `lead_score`, `lead_status`, `reason`, `recommended_action`.
+- Logs carry lead ids, status and score only; never names, phone numbers or emails.
 
 ### 3.5 Prompts (`/prompts`)
 - `system_prompt.md`: role, tone, KB-only rule, the never-invent list, tool-use policy, honest callback wording, 1–2 questions per turn.
@@ -243,12 +256,14 @@ Response:
 ### 3.10 Database (Neon)
 - `kb_chunks`: see part 3.6. `embedding vector(D)`, `tsv` generated.
 - `service_areas`: `city, region, source`.
-- `leads`: the part 3.3 fields + `session_id` (unique, nullable), `source_channel`, `location_status`, `lead_score`, `lead_status`, `score_breakdown` (jsonb), `qualification_reason`, `recommended_action`, `created_at`, `updated_at`.
-- `callbacks`: `id, lead_id (fk), preferred_time, notes, status, created_at`.
-- `support_requests`: `id, session_id, name, phone, email, project_details, issue, status, created_at`.
+- `leads` (T7, `app/leads/models.py`): `id`, the part 3.3 fields + `city_input`, `session_id` (unique, nullable), `source_channel` (`web|whatsapp`), `location_status`, `lead_score`, `lead_status`, `score_breakdown` (jsonb), `reason`, `reason_source` (`llm|template`), `recommended_action`, `created_at`, `updated_at` (timestamptz). Indexes on `lead_status` and `lead_score`.
+- `callbacks`: `id, lead_id (fk, on delete cascade), preferred_time (the customer's words), notes, status ('requested'), created_at`.
+- `support_requests`: `id, session_id, name, phone, email, project_details, issue, status ('open'), created_at`. Never linked to leads.
 - The LangGraph checkpoint tables, created by the library.
 
 Tables are created on startup with `create_all` + `CREATE EXTENSION IF NOT EXISTS vector`. Alembic migrations go under future work.
+
+**Changing a column later:** `create_all` only creates missing tables; it never alters an existing one. Before real leads exist, change the model, drop the table on the Neon test branch and then on main (`DROP TABLE callbacks, leads` or `DROP TABLE support_requests`), and let `init_db` recreate it on the next start. Once real leads exist, apply a reviewed `ALTER TABLE` script by hand (test branch first), or introduce Alembic.
 
 ### 3.11 Errors and safety
 - **Input:** 1–1,000 characters; control characters stripped.
@@ -295,7 +310,7 @@ One task = one Claude Code session = one `/handoff`.
 | T4 | Sun | Retrieval eval script + `docs/EVAL.md` | Table for keyword / vector / hybrid; hybrid hit@3 ≥ 0.9 or misses explained |
 | T5 | Sun | `app/core/llm.py` (Gemini + Groq fallback + retries), `rag_prompt.md`, grounded `/api/chat` v0 (retrieve → answer + sources) | The 5 PDF questions get correct, sourced answers; no invented price. q01 ("What solar systems do you provide?") moved to T8 |
 | T6 | Sun | Dockerfile + deploy the skeleton to Render | Live `/api/health` returns ok. **Done 2026-10-11:** the Render service `vantis-sales-agent-api` (Singapore; URL in the Render Dashboard, README in T14): `/api/health` → ok, db ok, kb_chunks 54; `/api/chat` Delhi → 200, KB Section 10, gemini, about 1 s warm |
-| T7 | Mon | Leads layer: tables, validation, scoring, reason (LLM + template fallback), unit tests | Scoring tests pass for HOT / WARM / COLD / caps |
+| T7 | Mon | Leads layer: tables, validation, scoring, reason (LLM + template fallback), unit tests | Scoring tests pass for HOT / WARM / COLD / caps. **Done 2026-10-11:** Rahul 97 HOT; same lead in Pune 82 → 74 WARM; round trip on the test branch |
 | T8 | Mon | LangGraph agent (part 3.1), the 6 tools, checkpointer, system + extraction prompts, `/api/chat` v1 | The demo script via the API creates a HOT lead (live test). The q01 reply names the 5 packages (HomeStart 3, HomePro 5, HomeMax 10, Business 15, Business 25) and cites KB Section 8, and the q01 xfail marker in `tests/test_live_chat.py` is gone. The rewritten-query eval keeps hybrid hit@3 at 22/24 or better |
 | T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint |
 | T10 | Tue | Chat page: welcome message + starter buttons (F0, no LLM call), messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser |
@@ -314,6 +329,11 @@ Rule: no extras until the current task's "Done when" passes.
 
 ### T9 note (from T6)
 - **Client IP behind Render's proxy.** The app sees the proxy's IP, because uvicorn trusts forwarded headers only from 127.0.0.1 by default. The per-IP rate limit needs the real client IP, or every customer would share one limit. T9 decides how to trust `X-Forwarded-For` (e.g. uvicorn `--proxy-headers` with `--forwarded-allow-ips`, or reading the right entry of the header) without letting clients spoof it.
+
+### T8 notes (from T7)
+- **Packages to kW.** The understand step gets the KB Section 8 summary chunk (read from the DB, not typed into code), so a named package like "HomePro 5" becomes `system_size_kw` 5 and counts as a clear requirement.
+- **Reason latency.** `create_lead` and `update_lead` call `fast_llm` for the reason (worst case about 46 s with the T5 timeouts, outside the DB transaction). If that slows the chat, write the reason in `finalize` or after the reply.
+- **Field descriptions.** `LeadData`'s field descriptions (e.g. `timeline_bucket`: "lt_1m = now, this month or next month") are part of the structured-output schema; keep them in sync with `docs/SCORING.md`.
 
 ### T8 notes (from T5)
 - **q01 retrieval.** "What solar systems do you provide?" misses KB Sections 8 and 9: its words (solar, system, provide) are not in the catalog rows, so they get no keyword hit, and the Section 8 summary chunk is only 6th on vector similarity (0.708; the best of 4 wordings tried reached 0.736 against 0.751 for the top chunk). Evidence in `docs/EVAL.md` ("T5: summary chunks").

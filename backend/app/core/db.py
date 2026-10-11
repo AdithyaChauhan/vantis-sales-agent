@@ -47,7 +47,8 @@ def init_db(engine: Engine | None) -> None:
         logger.warning("DATABASE_URL not set; skipping db init")
         return
     try:
-        import app.rag.models  # noqa: F401  (registers the tables on Base)
+        import app.leads.models  # noqa: F401  (registers the lead tables on Base)
+        import app.rag.models  # noqa: F401  (registers the KB tables on Base)
 
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))

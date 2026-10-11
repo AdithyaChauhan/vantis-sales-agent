@@ -2,7 +2,7 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T6)
+## Backend modules (as of T7)
 | Module | Role |
 |---|---|
 | `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware (skips `QUIET_PATHS`: `/api/health/live`), CORS, routers |
@@ -19,6 +19,12 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/rag/models.py` | `KbChunk` (`kb_chunks`: vector + generated tsvector with GIN index) and `ServiceArea` (`service_areas`, unique on city + region) |
 | `app/rag/ingest.py` | `python -m app.rag.ingest`: parse, chunk, embed all first, then replace all rows in ONE transaction; `--dry-run` prints chunks and touches no DB or key |
 | `app/rag/retriever.py` | `search(query, k, mode)`: keyword (stemmed words OR'd, words in more than 30% of chunks dropped, `ts_rank_cd`) + vector (cosine), RRF fusion (k = 60, keyword weight 0.5), relevance gate (similarity only when a vector search ran), keyword fallback with `degraded`; policy chunks never returned |
+| `app/leads/schemas.py` | `LeadData` (the lead contract: every field optional, null = unknown, units in names, per-field `description` for T8's structured output, `from_raw` keeps valid values and reports invalid ones), `LeadView` and the result models |
+| `app/leads/validators.py` | Pure validators: Indian mobile → `+91XXXXXXXXXX`, email syntax (email-validator, no network), ₹ amounts (`₹4,000`, `4k`, `1.2 lakh`), kW, kWh, names, text; plain error messages |
+| `app/leads/scoring.py` | `score_lead` (rubric, caps at WARM and 74, breakdown JSON), `status_for`, `recommended_action`, `missing_for_creation` |
+| `app/leads/reason.py` | `write_reason`: one sentence from `fast_llm` (breakdown only, no personal details or money), template fallback |
+| `app/leads/models.py` | `Lead` (`leads`), `Callback` (`callbacks`, status `requested`), `SupportRequest` (`support_requests`) |
+| `app/leads/service.py` | `create_lead` (refuses until the minimum fields, one lead per session), `update_lead` (merge, re-locate, re-score), `get_lead`, `list_leads`, `schedule_callback`, `create_support_request`; logs ids, status and score only |
 | `app/services/service_areas.py` | `ServiceAreas.lookup(city, state)`: alias map + rapidfuzz (score 85); loads from the `service_areas` table (`get_service_areas()`, cached) |
 | `scripts/list_models.py` | Lists Gemini chat and embedding models for the key |
 | `scripts/search_kb.py` | Prints the mode, `no_context` and the top chunks with scores and ranks |
@@ -103,3 +109,19 @@ flowchart LR
   web -->|"DATABASE_URL"| neon[("Neon Postgres + pgvector, AWS Singapore")]
   web -->|"GOOGLE_API_KEY / GROQ_API_KEY"| llms["Gemini, Groq"]
 ```
+
+## Leads layer (T7)
+Called by T8's tools and T9's API (no endpoint yet). Rules in plain words: `docs/SCORING.md`.
+```mermaid
+flowchart LR
+  raw["raw details (agent or API)"] --> parse["LeadData.from_raw: validators, errors kept apart"]
+  parse --> min{"name + phone/email + city + a need?"}
+  min -->|"no"| missing["missing_fields, nothing saved"]
+  min -->|"yes"| loc["ServiceAreas.lookup: listed / unverified"]
+  loc --> score["score_lead: 6 rules, caps, HOT / WARM / COLD"]
+  score --> reason["write_reason: fast_llm or template"]
+  score --> action["recommended_action"]
+  reason --> db[("leads, callbacks, support_requests")]
+  action --> db
+```
+
