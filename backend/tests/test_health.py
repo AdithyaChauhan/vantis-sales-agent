@@ -1,3 +1,5 @@
+import logging
+
 from app.core.db import init_db
 
 
@@ -34,3 +36,20 @@ def test_request_id_generated_and_echoed(client, use_engine):
     assert client.get("/api/health").headers["X-Request-ID"]
     response = client.get("/api/health", headers={"X-Request-ID": "abc123"})
     assert response.headers["X-Request-ID"] == "abc123"
+
+
+def test_live_check_needs_no_database(client, use_engine, unreachable_engine):
+    use_engine(unreachable_engine)  # a DB query would fail or be slow; the live check makes none
+    response = client.get("/api/health/live")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert response.headers["X-Request-ID"]
+
+
+def test_live_check_is_not_logged(client, use_engine, caplog):
+    use_engine(None)
+    with caplog.at_level(logging.INFO, logger="app.request"):
+        client.get("/api/health/live")
+        client.get("/api/health")
+    logged = [r.path for r in caplog.records if r.getMessage() == "request"]
+    assert logged == ["/api/health"]

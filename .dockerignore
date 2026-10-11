@@ -1,0 +1,16 @@
+# Second guard for the Dockerfile's explicit COPY lines: send only what the image needs.
+# Ignore everything...
+*
+
+# ...then allow the app package, its requirements and the prompts
+!backend
+backend/*
+!backend/app
+!backend/requirements.txt
+!prompts
+
+# ...and never these, even inside the allowed folders (later lines win)
+**/__pycache__
+**/*.py[cod]
+**/.env*
+**/*.pdf

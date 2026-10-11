@@ -16,6 +16,8 @@ from app.core.logging import request_id_var, setup_logging
 settings = get_settings()
 setup_logging(settings.log_level)
 logger = logging.getLogger("app.request")
+# Not logged: Render calls the health check every few seconds and would bury the real logs.
+QUIET_PATHS = {"/api/health/live"}
 
 
 @asynccontextmanager
@@ -43,6 +45,8 @@ async def request_context(request: Request, call_next):
             content={"detail": "Something went wrong", "request_id": request_id},
         )
     response.headers["X-Request-ID"] = request_id
+    if request.url.path in QUIET_PATHS and response.status_code < 400:
+        return response
     logger.info(
         "request",
         extra={

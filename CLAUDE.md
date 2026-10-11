@@ -44,6 +44,9 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - Search the KB: `cd backend && python -m scripts.search_kb "question" [--mode keyword|vector|hybrid]`
 - Retrieval eval: `cd backend && python -m scripts.eval_retrieval`
 - Frontend: `cd frontend && npm run dev`
+- Docker image (repo root, Docker Desktop running): `docker build -t vantis-api .`
+- Run the image: `docker run --rm -p 10000:10000 --env-file backend/.env vantis-api` (add `--cpus=0.1 --memory=512m` to match Render's free plan)
+- Deploy: push to `main`; Render builds from `render.yaml` (steps in `docs/DEPLOY.md`)
 These commands appear as their tasks get built. Keep this list in sync.
 
 ## Rules

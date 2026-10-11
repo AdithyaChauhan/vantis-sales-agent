@@ -1,0 +1,63 @@
+# Render Blueprint: the backend API as one free Docker web service. Steps: docs/DEPLOY.md.
+# No secret values here (the repo becomes public). Secrets use sync: false: Render asks for them
+# once, when the Blueprint is first created; variables added later must be set in the Dashboard.
+# Plain values must match backend/.env.example (tests/test_deploy_config.py checks this).
+services:
+  - type: web
+    name: vantis-sales-agent-api
+    runtime: docker
+    # Must be explicit: without it Render picks a paid instance
+    plan: free
+    # Closest to the Neon project (AWS Singapore). Cannot be changed later.
+    region: singapore
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Light check, no database query (see docs/DEPLOY.md). /api/health is the full check.
+    healthCheckPath: /api/health/live
+    # T13: switch to checksPass once GitHub Actions CI exists
+    autoDeployTrigger: commit
+    # Only changes that affect the image trigger a build (500 build minutes a month on the free plan)
+    buildFilter:
+      paths:
+        - Dockerfile
+        - .dockerignore
+        - backend/requirements.txt
+        - backend/app/**
+        - prompts/**
+    envVars:
+      # Secrets: typed into Render's form, copied from backend/.env
+      - key: DATABASE_URL
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      # Sales endpoints and dashboard (T9, T11): Render generates a random value
+      - key: SALES_API_KEY
+        generateValue: true
+      # Settings
+      - key: LLM_MODEL_MAIN
+        value: gemini-3.5-flash-lite
+      - key: LLM_MODEL_FAST
+        value: gemini-3.1-flash-lite
+      - key: EMBEDDING_MODEL
+        value: gemini-embedding-2
+      - key: EMBEDDING_DIM
+        value: "768"
+      - key: RETRIEVAL_MIN_SIMILARITY
+        value: "0.63"
+      - key: FALLBACK_MODEL
+        value: openai/gpt-oss-120b
+      # T13 adds the Vercel URL
+      - key: CORS_ORIGINS
+        value: http://localhost:5173
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LANGSMITH_TRACING
+        value: "false"
+      - key: LANGSMITH_PROJECT
+        value: vantis-sales-agent
+      # Left out on purpose: TEST_DATABASE_URL (tests only), KB_PATH (ingest only; the PDF is not
+      # in the image), LANGSMITH_API_KEY (tracing is off; add it in the Dashboard if you turn it on),
+      # PORT (Render sets it).

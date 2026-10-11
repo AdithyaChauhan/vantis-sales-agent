@@ -2,16 +2,16 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T5)
+## Backend modules (as of T6)
 | Module | Role |
 |---|---|
-| `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware, CORS, routers |
+| `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware (skips `QUIET_PATHS`: `/api/health/live`), CORS, routers |
 | `app/core/config.py` | `Settings` (pydantic-settings, reads `backend/.env`), `get_settings()` |
 | `app/core/logging.py` | JSON log formatter, `request_id_var` |
 | `app/core/db.py` | `Base`, `get_engine()` (Neon, pre-ping), `check_db()`, `init_db(engine)` (pgvector + `create_all`) |
 | `app/core/llm.py` | `embedder()`: google-genai, one Content per text, batches of 20, vector count and size checks, document vs query timeouts, LRU cache for queries. `query_embedder()`: the same, or None (request dependency). `main_llm()` / `fast_llm()`: `chat_llm(model)` = Gemini (`thinking_level` minimal, 15 s, 1 retry, none on 429) `.with_fallbacks([Groq])` (15 s, no retry, `reasoning_effort` low); never raises when built. `invoke_llm()` → `LLMReply(text, provider, latency_ms)`, logs provider and latency; `reply_text()` keeps text blocks only and strips `<think>` |
 | `app/core/prompts.py` | `load_prompt(name)`: reads `prompts/<name>.md` (cached) |
-| `app/api/health.py` | `GET /api/health` (status, db, kb_chunks) |
+| `app/api/health.py` | `GET /api/health` (status, db, kb_chunks); `GET /api/health/live` (`{"status":"ok"}`, no DB, Render's health check) |
 | `app/api/chat.py` | `POST /api/chat` v0: validates the message (control characters stripped, 1-1,000 chars), `search(k=4)`, `answer()`. DB down → 503; any other error → 200 degraded; `lead` always null |
 | `app/rag/answer.py` | `answer(question, SearchResult, llm)`: no context → fixed reply without an LLM call; else system + RAG prompt → `invoke_llm`; LLM failure → degraded reply. `format_context` (`[KB Section N: Title]` labels), `cited_sections`, `pick_sources` (one per cited section), steps |
 | `app/rag/pdf_parser.py` | `parse_kb(path)`: KB PDF to numbered sections with text lines and tables (pdfplumber; cover, header and footer removed) |
@@ -24,10 +24,13 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `scripts/search_kb.py` | Prints the mode, `no_context` and the top chunks with scores and ranks |
 | `scripts/eval_retrieval.py` | Embeds the 24 KB and 8 off-topic questions once, runs `search()` in all three modes (k = 10), prints hit@1, hit@3, MRR, the misses and the gate results, and writes `docs/EVAL.md` (its "Tuning notes" section is hand-written and kept) |
 
+Deployment files (repo root): `Dockerfile` (python:3.12-slim, app + prompts only, non-root, uvicorn on `$PORT`), `.dockerignore`, `render.yaml` (one free web service, Singapore). Steps: `docs/DEPLOY.md`.
+
 ## Request flow
 ```mermaid
 flowchart LR
   client["Client"] --> mw["Middleware: request id, JSON log, 500 guard"]
+  mw --> live["GET /api/health/live (no DB)"]
   mw --> health["GET /api/health"]
   health --> check["check_db: SELECT 1"]
   health --> count["count_kb_chunks"]

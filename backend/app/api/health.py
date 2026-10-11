@@ -18,3 +18,10 @@ def health(engine: Engine | None = Depends(get_engine)) -> dict[str, str | int |
         "db": "ok" if db_ok else "error",
         "kb_chunks": kb_chunks,
     }
+
+
+@router.get("/api/health/live")
+def live() -> dict[str, str]:
+    """Render's health check: the process is up. No database query, so it stays fast (Render allows
+    5 s) and lets Neon auto-suspend. Use /api/health for the full check."""
+    return {"status": "ok"}
