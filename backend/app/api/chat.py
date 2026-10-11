@@ -1,7 +1,8 @@
 """POST /api/chat: one customer message through the LangGraph agent (app/agent/graph.py).
 
-The conversation is remembered per session_id. `lead` stays null until T8b adds the lead tools.
-Never a 500: database trouble is a 503, anything else a friendly degraded reply.
+The conversation is remembered per session_id, a random UUID v4 the server issues on the first message
+(a guessable id like "demo-1" would let anyone continue someone else's chat). Rate limited per client IP
+(app/api/security.py). Never a 500: database trouble is a 503, anything else a friendly degraded reply.
 """
 import logging
 import threading
@@ -19,13 +20,14 @@ from sqlalchemy.exc import DBAPIError
 
 from app.agent.graph import get_agent
 from app.agent.state import turn_input
+from app.api.security import chat_rate_limit
 from app.core.config import get_settings
 from app.core.logging import request_id_var
 from app.leads.service import refresh_reason
 from app.rag.answer import LLM_DOWN_REPLY
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+router = APIRouter(tags=["chat"])
 
 MAX_MESSAGE_CHARS = 1000
 DB_DOWN_DETAIL = "Our knowledge base is not reachable right now. Please try again in a minute."
@@ -36,6 +38,7 @@ DB_ERRORS = (DBAPIError, psycopg.OperationalError, psycopg_pool.PoolTimeout)
 SESSION_LOCKS = [threading.Lock() for _ in range(64)]
 LOCK_TIMEOUT_S = 60
 BUSY_REPLY = "I'm still working on your last message. Please wait a moment and try again."
+SESSION_ID_ERROR = "session_id must be the id from an earlier reply (a UUID v4); leave it out to start a new chat."
 
 
 def session_lock(session_id: str) -> threading.Lock:
@@ -52,9 +55,25 @@ def clean_message(text: str) -> str:
 class ChatRequest(BaseModel):
     """A customer message. The conversation is remembered per session_id (a new one when not given)."""
 
-    session_id: str | None = Field(default=None, max_length=100)
+    session_id: str | None = Field(
+        default=None, max_length=100, description="From an earlier reply; leave it out to start a new chat"
+    )
     message: str
     channel: str = Field(default="web", max_length=20)
+
+    @field_validator("session_id")
+    @classmethod
+    def _session_id(cls, value: str | None) -> str | None:
+        """Only random ids: a UUID v4 (122 random bits), returned in its standard form."""
+        if value is None:
+            return None
+        try:
+            parsed = uuid.UUID(value)
+        except ValueError:
+            raise ValueError(SESSION_ID_ERROR) from None
+        if parsed.version != 4:  # None for the nil UUID and other non-RFC ids
+            raise ValueError(SESSION_ID_ERROR)
+        return str(parsed)
 
     @field_validator("message")
     @classmethod
@@ -106,9 +125,9 @@ class ChatResponse(BaseModel):
     degraded: bool
 
 
-@router.post("/api/chat", response_model=ChatResponse)
+@router.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(chat_rate_limit)])
 def chat(request: ChatRequest, background: BackgroundTasks, agent=Depends(get_agent)):
-    """Answer one customer message. 503 if the database is down; never a 500.
+    """Answer one customer message. 429 over the rate limit, 503 if the database is down; never a 500.
 
     A lead reason the turn left pending is written by the LLM after the reply (background task).
     """

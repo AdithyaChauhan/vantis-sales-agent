@@ -23,6 +23,7 @@ from app.leads.schemas import (
     LeadData,
     LeadView,
     SupportRequestResult,
+    SupportRequestView,
     UpdateLeadResult,
 )
 from app.leads.scoring import missing_for_creation, recommended_action, score_lead
@@ -338,3 +339,15 @@ def create_support_request(
         request_id = request.id
     logger.info("support request created", extra={"support_request_id": request_id})
     return SupportRequestResult(id=request_id, errors=errors)
+
+
+def list_support_requests(
+    engine: Engine, limit: int = 50, offset: int = 0
+) -> tuple[list[SupportRequestView], int]:
+    """(support requests, total), newest first."""
+    limit, offset = max(1, min(limit, MAX_LIMIT)), max(0, offset)
+    query = select(SupportRequest).order_by(SupportRequest.created_at.desc(), SupportRequest.id.desc())
+    with Session(engine) as session:
+        rows = session.scalars(query.limit(limit).offset(offset)).all()
+        total = session.scalar(select(func.count()).select_from(SupportRequest))
+        return [SupportRequestView.model_validate(r) for r in rows], int(total)

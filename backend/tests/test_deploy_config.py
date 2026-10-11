@@ -15,7 +15,9 @@ LEFT_OUT = {
     "LANGSMITH_HIDE_METADATA": "tracing is off on Render; T13 decides the privacy settings",
 }
 # Plain values meant to differ from backend/.env.example in production, and why (T13: CORS_ORIGINS)
-PROD_DIFFERS: dict[str, str] = {}
+PROD_DIFFERS: dict[str, str] = {
+    "CLIENT_IP_HEADER": "Cloudflare sets CF-Connecting-IP on Render; local requests come through no proxy",
+}
 
 
 def service() -> dict:

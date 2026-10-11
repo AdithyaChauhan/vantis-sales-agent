@@ -32,6 +32,12 @@ class Settings(BaseSettings):
 
     sales_api_key: str = ""
     cors_origins: str = "http://localhost:5173"
+    # Header a trusted proxy writes with the real client IP (Render: CF-Connecting-IP, which Cloudflare
+    # overwrites on every request). Empty: use the connection's address (local runs, tests).
+    client_ip_header: str = ""
+    # /api/chat messages per client IP (PLAN.md part 3.11 explains the numbers)
+    chat_limit_per_minute: int = 10
+    chat_limit_per_day: int = 100
 
     kb_path: str = "data/kb/Vantis_Energy_Solutions_Knowledge_Base.pdf"
     log_level: str = "INFO"

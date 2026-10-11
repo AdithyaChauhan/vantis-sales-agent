@@ -6,6 +6,7 @@ Run: python -m pytest -m live -s   (prints each reply, its steps and the LLM cal
 """
 import re
 import time
+import uuid
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -89,9 +90,10 @@ def test_q05_warranty_gives_no_duration(client):
 
 
 def test_follow_up_uses_memory(client):
-    first = ask(client, "Do you provide installation in Delhi?", session_id="live-memory")
+    session = str(uuid.uuid4())
+    first = ask(client, "Do you provide installation in Delhi?", session_id=session)
     assert 10 in cited_sections(first["reply"])
-    second = ask(client, "And in Kanpur?", session_id="live-memory")
+    second = ask(client, "And in Kanpur?", session_id=session)
     assert "Kanpur" in second["reply"]
     assert 10 in cited_sections(second["reply"]) or tool_steps(second, "check_service_area")
     assert "install" in second["reply"].lower() or "service" in second["reply"].lower()
@@ -112,8 +114,9 @@ def test_hello_gets_the_welcome(client):
 
 
 def test_no_claimed_actions_after_yes_please(client):
-    ask(client, "Do you provide installation in Delhi?", session_id="live-no-claims")
-    body = ask(client, "Yes please, connect me", session_id="live-no-claims")
+    session = str(uuid.uuid4())
+    ask(client, "Do you provide installation in Delhi?", session_id=session)
+    body = ask(client, "Yes please, connect me", session_id=session)
     assert any(s["node"] == "agent" for s in body["steps"]), "went to a fixed reply, not the agent"
     assert not CLAIMED_ACTION_RE.search(body["reply"]), "the reply claims an action that did not happen"
 

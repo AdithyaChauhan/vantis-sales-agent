@@ -1,5 +1,6 @@
 """Lead tools in the agent: scripted models, the real T7 leads service on the Neon test branch."""
 import threading
+import uuid
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -296,7 +297,7 @@ def test_reason_is_written_after_the_reply(ops, client):
     agent = Scripted(tool_call("create_lead", {}), answer("Saved; the sales team can follow up."))
     graph, _ = make_graph(understand_llm, agent, ops=ops)
     app.dependency_overrides[get_agent] = lambda: graph
-    body = client.post("/api/chat", json={"message": "details", "session_id": "bg-1"}).json()
+    body = client.post("/api/chat", json={"message": "details", "session_id": str(uuid.uuid4())}).json()
     lead = service.get_lead(ops.engine, body["lead"]["id"])
     # TestClient runs the background task before returning, as the server does after the response
     assert (lead.reason, lead.reason_source) == (REASON, "llm")

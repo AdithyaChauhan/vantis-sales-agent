@@ -161,11 +161,16 @@ def _blank(value) -> bool:
 
 def error_message(exc: ValidationError) -> str:
     """The first error as a plain sentence (our own messages, without Pydantic's 'Value error, ')."""
-    error = exc.errors()[0]
-    message = str(error.get("ctx", {}).get("error") or error["msg"])
+    return error_text(exc.errors()[0])
+
+
+def error_text(error: dict) -> str:
+    """One Pydantic error (an item of exc.errors()) as a plain sentence. Also used for the API's 422s."""
     if error["type"] == "literal_error":
-        message = f"Please choose one of: {error['ctx']['expected']}."
-    return message
+        return f"Please choose one of: {error['ctx']['expected']}."
+    if error["type"] == "extra_forbidden":
+        return "Unknown field."
+    return str(error.get("ctx", {}).get("error") or error["msg"])
 
 
 class CallbackView(BaseModel):
@@ -222,6 +227,21 @@ class CallbackResult(BaseModel):
 
     callback: CallbackView
     message: str
+
+
+class SupportRequestView(BaseModel):
+    """A stored support request, for the sales team (no session_id: it is the key to the customer's chat)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    phone: str | None
+    email: str | None
+    project_details: str | None
+    issue: str
+    status: str
+    created_at: datetime
 
 
 class SupportRequestResult(BaseModel):

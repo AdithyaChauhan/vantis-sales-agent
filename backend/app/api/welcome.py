@@ -6,7 +6,7 @@ from fastapi import APIRouter
 
 from app.agent.welcome import STARTER_QUESTIONS, WELCOME_TEXT
 
-router = APIRouter()
+router = APIRouter(tags=["chat"])
 
 
 @router.get("/api/welcome")

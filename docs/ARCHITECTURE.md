@@ -2,11 +2,14 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T8b)
+## Backend modules (as of T9)
 | Module | Role |
 |---|---|
-| `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware (skips `QUIET_PATHS`: `/api/health/live`), CORS, routers |
+| `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware (skips `QUIET_PATHS`: `/api/health/live`; adds `ip_source` for rate-limited requests, never the IP), error handlers (`ApiError`, 422 with one message per field, database down → 503), CORS (GET/POST; `Content-Type`, `X-API-Key`, `X-Request-ID`; exposes `Retry-After`), routers |
 | `app/core/config.py` | `Settings` (pydantic-settings, reads `backend/.env`), `get_settings()` |
+| `app/core/rate_limit.py` | `RateLimiter(limits)`: in-memory fixed windows per key, thread-safe; `hit()` counts or returns the seconds to wait (a refused request is not counted), `blocked()` only checks |
+| `app/api/security.py` | `client_ip` (the `CLIENT_IP_HEADER` value if it is one valid IP, else the connection address; never `X-Forwarded-For`), `limit_key` (IPv6 per /64), `chat_rate_limit` (10/min + 100/day per IP → 429 + Retry-After), `require_sales_key` (`X-API-Key`, constant-time, fails closed, 10 wrong keys per 15 min per IP → 429), `ApiError` + `error_response` (the JSON error shape) |
+| `app/api/sales.py` | Sales router (key required): `GET /api/leads`, `GET /api/leads/{id}`, `POST /api/leads`, `POST /api/callback`, `GET /api/support-requests`, all through `app/leads/service.py`; never returns `session_id` |
 | `app/core/logging.py` | JSON log formatter, `request_id_var` |
 | `app/core/db.py` | `Base`, `get_engine()` (Neon, pre-ping), `check_db()`, `init_db(engine)` (pgvector + `create_all`) |
 | `app/core/llm.py` | `embedder()` and `query_embedder()` (google-genai, one Content per text, batches of 20, LRU cache for queries). `GeminiChat`: adds our `http_options` (15 s, 1 retry, none on 429) to every Gemini request. `chat_llm(model, tools=, schema=)`: Gemini with a Groq fallback, built separately for plain, tool-bound and structured-output use (Groq: `parallel_tool_calls=False`). `main_llm()`, `fast_llm()`, `invoke_llm()`, `provider_of()`, `reply_text()` |
@@ -21,7 +24,7 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/agent/welcome.py` | Fixed texts: welcome (F0), starter questions, closing line, off-topic redirect |
 | `app/api/welcome.py` | `GET /api/welcome` |
 | `app/api/health.py` | `GET /api/health` (status, db, kb_chunks); `GET /api/health/live` (`{"status":"ok"}`, no DB, Render's health check) |
-| `app/api/chat.py` | `POST /api/chat`: validates the message, runs the agent with `thread_id` = `session_id`, returns reply, sources, steps, `lead` (summary; status and score only with `CHAT_SHOW_LEAD_SCORE`) and degraded. One turn per session (striped locks, 60 s timeout); a pending lead reason is written after the reply (background task). DB errors → 503; anything else → 200 degraded |
+| `app/api/chat.py` | `POST /api/chat`: rate limited (`chat_rate_limit`); `session_id` must be a UUID v4 (the server issues one when none is sent); validates the message, runs the agent with `thread_id` = `session_id`, returns reply, sources, steps, `lead` (summary; status and score only with `CHAT_SHOW_LEAD_SCORE`) and degraded. One turn per session (striped locks, 60 s timeout); a pending lead reason is written after the reply (background task). DB errors → 503; anything else → 200 degraded |
 | `app/rag/answer.py` | Helpers the agent reuses: `format_context` (`[KB Section N: Title]` labels), `rag_message`, `cited_sections`, `pick_sources` (one per cited section), `normalize_citations`, `retrieve_step`, `LLM_DOWN_REPLY` |
 | `app/rag/pdf_parser.py` | `parse_kb(path)`: KB PDF to numbered sections with text lines and tables (pdfplumber; cover, header and footer removed) |
 | `app/rag/chunker.py` | `Chunk`, `chunk_sections()`: one chunk per table row (KB Sections 8-12) plus one `table_summary` chunk listing every row (8, 10), one per FAQ item (15), prose split at ~1,200 chars, Sections 16-19 tagged `policy`; `embed_text()` = `title: ... \| text: ...` |
@@ -33,7 +36,7 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/leads/scoring.py` | `score_lead` (rubric, caps at WARM and 74, breakdown JSON), `status_for`, `recommended_action`, `missing_for_creation` |
 | `app/leads/reason.py` | `write_reason`: one sentence from `fast_llm` (breakdown only, no personal details or money), template fallback |
 | `app/leads/models.py` | `Lead` (`leads`), `Callback` (`callbacks`, status `requested`), `SupportRequest` (`support_requests`) |
-| `app/leads/service.py` | `create_lead` (refuses until the minimum fields, one lead per session), `update_lead` (merge, re-locate, re-score), `get_lead`, `list_leads`, `schedule_callback`, `create_support_request`; logs ids, status and score only |
+| `app/leads/service.py` | `create_lead` (refuses until the minimum fields, one lead per session), `update_lead` (merge, re-locate, re-score), `get_lead`, `list_leads`, `schedule_callback`, `create_support_request`, `list_support_requests`; logs ids, status and score only |
 | `app/services/service_areas.py` | `ServiceAreas.lookup(city, state)`: alias map + rapidfuzz (score 85); loads from the `service_areas` table (`get_service_areas()`, cached) |
 | `scripts/list_models.py` | Lists Gemini chat and embedding models for the key |
 | `scripts/search_kb.py` | Prints the mode, `no_context` and the top chunks with scores and ranks |
@@ -50,10 +53,17 @@ flowchart LR
   check --> neon[("Neon Postgres + pgvector")]
   count --> neon
   mw --> welcome["GET /api/welcome (fixed text)"]
-  mw --> chat["POST /api/chat"]
+  mw --> limit["chat_rate_limit: 10/min, 100/day per client IP<br/>(CF-Connecting-IP on Render)"]
+  limit -.->|"over"| e429["429 + Retry-After, friendly detail"]
+  limit --> chat["POST /api/chat (session_id: UUID v4)"]
   chat --> agent["agent graph (see Agent graph)"]
   agent --> neon
   agent -.->|"DB error"| e503["503, friendly message"]
+  mw --> key["require_sales_key: X-API-Key, constant time"]
+  key -.->|"missing / wrong; 10 wrong per 15 min → 429; key unset → 503"| e401["401 / 429 / 503"]
+  key --> sales["/api/leads, /api/leads/{id}, /api/callback,<br/>/api/support-requests"]
+  sales --> service["app/leads/service.py (T7)"]
+  service --> neon
 ```
 
 ## Chat v0 (T5)
@@ -121,7 +131,7 @@ flowchart LR
 ```
 
 ## Leads layer (T7)
-Called by T8's tools and T9's API (no endpoint yet). Rules in plain words: `docs/SCORING.md`.
+Called by T8's tools and T9's sales API (`app/api/sales.py`). Rules in plain words: `docs/SCORING.md`.
 ```mermaid
 flowchart LR
   raw["raw details (agent or API)"] --> parse["LeadData.from_raw: validators, errors kept apart"]

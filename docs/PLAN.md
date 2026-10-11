@@ -2,7 +2,7 @@
 
 The single source of truth for what we build and why.
 Roles: Adithya owns the project. Claude (chat) reviews and writes the tasks. Claude Code builds.
-Last updated: 2026-10-11 (T5).
+Last updated: 2026-10-11 (T9).
 
 ---
 
@@ -240,7 +240,9 @@ Plain-language version with worked examples: `docs/SCORING.md`. Code: `app/leads
 LangGraph Postgres checkpointer (`langgraph-checkpoint-postgres`, `app/agent/memory.py`), with `thread_id` = `session_id`. A small `psycopg_pool` pool on `DATABASE_URL` (min 0, max 4, connections checked before use, idle ones closed after 4 minutes, as Neon drops them) with the settings the saver needs (`autocommit`, `prepare_threshold=0`, `dict_row`). `setup()` creates its tables at startup and never fails the boot. The agent sees the last 12 messages, understand the last 6; the full history stays in the checkpoint.
 
 ### 3.9 API contract
-Public: `POST /api/chat`, `GET /api/health`. Sales (header `X-API-Key: <SALES_API_KEY>`): everything else. FastAPI serves the docs at `/docs`.
+Public: `POST /api/chat`, `GET /api/welcome`, `GET /api/health`, `GET /api/health/live`. Sales (header `X-API-Key: <SALES_API_KEY>`): everything else (`app/api/sales.py`, through the T7 service functions). FastAPI serves the docs at `/docs`, with an **Authorize** button for the key.
+
+`session_id` (T9): leave it out on the first message; the server issues a random UUID v4 and the chat page sends it back on every later message. Anything else (e.g. "demo-1", a UUID of another version, the nil UUID) is a 422, because a guessable id would let anyone continue someone else's chat and see their details.
 
 `POST /api/chat` request:
 ```json
@@ -268,11 +270,13 @@ Response:
 | GET | `/api/health` | `{"status": "ok\|degraded", "db": "ok\|error", "kb_chunks": n, "llm": {...}}`. Never 500 |
 | GET | `/api/welcome` | `{"text", "starter_questions"}`: the F0 welcome (public, no LLM call; the agent sends the same text to a hello) |
 | GET | `/api/health/live` | `{"status": "ok"}`, no DB query, not logged. Render's health check (T6) |
-| GET | `/api/leads?status=&limit=&offset=` | `{"items": [...], "total": n}` |
-| GET | `/api/leads/{id}` | All fields + `score_breakdown` + callbacks |
-| POST | `/api/leads` | Manual create: validated and scored. Returns 201 |
-| POST | `/api/callback` | `{"lead_id", "preferred_time", "notes"}` → 201 `{"id", "status": "requested"}` |
-| GET | `/api/support-requests` | List of support requests |
+| GET | `/api/leads?status=HOT\|WARM\|COLD&sort=newest\|score&limit=1..200&offset=` | `{"items", "total", "limit", "offset"}`; each item: `id, name, lead_score, lead_status, city, location_status, requirement, system_size_kw, monthly_bill_inr, recommended_action, created_at` (phone and email only in the detail) |
+| GET | `/api/leads/{id}` | All fields + `score_breakdown`, `reason`, `reason_source`, `recommended_action`, callbacks, timestamps. Never `session_id` (it is the key to the customer's chat). 404 if unknown |
+| POST | `/api/leads` | Manual create through `service.create_lead`: same checks and scoring as a chat lead. 201 with the lead; the LLM reason is written after the response (like chat). Invalid or unknown field → 422 `errors`; minimum details missing → 422 `missing_fields`; nothing saved then |
+| POST | `/api/callback` | `{"lead_id", "preferred_time", "notes"}` → 201 `{"id", "lead_id", "status": "requested", "preferred_time", "notes", "created_at", "message"}`. Unknown lead → 404 |
+| GET | `/api/support-requests?limit=&offset=` | `{"items", "total", "limit", "offset"}`, newest first, no `session_id` |
+
+**Errors (T9)** are always JSON `{"detail": "<message>", ..., "request_id"}`: 401 missing or wrong key; 404 unknown id; 422 `{"errors": {"<field>": "<message>"}}` (the input is not echoed back) or `{"missing_fields": [...]}`; 429 `{"retry_after": n}` plus the `Retry-After` header; 503 database down or not configured, or `SALES_API_KEY` not set.
 
 ### 3.10 Database (Neon)
 - `kb_chunks`: see part 3.6. `embedding vector(D)`, `tsv` generated.
@@ -288,13 +292,18 @@ Tables are created on startup with `create_all` + `CREATE EXTENSION IF NOT EXIST
 
 ### 3.11 Errors and safety
 - **Input:** 1–1,000 characters; control characters stripped.
-- **Rate limit:** 20 chat messages per minute per IP (in memory). This protects the free LLM quota on the live demo.
+- **Rate limit (T9, `app/api/security.py`, `app/core/rate_limit.py`):** `/api/chat` allows **10 messages a minute and 100 a day per client IP** (`CHAT_LIMIT_PER_MINUTE`, `CHAT_LIMIT_PER_DAY`). Over a limit: 429, `Retry-After` and a friendly `detail` the chat page shows. Why these numbers: a turn uses 1 fast-model call and 1-2 main-model calls (T8b), and the main model (15 a minute, 500 a day) is the bottleneck, so the whole service manages about 8 turns a minute and 280 a day; Groq (30 a minute but 8K tokens a minute, about 2-3 agent calls) only bridges bursts. The earlier 20 a minute would let one IP use more than twice the minute quota. 10 a minute is above any human pace (one IP at full speed makes about 17 main calls a minute, a burst Groq absorbs). 100 a day covers reviewers sharing one office IP and video retakes, and is about 175 main calls, about 35% of the day's quota. No global cap: quota exhaustion already degrades gently (Gemini 429 → Groq → friendly reply), and a global cap would let one abuser lock everyone out. Every request counts, including a 422 (the limiter runs before the body is validated). Fixed windows start at the first request; at a boundary up to twice the limit can pass in a burst.
+- **In memory, one instance:** the counters live in the process. That is correct for Render's single free instance with one worker; they reset when the service restarts or sleeps. More instances would need a shared store (Redis, Future work).
+- **Client IP behind Render's proxy (T9):** Render puts Cloudflare and its load balancer in front of every web service, so the connection address is a proxy. Cloudflare writes `CF-Connecting-IP` on every request and overwrites any value the caller sent, but only *appends* to `X-Forwarded-For`, so its first entry is whatever the caller claims (Render: <https://render.com/articles/host-pocketbase-on-render>, <https://render.com/articles/how-render-handles-ddos-attacks>; Cloudflare: <https://developers.cloudflare.com/fundamentals/reference/http-headers/>). uvicorn's `--forwarded-allow-ips="*"` would take that spoofable first entry, and its default leaves the proxy IP. So the app reads only the header named in `CLIENT_IP_HEADER` (`CF-Connecting-IP` on Render, empty locally), accepts it only if it is one valid IP, and never reads `X-Forwarded-For`. IPv6 is counted per /64. A missing header falls back to the connection address (one shared bucket: stricter, never looser). The request log records `ip_source: header|fallback` for each limited request, never the IP.
+- **Sales API key (T9):** compared in constant time (`hmac.compare_digest`). If `SALES_API_KEY` is unset or shorter than 16 characters, every sales request gets 503 (fail closed). **10 wrong keys per 15 minutes per client IP**, then 429 until the window ends, even with the right key. Requests with no key get 401 and are not counted, so opening a sales URL can't lock anyone out. A 32-byte random key can't be brute-forced anyway; the limit stops noise. Keys are never logged.
+- **CORS (T9):** methods GET and POST; headers `Content-Type`, `X-API-Key`, `X-Request-ID`; `Retry-After` and `X-Request-ID` exposed to the browser.
+- **Session ids (T9):** only UUID v4 (part 3.9).
 - **LLM down:** retries → Groq → a friendly reply ("I'm having trouble right now. Please try again in a minute.") with `degraded: true`. Never a 500 on chat.
 - **DB down:** `/api/health` reports it; chat returns 503 with a friendly message. Never claim a lead was saved if the write failed.
 - **Tool loop:** at most 4 rounds per turn.
 - **One turn per session at a time (T8b):** `/api/chat` takes one of 64 striped locks per `session_id` (60 s timeout; then a friendly "still working on your last message" reply). `service.create_lead` also handles a race on the UNIQUE `session_id` (updates the existing lead), so two requests never create two leads.
 - **Prompt injection:** the rules sit in the system prompt; KB text is treated as data; the lead tools can't accept invented fields.
-- **PII:** sales endpoints need the API key. Logs mask phone numbers and emails.
+- **PII:** sales endpoints need the API key. Logs carry no phone numbers, emails or client IPs.
 
 ### 3.12 Observability
 - JSON logs with `request_id, session_id, node, tool, provider, latency_ms, fallback_used`.
@@ -310,8 +319,10 @@ Tables are created on startup with `create_all` + `CREATE EXTENSION IF NOT EXIST
 | `LLM_MODEL_MAIN`, `LLM_MODEL_FAST` | From `scripts/list_models.py` |
 | `EMBEDDING_MODEL`, `EMBEDDING_DIM` | Must match the vector column |
 | `GROQ_API_KEY`, `FALLBACK_MODEL` | A Groq model that supports tool calling (check the Groq console) |
-| `SALES_API_KEY` | Sales endpoints + dashboard |
+| `SALES_API_KEY` | Sales endpoints + dashboard. At least 16 characters, or the sales API refuses every request. Render generates it |
 | `CORS_ORIGINS` | Comma-separated, e.g. `http://localhost:5173` |
+| `CLIENT_IP_HEADER` | Header with the real client IP. Empty locally; `CF-Connecting-IP` on Render (part 3.11) |
+| `CHAT_LIMIT_PER_MINUTE`, `CHAT_LIMIT_PER_DAY` | `/api/chat` messages per client IP: 10 and 100 (part 3.11) |
 | `KB_PATH` | Defaults to `data/kb/Vantis_Energy_Solutions_Knowledge_Base.pdf`, resolved from the repo root. Ingestion only |
 | `LOG_LEVEL` | `INFO` |
 | `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT` | Optional |
@@ -335,7 +346,7 @@ One task = one Claude Code session = one `/handoff`.
 | T7 | Mon | Leads layer: tables, validation, scoring, reason (LLM + template fallback), unit tests | Scoring tests pass for HOT / WARM / COLD / caps. **Done 2026-10-11:** Rahul 97 HOT; same lead in Pune 82 → 74 WARM; round trip on the test branch |
 | T8a | Mon | LangGraph agent part 1: understand (fast LLM, structured output, query rewrite), retrieve, agent with `search_knowledge_base` + `check_service_area`, finalize; Postgres checkpointer memory; welcome/closing/redirect replies; `GET /api/welcome`; `eval_retrieval --rewrite` | `/api/chat` runs the graph with the v0 shape (`lead` null), never a 500; Delhi → "And in Kanpur?" answered from memory; q01 names the 5 packages and cites KB Section 8 (xfail removed); Pune uses `check_service_area` and is "not in the listed areas; the team can check"; "hi" gets the welcome text; rewrite eval hybrid hit@3 ≥ 22/24. **Done 2026-10-11:** rewrite hit@3 24/24 |
 | T8b | Mon | Lead tools `create_lead`, `update_lead`, `schedule_callback`, `create_support_request` (reading the validated draft from graph state); flows F2-F4; lead status block in the agent prompt; `lead` in the response | The demo script via the API creates a HOT lead (live test); a callback is logged as requested, never booked; an inverter issue becomes a support request, not a lead; the reason-latency decision is made (T8 notes). **Done 2026-10-11:** demo (4 turns) → lead 97 HOT with reason and action plus a callback `requested` on the test branch; "Yes please, connect me" asks for name and phone; the reason is written after the reply (it added about 3.2 s) |
-| T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint |
+| T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint. **Done 2026-10-11:** 5 sales endpoints behind `X-API-Key` (fail closed, failed-key lockout), chat 10/min + 100/day per IP with 429 + Retry-After, client IP from `CF-Connecting-IP`, UUID v4 session ids |
 | T10 | Tue | Chat page: welcome message + starter buttons (F0, no LLM call), messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser |
 | T11 | Tue | Dashboard: API-key prompt, leads table + filter, lead detail with breakdown | Rahul shows as HOT with reason and action |
 | T12 | Wed | Edge-case pass, live scenario tests, prompt fixes logged | Every scenario in part 5 passes or is documented |
@@ -358,7 +369,15 @@ Rule: no extras until the current task's "Done when" passes.
 - **Keep it awake during review?** Decide whether to keep the service awake during the review days (e.g. a scheduled ping every 10 minutes). First check the free instance hours left on Render's Billing page (750 a month per workspace), since an always-awake service uses about 24 a day.
 
 ### T9 note (from T6)
-- **Client IP behind Render's proxy.** The app sees the proxy's IP, because uvicorn trusts forwarded headers only from 127.0.0.1 by default. The per-IP rate limit needs the real client IP, or every customer would share one limit. T9 decides how to trust `X-Forwarded-For` (e.g. uvicorn `--proxy-headers` with `--forwarded-allow-ips`, or reading the right entry of the header) without letting clients spoof it.
+- **Client IP behind Render's proxy.** Done in T9: the app reads `CF-Connecting-IP` (via `CLIENT_IP_HEADER`), never `X-Forwarded-For`; see part 3.11.
+
+### T10 notes (from T9)
+- **Session id.** Send no `session_id` on the first message, then keep the one the reply returns and send it with every later message. Anything that isn't a UUID v4 gets a 422.
+- **Rate limit.** On 429 show the response's `detail` (friendly text) and disable sending for `retry_after` seconds (also in the `Retry-After` header, which CORS exposes).
+- **Errors.** Every error body has a `detail` string; 422 adds `errors` per field.
+
+### T14 note (from T9)
+- **How reviewers get the sales key.** Decide how to hand `SALES_API_KEY` to the reviewers (e.g. the submission form's notes field or the email to Pradrix), **never in the README, the repo or the video**. After the review, rotate it: Render → service → Environment → `SALES_API_KEY` → generate a new value and save (Render redeploys).
 
 ### T8b notes (from T8a)
 - **One question, up to two details.** The system prompt's "at most one follow-up question" and F2's "1-2 missing details per turn" must agree: one question may ask for two details ("Could you share your name and phone number?").
@@ -430,7 +449,7 @@ Rule: no extras until the current task's "Done when" passes.
 5. Money is in INR; phone numbers are Indian.
 6. The KB is the only source of business facts. The renamed-city alias map is general knowledge.
 7. The conversation is in English (Hinglish works on a best-effort basis).
-8. Sales auth is a shared API key, which is demo-grade.
+8. Sales auth is one shared API key (constant-time check, failed-key lockout), which is demo-grade: no per-user accounts or roles.
 9. The KB PDF is assessment material, so it isn't committed. Reviewers use their own copy; the live demo reads from the database and doesn't need it.
 
 ## 8b. Known limitations

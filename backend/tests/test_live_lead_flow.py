@@ -5,6 +5,7 @@ Prints each reply with its steps, node times and the LLM calls used.
 """
 import re
 import time
+import uuid
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -65,7 +66,7 @@ def ask(client, message: str, session_id: str) -> dict:
 
 
 def test_demo_script_creates_a_hot_lead_with_a_requested_callback(client, lead_agent, test_engine):
-    session = "live-demo"
+    session = str(uuid.uuid4())
     ask(client, "What solar systems do you offer for homes?", session)
     second = ask(client, "I'm interested in a 5 kW system for my house in Lucknow. My bill is about ₹4,000 a month "
                          "and I'd like it installed next month.", session)
@@ -88,7 +89,7 @@ def test_demo_script_creates_a_hot_lead_with_a_requested_callback(client, lead_a
 
 
 def test_yes_please_connect_me_asks_for_name_and_phone(client, lead_agent):
-    session = "live-connect"
+    session = str(uuid.uuid4())
     ask(client, "Do you provide installation in Delhi?", session)
     body = ask(client, "Yes please, connect me", session)
     assert NAME_AND_PHONE_RE.search(body["reply"]), "should ask for name and phone"

@@ -8,12 +8,20 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine  # noqa: E402
 
+from app.api import security  # noqa: E402
 from app.core.config import get_settings, to_sqlalchemy_url  # noqa: E402
 from app.core.db import get_engine  # noqa: E402
 from app.main import app  # noqa: E402
 
 # Nothing listens on port 1, so connecting fails instantly.
 UNREACHABLE_URL = "postgresql+psycopg://u:p@127.0.0.1:1/x"
+
+
+@pytest.fixture(autouse=True)
+def fresh_limits():
+    """Every test starts with empty rate-limit counters (they are per process)."""
+    security.CHAT_LIMITER.reset()
+    security.KEY_FAILURES.reset()
 
 
 @pytest.fixture

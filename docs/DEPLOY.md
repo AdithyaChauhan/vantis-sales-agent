@@ -4,7 +4,7 @@ How to put the backend API on Render, check it works, and what the free plan mea
 
 What gets deployed: `render.yaml` (repo root) describes one free web service, built from `Dockerfile` in the Singapore region, next to the Neon database. Render rebuilds and redeploys on every push to `main` that touches the image (see "Build minutes").
 
-> **Keep the service URL private until T9.** `POST /api/chat` has no rate limit yet, so anyone with the URL could use up the Gemini and Groq quota. Don't post it anywhere until T9 is done. The README gets it in T14.
+> **The URL can be shared from T9 on; the sales key cannot.** `POST /api/chat` is rate limited per client IP (10 a minute, 100 a day), so the URL can go into the README (T14). `SALES_API_KEY` never goes into the README, the repo or the video (see PLAN.md, T14 note).
 
 ## The live service
 
@@ -13,7 +13,7 @@ What gets deployed: `render.yaml` (repo root) describes one free web service, bu
 | Service name | `vantis-sales-agent-api` (Blueprint from `render.yaml`) |
 | Plan, region | Free, Singapore (same AWS region as the Neon project) |
 | First deployed | 2026-10-11 (T6) |
-| URL | In the Render Dashboard. It goes into the README in T14; keep it private until T9 |
+| URL | In the Render Dashboard. It goes into the README in T14 |
 | Measured warm | `/api/health` 0.13-0.23 s; `/api/chat` 1.0-1.8 s (Gemini 0.9-1.2 s of that) |
 | Measured cold (first request after sleeping) | `/api/health` 32.5 s after 17 idle minutes (Render wake + app start), then `/api/chat` 3.0 s. Render's own health checks did not keep the service awake |
 
@@ -59,6 +59,46 @@ curl -s -X POST <URL>/api/chat -H "Content-Type: application/json" \
 ```
 
 Expected: an answer citing `[KB Section 10: Reference Service Locations]`, a source with `"section":"10"`, and `"degraded":false`. This proves that the prompts and the API keys made it into the deployed app. `/api/health` alone does not show that.
+
+## Live check of T9 (sales API, key, chat limit): writes nothing to the main database
+
+Every step below only reads, gets refused, or fails validation, so nothing is saved in the main database and no LLM is called. Do step 10 last: it locks your IP out of the sales API for 15 minutes. `<URL>` is the service URL; `<KEY>` is `SALES_API_KEY`.
+
+1. **After the deploy**, open the service → **Environment** and check that `CLIENT_IP_HEADER` = `CF-Connecting-IP`, `CHAT_LIMIT_PER_MINUTE` = `10` and `CHAT_LIMIT_PER_DAY` = `100` are there. If the Blueprint sync did not add them, add them by hand and save. Copy the value of `SALES_API_KEY` (eye icon) to use below; don't paste it anywhere else.
+2. Open `<URL>/api/health` and wait for `"status":"ok"` (about 30 s if it was asleep).
+3. Open `<URL>/docs`. The endpoints are grouped (health, chat, sales); the sales ones show a lock icon. Open **GET /api/leads** → **Try it out** → **Execute** without authorizing → **401** `{"detail":"Missing or invalid API key. ..."}`.
+4. Click **Authorize** (top right), paste the key, **Authorize**, **Close**. Then:
+   - **GET /api/leads** → **200** `{"items": [...], "total": n, ...}`. Write down `total`.
+   - **GET /api/leads** with `status` = `HOT` → **200**.
+   - **GET /api/leads/{lead_id}** with `999999` → **404** `{"detail":"No lead with id 999999."}`.
+   - **GET /api/support-requests** → **200**.
+5. **POST /api/leads**, replace the example body with `{"name": "T9 check"}` → **422** with `missing_fields`. Then `{"phone": "123"}` → **422** with `errors.phone`. Neither saves anything.
+6. **POST /api/callback** with `{"lead_id": 999999, "preferred_time": "tomorrow"}` → **404**; nothing saved.
+7. **GET /api/leads** again: `total` is the same as in step 4, so nothing was written.
+8. Chat limit, in Git Bash (empty messages are refused before the agent runs, but still count):
+   ```bash
+   curl -s -X POST <URL>/api/chat -H "Content-Type: application/json" \
+     -d '{"message":"hi","session_id":"demo-1"}'
+   # → 422, errors.session_id: "session_id must be the id from an earlier reply (a UUID v4); ..."
+   for i in $(seq 1 11); do
+     curl -s -o /dev/null -w "%{http_code}\n" -X POST <URL>/api/chat \
+       -H "Content-Type: application/json" -d '{"message":""}'
+   done
+   # → 422 nine times (the demo-1 request counted too), then 429 twice
+   curl -si -X POST <URL>/api/chat -H "Content-Type: application/json" -d '{"message":""}' | grep -iE "^HTTP|retry-after|detail"
+   # → HTTP 429, a Retry-After header, and "You're sending messages a little fast. Please wait N seconds ..."
+   ```
+9. **The real client IP is used:** Render → service → **Logs**, search for `/api/chat`. Every request line from step 8 must show `"ip_source": "header"`. If any line says `"fallback"`, Cloudflare's header is not reaching the app and every visitor shares one limit: stop and check `CLIENT_IP_HEADER` on the Environment page.
+10. **Spoofed headers don't help (do this last):**
+    ```bash
+    for i in $(seq 1 11); do
+      curl -s -o /dev/null -w "%{http_code}\n" <URL>/api/leads -H "X-API-Key: wrong-$i" \
+        -H "CF-Connecting-IP: 10.0.0.$i" -H "X-Forwarded-For: 10.1.0.$i"
+    done
+    # → 401 ten times, then 429: a fake IP header on each request did not give a fresh limit
+    ```
+    Requests without any key never count, so they can't cause this lockout. Your IP is locked out of the sales API for 15 minutes.
+11. **Optional:** while locked out, open `<URL>/docs` on a phone using mobile data (not your Wi-Fi), authorize with the right key and run **GET /api/leads** → **200**. The limit is per real client, not one shared proxy bucket.
 
 ## Where things are in the Render Dashboard
 

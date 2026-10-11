@@ -36,6 +36,15 @@ services:
       # Sales endpoints and dashboard (T9, T11): Render generates a random value
       - key: SALES_API_KEY
         generateValue: true
+      # Real client IP for the rate limits: Cloudflare (in front of every Render web service) writes this
+      # header on every request and overwrites any value the caller sent. Never X-Forwarded-For.
+      - key: CLIENT_IP_HEADER
+        value: CF-Connecting-IP
+      # /api/chat messages per client IP (PLAN.md part 3.11)
+      - key: CHAT_LIMIT_PER_MINUTE
+        value: "10"
+      - key: CHAT_LIMIT_PER_DAY
+        value: "100"
       # Settings
       - key: LLM_MODEL_MAIN
         value: gemini-3.5-flash-lite

@@ -5,7 +5,7 @@ from sqlalchemy import Engine
 from app.core.db import check_db, get_engine
 from app.rag.retriever import count_kb_chunks
 
-router = APIRouter()
+router = APIRouter(tags=["health"])
 
 
 @router.get("/api/health")

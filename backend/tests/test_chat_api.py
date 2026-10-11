@@ -53,8 +53,9 @@ def test_response_shape(client, use_agent):
 def test_session_id_is_echoed_and_remembered(client, use_agent):
     understand_llm = Scripted(understood(["question"], "q"))
     use_agent(understand_llm=understand_llm, agent_llm=Scripted(answer("A1"), answer("A2")))
-    assert post(client, "First question", session_id="abc-123").json()["session_id"] == "abc-123"
-    post(client, "Second question", session_id="abc-123")
+    session_id = str(uuid.uuid4())
+    assert post(client, "First question", session_id=session_id).json()["session_id"] == session_id
+    post(client, "Second question", session_id=session_id)
     assert "Customer: First question" in understand_llm.calls[1][0].content
 
 
@@ -116,7 +117,7 @@ def test_invalid_messages_are_rejected(client, use_agent, message):
 
 
 def test_missing_message_is_rejected(client):
-    assert client.post("/api/chat", json={"session_id": "x"}).status_code == 422
+    assert client.post("/api/chat", json={"session_id": str(uuid.uuid4())}).status_code == 422
 
 
 def test_1000_characters_after_trimming_is_accepted(client, use_agent):
@@ -194,7 +195,8 @@ def test_no_lead_summary_is_null(client):
 def test_turns_of_one_session_never_overlap(client):
     agent = StateAgent(delay=0.3)
     app.dependency_overrides[get_agent] = lambda: agent
-    threads = [threading.Thread(target=post, args=(client, "hi"), kwargs={"session_id": "same"}) for _ in range(2)]
+    same = {"session_id": str(uuid.uuid4())}
+    threads = [threading.Thread(target=post, args=(client, "hi"), kwargs=same) for _ in range(2)]
     for t in threads:
         t.start()
     for t in threads:
@@ -205,10 +207,113 @@ def test_turns_of_one_session_never_overlap(client):
 def test_busy_session_gets_a_friendly_reply(client, monkeypatch):
     monkeypatch.setattr(chat_api, "LOCK_TIMEOUT_S", 0.1)
     app.dependency_overrides[get_agent] = lambda: StateAgent()
-    lock = chat_api.session_lock("busy-1")
+    session_id = str(uuid.uuid4())
+    lock = chat_api.session_lock(session_id)
     lock.acquire()
     try:
-        body = post(client, "hi", session_id="busy-1").json()
+        body = post(client, "hi", session_id=session_id).json()
     finally:
         lock.release()
     assert body["reply"] == chat_api.BUSY_REPLY and body["degraded"] is True
+
+
+# ---------- T9: random session ids, rate limit, client IP ----------
+from app.api import security  # noqa: E402
+from app.core.rate_limit import RateLimiter  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    ["demo-1", "abc-123", "", str(uuid.uuid1()), "00000000-0000-0000-0000-000000000000",
+     "12345678-1234-1234-1234-123456789abc"],  # the last one is version 1
+)
+def test_guessable_session_ids_are_refused(client, use_agent, session_id):
+    understand_llm = Scripted(understood(["question"], "q"))
+    use_agent(understand_llm=understand_llm)
+    response = post(client, "hi", session_id=session_id)
+    assert response.status_code == 422
+    assert response.json()["errors"]["session_id"] == chat_api.SESSION_ID_ERROR
+    assert understand_llm.calls == []
+
+
+def test_a_uuid4_is_accepted_in_its_standard_form(client):
+    app.dependency_overrides[get_agent] = lambda: StateAgent()
+    session_id = str(uuid.uuid4())
+    assert post(client, "hi", session_id=session_id.upper()).json()["session_id"] == session_id
+
+
+def use_limits(monkeypatch, per_minute, per_day=1000):
+    monkeypatch.setattr(security, "CHAT_LIMITER", RateLimiter([(per_minute, 60), (per_day, 86_400)]))
+
+
+def test_over_the_minute_limit_is_429_with_retry_after(client, monkeypatch):
+    use_limits(monkeypatch, per_minute=2)
+    agent = StateAgent()
+    app.dependency_overrides[get_agent] = lambda: agent
+    assert [post(client, "hi").status_code for _ in range(2)] == [200, 200]
+    response = post(client, "hi")
+    assert response.status_code == 429
+    body = response.json()
+    assert set(body) == {"detail", "retry_after", "request_id"}
+    assert 1 <= body["retry_after"] <= 60 and response.headers["Retry-After"] == str(body["retry_after"])
+    assert body["detail"] == security.TOO_FAST.format(seconds=body["retry_after"])
+
+
+def test_over_the_day_limit_says_so(client, monkeypatch):
+    use_limits(monkeypatch, per_minute=100, per_day=1)
+    app.dependency_overrides[get_agent] = lambda: StateAgent()
+    post(client, "hi")
+    response = post(client, "hi")
+    assert response.status_code == 429
+    assert response.json()["detail"] == security.DAY_LIMIT.format(wait="24 hours")
+    assert int(response.headers["Retry-After"]) > 86_000
+
+
+def test_invalid_requests_count_toward_the_limit(client, monkeypatch, use_agent):
+    use_limits(monkeypatch, per_minute=2)
+    use_agent()
+    assert [post(client, "").status_code for _ in range(2)] == [422, 422]
+    assert post(client, "What do you offer?").status_code == 429
+
+
+def test_spoofed_forwarding_headers_do_not_bypass_the_limit(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "client_ip_header", "")
+    use_limits(monkeypatch, per_minute=2)
+    app.dependency_overrides[get_agent] = lambda: StateAgent()
+    statuses = [
+        client.post("/api/chat", json={"message": "hi"},
+                    headers={"X-Forwarded-For": f"10.0.0.{i}", "CF-Connecting-IP": f"10.9.0.{i}"}).status_code
+        for i in range(3)
+    ]
+    assert statuses == [200, 200, 429]
+
+
+def test_with_the_header_configured_each_client_has_its_own_limit(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "client_ip_header", "CF-Connecting-IP")
+    use_limits(monkeypatch, per_minute=1)
+    app.dependency_overrides[get_agent] = lambda: StateAgent()
+
+    def send(ip, forwarded="1.1.1.1"):
+        return client.post("/api/chat", json={"message": "hi"},
+                           headers={"CF-Connecting-IP": ip, "X-Forwarded-For": forwarded}).status_code
+
+    assert send("203.0.113.7") == 200
+    assert send("203.0.113.7", forwarded="2.2.2.2") == 429  # a new X-Forwarded-For changes nothing
+    assert send("198.51.100.4") == 200  # another real client
+
+
+def test_request_log_says_where_the_ip_came_from_but_never_the_ip(client, monkeypatch, caplog):
+    import logging
+
+    use_limits(monkeypatch, per_minute=1)
+    app.dependency_overrides[get_agent] = lambda: StateAgent()
+    with caplog.at_level(logging.INFO):
+        post(client, "hi")
+        post(client, "hi")  # 429
+        monkeypatch.setattr(get_settings(), "client_ip_header", "CF-Connecting-IP")
+        client.post("/api/chat", json={"message": "hi"}, headers={"CF-Connecting-IP": "203.0.113.7"})
+    requests = [r for r in caplog.records if r.getMessage() == "request"]
+    assert [(r.status, r.ip_source) for r in requests] == [(200, "fallback"), (429, "fallback"), (200, "header")]
+    logged = " ".join(f"{r.getMessage()} {r.__dict__}" for r in caplog.records)
+    assert "testclient" not in logged and "203.0.113.7" not in logged
+    assert any(r.getMessage() == "chat rate limit reached" and r.limit == "minute" for r in caplog.records)
