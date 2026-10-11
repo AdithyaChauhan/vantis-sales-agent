@@ -1,43 +1,32 @@
-"""POST /api/chat with a fake LLM. Most tests replace search(); the last one uses the test database."""
+"""POST /api/chat through the agent graph, with fake models and a fake search (no network)."""
 import uuid
 
+import psycopg
 import pytest
+from sqlalchemy.exc import OperationalError
 
-from app.api import chat as chat_api
-from app.core.llm import main_llm, query_embedder
+from app.agent.graph import get_agent
+from app.agent.welcome import WELCOME_TEXT
 from app.main import app
-from app.rag.answer import LLM_DOWN_REPLY, NO_CONTEXT_REPLY
-from app.rag.ingest import ingest_sections
-from app.rag.retriever import SearchResult
-from tests.test_answer import CHUNKS, FakeLLM
-from tests.test_kb_db import SECTIONS, WARRANTY, FakeEmbedder, mix
+from app.rag.answer import LLM_DOWN_REPLY
+from tests.agent_fakes import FakeSearch, Scripted, answer, make_graph, understood
 
-CITED = "HomePro 5 is a 5 kW option [KB Section 8: Product & Service Catalog]."
+CITED = "We offer Plan A [KB Section 8: Catalog]."
 
 
 @pytest.fixture
-def fake_llm():
-    """Return a function that makes the app use a given fake LLM."""
+def use_agent():
+    """Return a function that makes the app use a graph built from the given fakes."""
 
-    def _use(llm):
-        app.dependency_overrides[main_llm] = lambda: llm
-        return llm
-
-    return _use
-
-
-@pytest.fixture
-def fake_search(monkeypatch):
-    """Replace search() with a canned result and record the questions it was asked."""
-    asked = []
-
-    def _use(result):
-        def _search(query, k=4, **kwargs):
-            asked.append((query, k))
-            return result
-
-        monkeypatch.setattr(chat_api, "search", _search)
-        return asked
+    def _use(understand_llm=None, agent_llm=None, search=None, graph=None):
+        if graph is None:
+            graph, _ = make_graph(
+                understand_llm or Scripted(understood(["question"], "catalog")),
+                agent_llm or Scripted(answer(CITED)),
+                search=search,
+            )
+        app.dependency_overrides[get_agent] = lambda: graph
+        return graph
 
     return _use
 
@@ -46,9 +35,8 @@ def post(client, message, **extra):
     return client.post("/api/chat", json={"message": message, **extra})
 
 
-def test_response_shape(client, fake_llm, fake_search):
-    llm = fake_llm(FakeLLM(CITED))
-    asked = fake_search(SearchResult(chunks=CHUNKS, mode="hybrid"))
+def test_response_shape(client, use_agent):
+    use_agent()
     response = post(client, "What do you offer?")
     assert response.status_code == 200
     body = response.json()
@@ -58,109 +46,99 @@ def test_response_shape(client, fake_llm, fake_search):
     assert body["lead"] is None and body["degraded"] is False
     assert [s["section"] for s in body["sources"]] == ["8"]
     assert set(body["sources"][0]) == {"section", "title", "page", "snippet"}
-    assert [s["node"] for s in body["steps"]] == ["retrieve", "answer"]
-    assert body["steps"][1]["data"]["provider"] == "gemini"
-    assert asked == [("What do you offer?", 4)]
-    assert len(llm.calls) == 1
+    assert [s["node"] for s in body["steps"]] == ["understand", "retrieve", "agent"]
+    assert set(body["steps"][0]) == {"node", "name", "detail", "data"}
 
 
-def test_session_id_is_echoed(client, fake_llm, fake_search):
-    fake_llm(FakeLLM(CITED))
-    fake_search(SearchResult(chunks=CHUNKS))
-    response = post(client, "Hi", session_id="abc-123")
-    assert response.json()["session_id"] == "abc-123"
+def test_session_id_is_echoed_and_remembered(client, use_agent):
+    understand_llm = Scripted(understood(["question"], "q"))
+    use_agent(understand_llm=understand_llm, agent_llm=Scripted(answer("A1"), answer("A2")))
+    assert post(client, "First question", session_id="abc-123").json()["session_id"] == "abc-123"
+    post(client, "Second question", session_id="abc-123")
+    assert "Customer: First question" in understand_llm.calls[1][0].content
 
 
-def test_no_context_makes_no_llm_call(client, fake_llm, fake_search):
-    llm = fake_llm(FakeLLM(CITED))
-    fake_search(SearchResult(chunks=CHUNKS, no_context=True))
-    body = post(client, "Tell me a joke").json()
-    assert llm.calls == []
-    assert body["reply"] == NO_CONTEXT_REPLY
-    assert body["sources"] == []
+def test_tool_steps_have_a_name(client, use_agent):
+    from tests.agent_fakes import tool_call
+
+    use_agent(agent_llm=Scripted(tool_call("check_service_area", {"city": "Pune"}), answer("Pune: the team can check.")))
+    steps = post(client, "Pune?").json()["steps"]
+    tool = next(s for s in steps if s["node"] == "tool")
+    assert (tool["name"], tool["detail"]) == ("check_service_area", "Pune: unverified")
 
 
-def test_llm_failure_is_200_and_degraded(client, fake_llm, fake_search):
-    fake_llm(FakeLLM(error=RuntimeError("Gemini and Groq both down")))
-    fake_search(SearchResult(chunks=CHUNKS))
+def test_greeting_returns_the_welcome(client, use_agent):
+    use_agent(understand_llm=Scripted(understood(["greeting"])))
+    assert post(client, "hi").json()["reply"] == WELCOME_TEXT
+
+
+def test_llm_failure_is_200_and_degraded(client, use_agent):
+    use_agent(agent_llm=Scripted(RuntimeError("Gemini and Groq both down")))
     response = post(client, "What do you offer?")
     assert response.status_code == 200
     body = response.json()
     assert (body["reply"], body["degraded"], body["sources"]) == (LLM_DOWN_REPLY, True, [])
 
 
-def test_unexpected_error_is_still_200(client, fake_llm, fake_search, monkeypatch):
-    fake_llm(FakeLLM(CITED))
-    fake_search(SearchResult(chunks=CHUNKS))
+@pytest.mark.parametrize(
+    "error",
+    [OperationalError("SELECT 1", {}, Exception("down")), psycopg.OperationalError("down")],
+)
+def test_database_errors_are_503(client, use_agent, error):
+    use_agent(search=FakeSearch(error=error))
+    response = post(client, "Do you install in Delhi?")
+    assert response.status_code == 503
+    assert set(response.json()) == {"detail", "request_id"}
 
-    def broken(*args, **kwargs):
-        raise KeyError("bug")
 
-    monkeypatch.setattr(chat_api, "answer", broken)
+def test_no_database_configured_is_503(client):
+    app.dependency_overrides[get_agent] = lambda: None
+    assert post(client, "Hi").status_code == 503
+
+
+def test_unexpected_error_is_still_200(client, use_agent):
+    class Broken:
+        def invoke(self, *args, **kwargs):
+            raise KeyError("bug")
+
+    use_agent(graph=Broken())
     response = post(client, "Hi")
     assert response.status_code == 200
     assert response.json()["degraded"] is True
 
 
 @pytest.mark.parametrize("message", ["", "    ", "\x00\x07", "x" * 1001])
-def test_invalid_messages_are_rejected(client, fake_llm, fake_search, message):
-    llm = fake_llm(FakeLLM(CITED))
-    asked = fake_search(SearchResult(chunks=CHUNKS))
+def test_invalid_messages_are_rejected(client, use_agent, message):
+    understand_llm = Scripted(understood(["question"], "q"))
+    use_agent(understand_llm=understand_llm)
     assert post(client, message).status_code == 422
-    assert asked == [] and llm.calls == []
+    assert understand_llm.calls == []
 
 
 def test_missing_message_is_rejected(client):
     assert client.post("/api/chat", json={"session_id": "x"}).status_code == 422
 
 
-def test_1000_characters_after_trimming_is_accepted(client, fake_llm, fake_search):
-    fake_llm(FakeLLM(CITED))
-    asked = fake_search(SearchResult(chunks=CHUNKS))
+def test_1000_characters_after_trimming_is_accepted(client, use_agent):
+    understand_llm = Scripted(understood(["question"], "q"))
+    use_agent(understand_llm=understand_llm)
     assert post(client, "  " + "x" * 1000 + "  ").status_code == 200
-    assert asked[0][0] == "x" * 1000
+    assert "x" * 1000 in understand_llm.calls[0][0].content
 
 
-def test_control_characters_are_stripped(client, fake_llm, fake_search):
-    fake_llm(FakeLLM(CITED))
-    asked = fake_search(SearchResult(chunks=CHUNKS))
+def test_control_characters_are_stripped(client, use_agent):
+    understand_llm = Scripted(understood(["question"], "q"))
+    use_agent(understand_llm=understand_llm)
     post(client, " Do you\x00 install\x1b in\nDelhi?\t ")
-    assert asked[0][0] == "Do you install in\nDelhi?"
+    assert "Do you install in\nDelhi?" in understand_llm.calls[0][0].content
 
 
-def test_db_unreachable_is_503(client, use_engine, unreachable_engine, fake_llm):
-    llm = fake_llm(FakeLLM(CITED))
-    use_engine(unreachable_engine)
-    app.dependency_overrides[query_embedder] = FakeEmbedder  # no real embedding call
-    response = post(client, "Do you install in Delhi?")
-    assert response.status_code == 503
-    assert set(response.json()) == {"detail", "request_id"}
-    assert llm.calls == []
+def test_log_line_has_no_message_text(client, use_agent, caplog):
+    import logging
 
-
-def test_db_not_configured_is_503(client, use_engine, fake_llm):
-    llm = fake_llm(FakeLLM(CITED))
-    use_engine(None)
-    app.dependency_overrides[query_embedder] = FakeEmbedder
-    assert post(client, "Do you install in Delhi?").status_code == 503
-    assert llm.calls == []
-
-
-def test_end_to_end_with_the_test_database(client, use_engine, fake_llm, test_engine):
-    embedder = FakeEmbedder()
-    ingest_sections(SECTIONS, "abc123def456", test_engine, embedder)
-    embedder.query_vector = mix((WARRANTY, 1.0))  # the question is closest to the warranty chunk
-    use_engine(test_engine)
-    app.dependency_overrides[query_embedder] = lambda: embedder
-    fake_llm(FakeLLM("Panels carry a guarantee [KB Section 11: Warranty and Support]."))
-
-    body = post(client, "Is there a guarantee on the panels?").json()
-    assert body["steps"][0]["data"]["mode"] == "hybrid"
-    assert body["sources"] == [
-        {
-            "section": "11",
-            "title": "Warranty and Support",
-            "page": 4,
-            "snippet": "Panels carry a guarantee against defects.",
-        }
-    ]
+    use_agent()
+    with caplog.at_level(logging.INFO, logger="app.api.chat"):
+        post(client, "my number is 9876543210")
+    record = next(r for r in caplog.records if r.getMessage() == "chat")
+    assert "9876543210" not in str(record.__dict__)
+    assert record.nodes == ["understand", "retrieve", "agent"]

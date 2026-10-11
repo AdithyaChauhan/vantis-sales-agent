@@ -43,6 +43,7 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - Ingest KB (embeds, then replaces the KB rows in one transaction): `cd backend && python -m app.rag.ingest`
 - Search the KB: `cd backend && python -m scripts.search_kb "question" [--mode keyword|vector|hybrid]`
 - Retrieval eval: `cd backend && python -m scripts.eval_retrieval`
+- Retrieval eval with the agent's query rewrite (about 32 fast-LLM calls, paced): `cd backend && python -m scripts.eval_retrieval --rewrite`
 - Frontend: `cd frontend && npm run dev`
 - Docker image (repo root, Docker Desktop running): `docker build -t vantis-api .`
 - Run the image: `docker run --rm -p 10000:10000 --env-file backend/.env vantis-api` (add `--cpus=0.1 --memory=512m` to match Render's free plan)

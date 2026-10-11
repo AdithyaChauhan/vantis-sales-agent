@@ -148,16 +148,22 @@ class LLMReply:
     latency_ms: int
 
 
-def gemini_chat(model: str, settings: Settings) -> Runnable:
-    """Gemini chat model with our timeout and retry rules bound to every call.
+class GeminiChat(ChatGoogleGenerativeAI):
+    """ChatGoogleGenerativeAI that sends our timeout and retry rules (GEMINI_CHAT_HTTP) with every request.
 
-    T8: bind_tools() on this binding drops http_options, so pass them again:
-    bind_tools(tools, http_options=GEMINI_CHAT_HTTP).
+    bind_tools() drops bound http_options and with_structured_output() rejects them, so they are added
+    here, where every call (plain, tools, structured output) builds its request. This relies on a private
+    method of langchain-google-genai 4.4.1 (pinned; tests/test_llm.py checks it).
     """
-    chat = ChatGoogleGenerativeAI(
-        model=model, google_api_key=settings.google_api_key, thinking_level=THINKING_LEVEL
-    )
-    return chat.bind(http_options=GEMINI_CHAT_HTTP)
+
+    def _prepare_request(self, messages, **kwargs):
+        kwargs.setdefault("http_options", GEMINI_CHAT_HTTP)
+        return super()._prepare_request(messages, **kwargs)
+
+
+def gemini_chat(model: str, settings: Settings) -> GeminiChat:
+    """Gemini chat model: minimal thinking, our timeout and retry rules."""
+    return GeminiChat(model=model, google_api_key=settings.google_api_key, thinking_level=THINKING_LEVEL)
 
 
 def groq_chat(settings: Settings) -> ChatGroq:
@@ -175,18 +181,37 @@ def _not_configured(_messages) -> None:
     raise LLMError("no LLM configured: set GOOGLE_API_KEY and/or GROQ_API_KEY + FALLBACK_MODEL")
 
 
-def chat_llm(model: str, settings: Settings | None = None) -> Runnable:
+def _shape(model: Runnable, provider: str, tools: list | None, schema: type | None) -> Runnable:
+    """The model as plain chat, with tools bound, or with structured output (raw message kept)."""
+    if tools:
+        # gpt-oss on Groq does not support parallel tool calls
+        extra = {"parallel_tool_calls": False} if provider == "groq" else {}
+        return model.bind_tools(tools, **extra)
+    if schema is not None:
+        return model.with_structured_output(schema, include_raw=True)
+    return model
+
+
+def chat_llm(
+    model: str,
+    settings: Settings | None = None,
+    *,
+    tools: list | None = None,
+    schema: type | None = None,
+) -> Runnable:
     """Gemini `model`, falling back to Groq on any error. Never raises.
 
+    tools: both models get the tools bound (each built separately, as fallbacks need).
+    schema: both return {"raw": AIMessage, "parsed": schema | None, "parsing_error": ...}.
     With only one provider configured, that one is used alone. With none (or if building fails),
     the result raises LLMError when called, so the chat replies "degraded" instead of crashing.
     """
     settings = settings or get_settings()
     try:
         gemini = gemini_chat(model, settings) if settings.google_api_key and model else None
-        groq = (
-            groq_chat(settings) if settings.groq_api_key and settings.fallback_model else None
-        )
+        groq = groq_chat(settings) if settings.groq_api_key and settings.fallback_model else None
+        gemini = _shape(gemini, "gemini", tools, schema) if gemini else None
+        groq = _shape(groq, "groq", tools, schema) if groq else None
     except Exception as exc:
         logger.error("building the chat model failed: %s", type(exc).__name__)
         gemini = groq = None
@@ -203,8 +228,13 @@ def main_llm() -> Runnable:
 
 @lru_cache
 def fast_llm() -> Runnable:
-    """The model for small steps (LLM_MODEL_FAST), e.g. extraction in T8."""
+    """The model for small steps (LLM_MODEL_FAST), e.g. the lead reason."""
     return chat_llm(get_settings().llm_model_fast)
+
+
+def provider_of(message: BaseMessage) -> str:
+    """Which provider wrote a message: gemini, groq or unknown."""
+    return PROVIDERS.get(message.response_metadata.get("model_provider", ""), "unknown")
 
 
 def reply_text(message: BaseMessage) -> str:
@@ -227,8 +257,7 @@ def invoke_llm(llm: Runnable, messages: list[BaseMessage]) -> LLMReply:
         )
         raise LLMError(f"{type(exc).__name__}: {exc}") from exc
     latency_ms = round((time.perf_counter() - start) * 1000)
-    raw_provider = message.response_metadata.get("model_provider", "")
-    provider = PROVIDERS.get(raw_provider, "unknown")
+    provider = provider_of(message)
     logger.info(
         "llm call",
         extra={"provider": provider, "latency_ms": latency_ms, "fallback_used": provider == "groq"},

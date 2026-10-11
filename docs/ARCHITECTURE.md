@@ -2,18 +2,25 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T7)
+## Backend modules (as of T8a)
 | Module | Role |
 |---|---|
 | `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware (skips `QUIET_PATHS`: `/api/health/live`), CORS, routers |
 | `app/core/config.py` | `Settings` (pydantic-settings, reads `backend/.env`), `get_settings()` |
 | `app/core/logging.py` | JSON log formatter, `request_id_var` |
 | `app/core/db.py` | `Base`, `get_engine()` (Neon, pre-ping), `check_db()`, `init_db(engine)` (pgvector + `create_all`) |
-| `app/core/llm.py` | `embedder()`: google-genai, one Content per text, batches of 20, vector count and size checks, document vs query timeouts, LRU cache for queries. `query_embedder()`: the same, or None (request dependency). `main_llm()` / `fast_llm()`: `chat_llm(model)` = Gemini (`thinking_level` minimal, 15 s, 1 retry, none on 429) `.with_fallbacks([Groq])` (15 s, no retry, `reasoning_effort` low); never raises when built. `invoke_llm()` → `LLMReply(text, provider, latency_ms)`, logs provider and latency; `reply_text()` keeps text blocks only and strips `<think>` |
+| `app/core/llm.py` | `embedder()` and `query_embedder()` (google-genai, one Content per text, batches of 20, LRU cache for queries). `GeminiChat`: adds our `http_options` (15 s, 1 retry, none on 429) to every Gemini request. `chat_llm(model, tools=, schema=)`: Gemini with a Groq fallback, built separately for plain, tool-bound and structured-output use (Groq: `parallel_tool_calls=False`). `main_llm()`, `fast_llm()`, `invoke_llm()`, `provider_of()`, `reply_text()` |
 | `app/core/prompts.py` | `load_prompt(name)`: reads `prompts/<name>.md` (cached) |
+| `app/agent/state.py` | `AgentState` (persisted `messages` and `lead`; per-turn fields) and `turn_input()`, which resets the per-turn fields |
+| `app/agent/understand.py` | `Understanding` schema (intents, `search_query`, details generated from `LeadData`), `load_kb_hints` (section titles + table summary chunks from `kb_chunks`), `understand()` |
+| `app/agent/tools.py` | `make_tools`: `search_knowledge_base`, `check_service_area` (content + KB chunk artifacts); `tool_step` |
+| `app/agent/graph.py` | `build_graph(AgentDeps)`: understand → retrieve → agent ⇄ tools → finalize, plus welcome / closing / redirect; `build_agent()`, `get_agent()` (FastAPI dependency) |
+| `app/agent/memory.py` | `get_checkpointer()` (PostgresSaver over a psycopg pool), `setup_checkpointer()` (never fails the boot) |
+| `app/agent/welcome.py` | Fixed texts: welcome (F0), starter questions, closing line, off-topic redirect |
+| `app/api/welcome.py` | `GET /api/welcome` |
 | `app/api/health.py` | `GET /api/health` (status, db, kb_chunks); `GET /api/health/live` (`{"status":"ok"}`, no DB, Render's health check) |
-| `app/api/chat.py` | `POST /api/chat` v0: validates the message (control characters stripped, 1-1,000 chars), `search(k=4)`, `answer()`. DB down → 503; any other error → 200 degraded; `lead` always null |
-| `app/rag/answer.py` | `answer(question, SearchResult, llm)`: no context → fixed reply without an LLM call; else system + RAG prompt → `invoke_llm`; LLM failure → degraded reply. `format_context` (`[KB Section N: Title]` labels), `cited_sections`, `pick_sources` (one per cited section), steps |
+| `app/api/chat.py` | `POST /api/chat`: validates the message, runs the agent with `thread_id` = `session_id`, returns reply, sources, steps, `lead` (null until T8b) and degraded. DB errors → 503; anything else → 200 degraded |
+| `app/rag/answer.py` | Helpers the agent reuses: `format_context` (`[KB Section N: Title]` labels), `rag_message`, `cited_sections`, `pick_sources` (one per cited section), `normalize_citations`, `retrieve_step`, `LLM_DOWN_REPLY` |
 | `app/rag/pdf_parser.py` | `parse_kb(path)`: KB PDF to numbered sections with text lines and tables (pdfplumber; cover, header and footer removed) |
 | `app/rag/chunker.py` | `Chunk`, `chunk_sections()`: one chunk per table row (KB Sections 8-12) plus one `table_summary` chunk listing every row (8, 10), one per FAQ item (15), prose split at ~1,200 chars, Sections 16-19 tagged `policy`; `embed_text()` = `title: ... \| text: ...` |
 | `app/rag/models.py` | `KbChunk` (`kb_chunks`: vector + generated tsvector with GIN index) and `ServiceArea` (`service_areas`, unique on city + region) |
@@ -28,7 +35,7 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/services/service_areas.py` | `ServiceAreas.lookup(city, state)`: alias map + rapidfuzz (score 85); loads from the `service_areas` table (`get_service_areas()`, cached) |
 | `scripts/list_models.py` | Lists Gemini chat and embedding models for the key |
 | `scripts/search_kb.py` | Prints the mode, `no_context` and the top chunks with scores and ranks |
-| `scripts/eval_retrieval.py` | Embeds the 24 KB and 8 off-topic questions once, runs `search()` in all three modes (k = 10), prints hit@1, hit@3, MRR, the misses and the gate results, and writes `docs/EVAL.md` (its "Tuning notes" section is hand-written and kept) |
+| `scripts/eval_retrieval.py` | Embeds the 24 KB and 8 off-topic questions once, runs `search()` in all three modes (k = 10), prints hit@1, hit@3, MRR, the misses and the gate results, and writes `docs/EVAL.md` (its "Tuning notes" section is hand-written and kept). `--rewrite` adds the understand step's rewritten query (`rewrite` and `fused` modes) and the small-to-big report |
 
 ## Request flow
 ```mermaid
@@ -40,10 +47,11 @@ flowchart LR
   health --> count["count_kb_chunks"]
   check --> neon[("Neon Postgres + pgvector")]
   count --> neon
+  mw --> welcome["GET /api/welcome (fixed text)"]
   mw --> chat["POST /api/chat"]
-  chat --> search["search(k = 4)"]
-  search --> neon
-  search -.->|"DB error"| e503["503, friendly message"]
+  chat --> agent["agent graph (see Agent graph)"]
+  agent --> neon
+  agent -.->|"DB error"| e503["503, friendly message"]
 ```
 
 ## Chat v0 (T5)
@@ -125,3 +133,24 @@ flowchart LR
   action --> db
 ```
 
+## Agent graph (T8a)
+One customer message; state checkpointed in Postgres per `session_id`. Details: PLAN.md part 3.1.
+```mermaid
+flowchart TD
+  msg(["POST /api/chat"]) --> understand["understand<br/>fast LLM, structured output:<br/>intents, search_query, lead details"]
+  understand -->|"only hello / what can you do"| welcome["welcome text"]
+  understand -->|"only thanks / bye"| closing["closing line"]
+  understand -->|"only off-topic, no query"| redirect["polite redirect"]
+  understand -->|"search_query"| retrieve["retrieve<br/>hybrid search, top 4"]
+  understand -->|"anything else"| agent
+  retrieve --> agent["agent<br/>main LLM + tools<br/>(Gemini, Groq fallback)"]
+  agent -->|"tool calls (max 4 rounds)"| tools["tools<br/>search_knowledge_base<br/>check_service_area"]
+  tools --> agent
+  agent -->|"answer"| finalize["finalize<br/>reply, sources, steps"]
+  welcome --> finalize
+  closing --> finalize
+  redirect --> finalize
+  finalize --> reply(["reply + sources + steps"])
+  memory[("Postgres checkpointer<br/>thread = session_id")] -.-> understand
+  finalize -.-> memory
+```

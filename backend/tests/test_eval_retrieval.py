@@ -150,3 +150,44 @@ def test_write_report_keeps_the_hand_written_notes(tmp_path):
     write_report(path, "# Newer report")  # a second run still keeps the notes
     assert path.read_text(encoding="utf-8").endswith("my careful notes\n")
     assert "\r" not in path.read_text(encoding="utf-8")  # LF line endings
+
+
+# ---------- --rewrite helpers ----------
+from app.rag.retriever import RetrievedChunk, SearchResult  # noqa: E402
+from scripts.eval_retrieval import Question, fuse_results, rewrite_questions, table_complete  # noqa: E402
+
+
+def _chunk(cid, section=8, kind="table_row"):
+    return RetrievedChunk(cid, section, "T", 3, kind, "x")
+
+
+def test_fuse_results_rewards_chunks_in_both_rankings():
+    raw = SearchResult(chunks=[_chunk("a"), _chunk("b"), _chunk("c")])
+    rewritten = SearchResult(chunks=[_chunk("c"), _chunk("d")])
+    fused = fuse_results(raw, rewritten)
+    assert [c.chunk_id for c in fused.chunks] == ["c", "a", "b", "d"]  # b and d tie at 1/62: id order
+    assert fused.mode == "fused"
+    assert fuse_results(SearchResult(no_context=True), SearchResult(no_context=True)).no_context is True
+    assert fuse_results(SearchResult(no_context=True), rewritten).no_context is False
+
+
+def test_table_complete():
+    counts = {8: 2}
+    rows = [{"section_no": 8, "chunk_type": "table_row"}] * 2
+    assert table_complete(rows, 8, counts) is True
+    assert table_complete(rows[:1], 8, counts) is False
+    assert table_complete([{"section_no": 8, "chunk_type": "table_summary"}], 8, counts) is True
+    assert table_complete([], 8, counts) is False
+
+
+def test_rewrite_questions_keeps_the_raw_question_on_failure():
+    from tests.agent_fakes import HINTS, Scripted, understood
+
+    questions = [Question("q1", "What do you sell?", {8}), Question("q2", "Joke?", set())]
+    llm = Scripted(understood(["question"], "Product & Service Catalog"), understood(["off_topic"]))
+    assert rewrite_questions(questions, llm, HINTS, pause_s=0) == {
+        "What do you sell?": "Product & Service Catalog", "Joke?": None,
+    }
+    assert rewrite_questions(questions[:1], Scripted(RuntimeError("down")), HINTS, pause_s=0) == {
+        "What do you sell?": "What do you sell?",
+    }

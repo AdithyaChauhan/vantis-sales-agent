@@ -7,7 +7,9 @@ from app.rag.pdf_parser import Line, Section, table_dicts
 TABLE_SECTIONS = {8, 9, 10, 11, 12}
 # Tables that also get one chunk listing every row, so broad questions ("What systems do you
 # offer?", "Where do you install?") match one chunk with the whole list (T5, docs/EVAL.md).
-SUMMARY_SECTIONS = {8, 10}
+CATALOG_SECTION = 8  # Product & Service Catalog
+SERVICE_AREA_SECTION = 10  # Reference Service Locations
+SUMMARY_SECTIONS = {CATALOG_SECTION, SERVICE_AREA_SECTION}
 SUMMARY_LABEL = "Summary of all rows"
 FAQ_SECTION = 15
 POLICY_SECTIONS = {16, 17, 18, 19}

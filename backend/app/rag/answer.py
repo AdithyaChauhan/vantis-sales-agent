@@ -1,37 +1,20 @@
-"""Grounded answer: retrieved KB chunks -> main LLM -> reply with citations, sources and steps.
+"""Helpers for grounded answers: the context block, citations, sources and the retrieve step.
 
-No FastAPI and no database here: answer() takes a finished SearchResult, so it is easy to test.
+The agent (app/agent/graph.py) uses them; nothing here calls an LLM or the database.
 """
 import logging
 import re
-from dataclasses import dataclass, field
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_core.runnables import Runnable
+from langchain_core.messages import HumanMessage
 
-from app.core.llm import LLMError, invoke_llm
 from app.core.prompts import load_prompt
 from app.rag.retriever import RetrievedChunk, SearchResult
 
 logger = logging.getLogger(__name__)
 
-NO_CONTEXT_REPLY = (
-    "I don't have that information in my Vantis knowledge base. "
-    "I can connect you with our sales team if you'd like."
-)
 LLM_DOWN_REPLY = "I'm having trouble right now. Please try again in a minute."
 SNIPPET_CHARS = 160
 _CITATION_RE = re.compile(r"KB Section (\d+)")
-
-
-@dataclass
-class Answer:
-    """What the chat endpoint sends back (minus session id and lead)."""
-
-    reply: str
-    sources: list[dict] = field(default_factory=list)
-    steps: list[dict] = field(default_factory=list)
-    degraded: bool = False
 
 
 def citation_label(chunk: RetrievedChunk) -> str:
@@ -44,14 +27,13 @@ def format_context(chunks: list[RetrievedChunk]) -> str:
     return "\n\n".join(f"{citation_label(c)}\n{c.content}" for c in chunks)
 
 
-def build_messages(question: str, chunks: list[RetrievedChunk]) -> list[BaseMessage]:
-    """System prompt + the RAG prompt filled with the context and the question.
+def rag_message(question: str, chunks: list[RetrievedChunk]) -> HumanMessage:
+    """The customer's message wrapped in the RAG prompt with the context (empty when nothing was found).
 
     The context is filled in first, so a "{context}" typed by the customer is left as it is.
     """
-    user = load_prompt("rag_prompt").replace("{context}", format_context(chunks))
-    user = user.replace("{question}", question)
-    return [SystemMessage(load_prompt("system_prompt")), HumanMessage(user)]
+    text = load_prompt("rag_prompt").replace("{context}", format_context(chunks))
+    return HumanMessage(text.replace("{question}", question))
 
 
 def normalize_citations(reply: str) -> str:
@@ -106,43 +88,3 @@ def retrieve_step(result: SearchResult) -> dict:
         "detail": detail,
         "data": {"mode": result.mode, "chunks": len(result.chunks), "no_context": result.no_context},
     }
-
-
-def answer(question: str, result: SearchResult, llm: Runnable) -> Answer:
-    """Answer from the retrieved chunks. Never raises for LLM failures (degraded reply instead).
-
-    No relevant context: a fixed reply, and the LLM is not called.
-    """
-    steps = [retrieve_step(result)]
-    if result.no_context:
-        steps.append(
-            {
-                "node": "answer",
-                "detail": "fixed reply, LLM not called",
-                "data": {"provider": None, "latency_ms": 0},
-            }
-        )
-        return Answer(NO_CONTEXT_REPLY, [], steps, degraded=result.degraded)
-
-    try:
-        llm_reply = invoke_llm(llm, build_messages(question, result.chunks))
-    except LLMError:
-        steps.append(
-            {"node": "answer", "detail": "LLM failed", "data": {"provider": None, "latency_ms": None}}
-        )
-        return Answer(LLM_DOWN_REPLY, [], steps, degraded=True)
-
-    steps.append(
-        {
-            "node": "answer",
-            "detail": f"{llm_reply.provider}, {llm_reply.latency_ms} ms",
-            "data": {"provider": llm_reply.provider, "latency_ms": llm_reply.latency_ms},
-        }
-    )
-    reply = normalize_citations(llm_reply.text)
-    return Answer(
-        reply,
-        pick_sources(reply, result.chunks),
-        steps,
-        degraded=result.degraded,
-    )

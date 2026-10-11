@@ -1,19 +1,17 @@
-"""Prompts, context format, citations, sources and the answer flow, with a fake LLM."""
+"""Prompts, context format, citations and sources (the answer helpers the agent reuses)."""
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from app.core.prompts import load_prompt
 from app.rag.answer import (
-    LLM_DOWN_REPLY,
-    NO_CONTEXT_REPLY,
     SNIPPET_CHARS,
-    answer,
-    build_messages,
+    normalize_citations,
+    rag_message,
     cited_sections,
     format_context,
     pick_sources,
 )
-from app.rag.retriever import RetrievedChunk, SearchResult
+from app.rag.retriever import RetrievedChunk
 
 
 class FakeLLM:
@@ -63,13 +61,13 @@ def test_context_blocks_start_with_their_citation_label():
     )
 
 
-def test_build_messages():
-    system, user = build_messages("What is {context}?", [CATALOG])
-    assert isinstance(system, SystemMessage) and system.content == load_prompt("system_prompt")
-    assert isinstance(user, HumanMessage)
-    assert "[KB Section 8: Product & Service Catalog]\nOffering: Vantis HomePro 5" in user.content
-    assert "What is {context}?" in user.content  # the customer's text is not expanded
-    assert "{question}" not in user.content
+def test_rag_message():
+    message = rag_message("What is {context}?", [CATALOG])
+    assert isinstance(message, HumanMessage)
+    assert "[KB Section 8: Product & Service Catalog]\nOffering: Vantis HomePro 5" in message.content
+    assert "What is {context}?" in message.content  # the customer's text is not expanded
+    assert "{question}" not in message.content
+    assert "<context>\n\n</context>" in rag_message("Hi", []).content  # empty context
 
 
 def test_cited_sections():
@@ -112,46 +110,6 @@ def test_snippet_is_one_line_and_cut_at_a_word():
     assert len(source["snippet"]) <= SNIPPET_CHARS + 1 and source["snippet"].endswith("word…")
 
 
-def test_answer_happy_path():
-    llm = FakeLLM("We offer HomePro 5 [KB Section 8: Product & Service Catalog].")
-    result = answer("What do you offer?", SearchResult(chunks=CHUNKS, mode="hybrid"), llm)
-    assert result.reply.startswith("We offer HomePro 5")
-    assert [s["section"] for s in result.sources] == ["8"]
-    assert result.degraded is False
-    retrieve, step = result.steps
-    assert retrieve == {
-        "node": "retrieve",
-        "detail": "3 chunks (hybrid)",
-        "data": {"mode": "hybrid", "chunks": 3, "no_context": False},
-    }
-    assert step["node"] == "answer" and step["data"]["provider"] == "gemini"
-    assert isinstance(step["data"]["latency_ms"], int)
-    assert len(llm.calls) == 1
-
-
-def test_no_context_makes_no_llm_call():
-    llm = FakeLLM()
-    result = answer("Tell me a joke", SearchResult(chunks=CHUNKS, no_context=True), llm)
-    assert llm.calls == []
-    assert result.reply == NO_CONTEXT_REPLY
-    assert result.sources == []
-    assert result.steps[1]["data"]["provider"] is None
-
-
-def test_llm_failure_gives_a_degraded_reply():
-    llm = FakeLLM(error=RuntimeError("both providers down"))
-    result = answer("What do you offer?", SearchResult(chunks=CHUNKS), llm)
-    assert (result.reply, result.sources, result.degraded) == (LLM_DOWN_REPLY, [], True)
-
-
-def test_keyword_fallback_search_is_degraded():
-    result = answer("Q?", SearchResult(chunks=CHUNKS, mode="keyword", degraded=True), FakeLLM("A."))
-    assert result.degraded is True
-    assert result.reply == "A."
-
-
 def test_full_width_citation_brackets_are_normalized():
-    llm = FakeLLM("Steps: inquiry → handover【KB Section 8: Product & Service Catalog】.", provider="groq")
-    result = answer("Process?", SearchResult(chunks=CHUNKS), llm)
-    assert result.reply == "Steps: inquiry → handover[KB Section 8: Product & Service Catalog]."
-    assert [s["section"] for s in result.sources] == ["8"]
+    reply = "Steps: inquiry → handover【KB Section 8: Product & Service Catalog】."
+    assert normalize_citations(reply) == "Steps: inquiry → handover[KB Section 8: Product & Service Catalog]."

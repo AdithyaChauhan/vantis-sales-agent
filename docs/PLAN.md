@@ -50,7 +50,7 @@ Skipped on purpose: mock WhatsApp (optional in the PDF), streaming.
 - **Sales rep**, using the dashboard.
 
 ### Flows
-- **F0 Welcome.** When the chat opens, before the customer types, show a welcome message: what the assistant can help with (packages, service areas, installation, warranty and support, financing and subsidies, getting a quote) and its main limits from KB Section 16 (no exact prices, savings or subsidy amounts, no guaranteed installation dates; the Vantis team confirms those). Under it, 3 or 4 starter-question buttons. T10 shows it without an LLM call. T8 replies with the same text when the customer only says hi or asks what the assistant can do. The text lives in one place (the backend, which also serves it to the frontend), so both use the same words. Not built yet.
+- **F0 Welcome.** When the chat opens, before the customer types, show a welcome message: what the assistant can help with (packages, service areas, installation, warranty and support, financing and subsidies, getting a quote) and its main limits from KB Section 16 (no exact prices, savings or subsidy amounts, no guaranteed installation dates; the Vantis team confirms those). Under it, 3 or 4 starter-question buttons. T10 shows it without an LLM call. T8 replies with the same text when the customer only says hi or asks what the assistant can do. The text lives in one place (`app/agent/welcome.py`, served by `GET /api/welcome`), so both use the same words. Built in T8a.
 - **F1 Knowledge question.** Answer from the KB with sources. If the KB doesn't cover it, say so plainly and offer a sales follow-up.
 - **F2 Buying intent.** First answer any question in the message. Then ask for 1–2 missing details per turn, in this order: location → requirement (size, bill or usage) → timeline → name → phone or email → property details. Once the minimum fields are present (part 3.4), create the lead, describe the next step without promises, and offer a callback.
 - **F3 Callback.** Requires a lead. Save the request with status `requested`. Reply: "I've logged a callback request for <time>; our team will confirm." Never say it is booked.
@@ -91,8 +91,14 @@ flowchart LR
 ```mermaid
 flowchart TD
   msg(["Customer message"]) --> understand["understand<br/>fast LLM: intents, lead details, search query<br/>code: merge + validate"]
-  understand -->|"has a question"| retrieve["retrieve<br/>keyword + vector search, merged"]
-  understand -->|"no question"| agent
+  understand -->|"only hello / what can you do"| welcome["welcome text (no LLM)"]
+  understand -->|"only thanks / bye"| closing["closing line (no LLM)"]
+  understand -->|"only off-topic, no query"| redirect["polite redirect (no LLM)"]
+  welcome --> finalize
+  closing --> finalize
+  redirect --> finalize
+  understand -->|"has a search query"| retrieve["retrieve<br/>keyword + vector search, merged"]
+  understand -->|"anything else (incl. yes / no thanks)"| agent
   retrieve --> agent["agent<br/>main LLM, decides which tools to call"]
   agent -->|"tool calls"| tools["tools<br/>search_knowledge_base, check_service_area,<br/>create_lead, update_lead,<br/>schedule_callback, create_support_request"]
   tools --> agent
@@ -100,16 +106,17 @@ flowchart TD
   finalize --> reply(["Reply to customer"])
 ```
 
-**State** (LangGraph, checkpointed per `session_id`):
-`messages`, `lead` (merged and validated fields), `validation_errors`, `intents`, `search_query`, `retrieved`, `lead_id`, `support_request_id`, `steps`, `sources`, `degraded`.
-Reset the per-turn fields (`intents`, `search_query`, `retrieved`, `steps`, `sources`, `validation_errors`, `degraded`) at the start of every turn so nothing bleeds into the next turn.
+**State** (LangGraph, checkpointed per `session_id`; `app/agent/state.py`; domain data as plain dicts):
+`messages` (customer messages and final replies only), `lead` (merged and validated fields), `scratch` (this turn's tool calls and results), `intents`, `search_query`, `chunks`, `no_context`, `search_mode`, `validation_errors`, `tool_rounds`, `steps`, `reply`, `sources`, `degraded`. T8b adds `lead_id` and `support_request_id`.
+The turn input resets every per-turn field (`scratch` with `RemoveMessage(REMOVE_ALL_MESSAGES)`), so nothing bleeds into the next turn, and tool messages never enter the persisted history.
 
 **Nodes**
-1. **understand.** The fast LLM, with structured output (`prompts/lead_extraction_prompt.md`), reads the last user message, the last 6 messages and the current lead draft. It returns intents, the fields the customer explicitly stated, signals, and `search_query`: a standalone English rewrite when the message asks about Vantis, so a follow-up like "and in Kanpur?" works. Code then merges the non-null fields and validates them (part 3.3). Invalid values go to `validation_errors` and are never stored.
-2. **retrieve.** Runs only when `search_query` is set. Hybrid search returns the top 4 chunks (part 3.6). If nothing is relevant, it sets `no_context`.
-3. **agent.** The main LLM gets `system_prompt.md`, the context block from `rag_prompt.md`, a lead status block (known fields, missing fields, validation errors, location status) and the last 12 messages, with the tools bound. At most 4 tool rounds per turn.
-4. **tools.** The LangGraph ToolNode runs the calls. Each call is recorded in `steps`.
-5. **finalize.** If a lead exists and new details arrived, update it and re-score (the step is logged as `auto-sync`). Then collect `sources` and `steps`.
+1. **understand.** The fast LLM, with structured output (`prompts/lead_extraction_prompt.md`, schema `Understanding` with `include_raw`), reads the new message, the last 6 messages, the KB section titles and the KB Section 8 summary chunk (both read from `kb_chunks`). Intents: question, buying_interest, greeting, reply_to_assistant, thanks_or_bye, existing_customer_issue, off_topic. The details schema is generated from `LeadData` (same names and descriptions, loose types), so an invalid value becomes a validation error instead of breaking the output. If the call fails, the raw message becomes the search query and the turn is marked degraded. It returns intents, the fields the customer explicitly stated, signals, and `search_query`: a standalone English rewrite when the message asks about Vantis, so a follow-up like "and in Kanpur?" works. Code then merges the non-null fields and validates them (part 3.3). Invalid values go to `validation_errors` and are never stored.
+2. **retrieve.** Runs only when `search_query` is set. Hybrid search on the rewritten query returns the top 4 chunks (part 3.6). If nothing is relevant, it sets `no_context` and the agent gets an empty context. A small-to-big rule (add a table's summary chunk when its rows are retrieved) exists but is off: in the T8a eval it was not needed for q01 and added the whole catalog to 5 unrelated questions (`docs/EVAL.md`).
+3. **agent.** The main LLM gets `system_prompt.md`, the last 12 persisted messages with the current one wrapped in `rag_prompt.md` (context block), and this turn's tool messages, with the tools bound. After 4 tool rounds it is called without tools, which forces a final answer. If it fails: the friendly "trouble" reply, degraded. T8b adds a lead status block (known fields, missing fields, validation errors, location status).
+4. **tools.** The LangGraph ToolNode (`messages_key="scratch"`) runs the calls. Each call is recorded in `steps` (e.g. "Pune: unverified").
+5. **welcome / closing / redirect.** Fixed texts (`app/agent/welcome.py`), no LLM call, only when that intent is the only one; "yes" and "no thanks" always go to the agent with the history.
+6. **finalize.** Reply text (text blocks only, citations normalized), sources from the retrieved chunks plus the tool artifacts (one per cited section), the final reply added to `messages`. T8b: if a lead exists and new details arrived, update it and re-score (`auto-sync`).
 
 **Why this shape** (the interview answer): understanding and acting are split, so each step can be tested on its own. Retrieval always runs for questions, so answers can't skip the KB. The LLM decides *when* to save a lead; code decides *what* gets saved and computes the score.
 
@@ -125,6 +132,8 @@ Reset the per-turn fields (`intents`, `search_query`, `retrieved`, `steps`, `sou
 | `create_support_request` | `issue: str, project_details: str \| None` | Needs a name and a phone or email from the draft. Stores the request and returns its id |
 
 The lead tools take no free-form fields: they read the validated draft through injected graph state. The LLM chooses when; it cannot write made-up data to the DB.
+
+T8a builds `search_knowledge_base` and `check_service_area` (`app/agent/tools.py`). Both return `(content, artifact)`: the content is what the LLM reads (context blocks with KB Section labels, or the service-area result as JSON plus the KB Section 10 summary block); the artifact holds the KB chunks, so the reply's sources include what a tool found. The tools return data only; the system prompt says how to word "unverified". The lead tools come in T8b.
 
 ### 3.3 Lead fields and validation
 The contract is one Pydantic model, `LeadData` (`app/leads/schemas.py`): T8's understand step fills it with structured output, T9's `POST /leads` accepts it. Every field is optional and **null means unknown**. Units are in the names. Final names (T7):
@@ -210,14 +219,15 @@ Plain-language version with worked examples: `docs/SCORING.md`. Code: `app/leads
 - One module, `app/core/llm.py`, exposes `fast_llm()`, `main_llm()` and `embedder()`. Everything else uses only these.
 - Gemini: 15 s timeout, one retry on timeouts, 408 and 5xx, **no retry on 429** (quota), then fall back to Groq (LangChain `.with_fallbacks`). Groq: 15 s, no retry. Worst case about 46 s. Build the fallback separately for `bind_tools` and `with_structured_output`. Record which provider answered (from `response_metadata["model_provider"]`) and the latency in `steps` and the logs.
 - Gemini 3.x thinks by default: `thinking_level="minimal"` (lowest; one real call took 1.4 s). Groq gpt-oss: `reasoning_effort="low"`. The reply uses only the text blocks and strips any `<think>…</think>`, so reasoning never reaches the customer. gpt-oss sometimes cites with full-width brackets 【 】; `app/rag/answer.py` turns them into [ ].
-- In langchain-google-genai, `max_retries` means total attempts (first call included) and its default retry list includes 429, so `llm.py` binds its own `http_options` per call.
+- In langchain-google-genai, `max_retries` means total attempts (first call included) and its default retry list includes 429, so `llm.py` sends its own `http_options` with every request. `bind_tools()` drops bound `http_options` and `with_structured_output()` rejects them, so (T8a) a small subclass `GeminiChat` adds them in `_prepare_request`, which every call goes through (a private method: see Known limitations).
+- `chat_llm(model, tools=…, schema=…)` builds the Gemini model and the Groq fallback separately for each shape (plain, tools bound, structured output with the raw message kept). Groq gets `parallel_tool_calls=False` (gpt-oss does not support parallel tool calls).
 - Model names come only from env. `scripts/list_models.py` lists what the key can use.
 - **Model choice and free-tier limits** (checked in AI Studio and the Groq docs): every Gemini Flash model allows only 20 requests/day, so the agent uses the Flash-Lite models. `LLM_MODEL_MAIN=gemini-3.5-flash-lite` and `LLM_MODEL_FAST=gemini-3.1-flash-lite` each allow 15/min and 500/day, with a separate quota per model. `EMBEDDING_MODEL=gemini-embedding-2` allows 100/min, 30K tokens/min, 1,000/day. The Groq fallback `FALLBACK_MODEL=openai/gpt-oss-120b` allows 30/min, 1,000/day, 8K tokens/min (used from T5).
 - T3 builds `embedder()` only, with the `google-genai` SDK directly. T5 adds `fast_llm()` and `main_llm()` (langchain-google-genai 4.4.1, langchain-groq 1.1.3, langchain-core 1.6.9; google-genai stays 2.29.0).
 - Tests swap in a fake through this module and never call a real LLM (except tests marked `live`).
 
 ### 3.8 Memory
-LangGraph Postgres checkpointer, with `thread_id` = `session_id`. The LLM sees the last 12 messages; the full history stays in the checkpoint.
+LangGraph Postgres checkpointer (`langgraph-checkpoint-postgres`, `app/agent/memory.py`), with `thread_id` = `session_id`. A small `psycopg_pool` pool on `DATABASE_URL` (min 0, max 4, connections checked before use, idle ones closed after 4 minutes, as Neon drops them) with the settings the saver needs (`autocommit`, `prepare_threshold=0`, `dict_row`). `setup()` creates its tables at startup and never fails the boot. The agent sees the last 12 messages, understand the last 6; the full history stays in the checkpoint.
 
 ### 3.9 API contract
 Public: `POST /api/chat`, `GET /api/health`. Sales (header `X-API-Key: <SALES_API_KEY>`): everything else. FastAPI serves the docs at `/docs`.
@@ -241,11 +251,12 @@ Response:
   "degraded": false
 }
 ```
-`lead`, when present: `{"id", "status", "score", "missing_fields"}`.
+`lead`, when present (T8b): `{"id", "status", "score", "missing_fields"}`. Each step is `{"node", "name" (tools only), "detail", "data"}`.
 
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/api/health` | `{"status": "ok\|degraded", "db": "ok\|error", "kb_chunks": n, "llm": {...}}`. Never 500 |
+| GET | `/api/welcome` | `{"text", "starter_questions"}`: the F0 welcome (public, no LLM call; the agent sends the same text to a hello) |
 | GET | `/api/health/live` | `{"status": "ok"}`, no DB query, not logged. Render's health check (T6) |
 | GET | `/api/leads?status=&limit=&offset=` | `{"items": [...], "total": n}` |
 | GET | `/api/leads/{id}` | All fields + `score_breakdown` + callbacks |
@@ -311,7 +322,8 @@ One task = one Claude Code session = one `/handoff`.
 | T5 | Sun | `app/core/llm.py` (Gemini + Groq fallback + retries), `rag_prompt.md`, grounded `/api/chat` v0 (retrieve → answer + sources) | The 5 PDF questions get correct, sourced answers; no invented price. q01 ("What solar systems do you provide?") moved to T8 |
 | T6 | Sun | Dockerfile + deploy the skeleton to Render | Live `/api/health` returns ok. **Done 2026-10-11:** the Render service `vantis-sales-agent-api` (Singapore; URL in the Render Dashboard, README in T14): `/api/health` → ok, db ok, kb_chunks 54; `/api/chat` Delhi → 200, KB Section 10, gemini, about 1 s warm |
 | T7 | Mon | Leads layer: tables, validation, scoring, reason (LLM + template fallback), unit tests | Scoring tests pass for HOT / WARM / COLD / caps. **Done 2026-10-11:** Rahul 97 HOT; same lead in Pune 82 → 74 WARM; round trip on the test branch |
-| T8 | Mon | LangGraph agent (part 3.1), the 6 tools, checkpointer, system + extraction prompts, `/api/chat` v1 | The demo script via the API creates a HOT lead (live test). The q01 reply names the 5 packages (HomeStart 3, HomePro 5, HomeMax 10, Business 15, Business 25) and cites KB Section 8, and the q01 xfail marker in `tests/test_live_chat.py` is gone. The rewritten-query eval keeps hybrid hit@3 at 22/24 or better |
+| T8a | Mon | LangGraph agent part 1: understand (fast LLM, structured output, query rewrite), retrieve, agent with `search_knowledge_base` + `check_service_area`, finalize; Postgres checkpointer memory; welcome/closing/redirect replies; `GET /api/welcome`; `eval_retrieval --rewrite` | `/api/chat` runs the graph with the v0 shape (`lead` null), never a 500; Delhi → "And in Kanpur?" answered from memory; q01 names the 5 packages and cites KB Section 8 (xfail removed); Pune uses `check_service_area` and is "not in the listed areas; the team can check"; "hi" gets the welcome text; rewrite eval hybrid hit@3 ≥ 22/24. **Done 2026-10-11:** rewrite hit@3 24/24 |
+| T8b | Mon | Lead tools `create_lead`, `update_lead`, `schedule_callback`, `create_support_request` (reading the validated draft from graph state); flows F2-F4; lead status block in the agent prompt; `lead` in the response | The demo script via the API creates a HOT lead (live test); a callback is logged as requested, never booked; an inverter issue becomes a support request, not a lead; the reason-latency decision is made (T8 notes) |
 | T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint |
 | T10 | Tue | Chat page: welcome message + starter buttons (F0, no LLM call), messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser |
 | T11 | Tue | Dashboard: API-key prompt, leads table + filter, lead detail with breakdown | Rahul shows as HOT with reason and action |
@@ -327,22 +339,31 @@ Rule: no extras until the current task's "Done when" passes.
 ### T14 note (from T6)
 - The README gets the live backend URL and the sleep/wake note: the free service sleeps after 15 idle minutes, and the first request after that waits for Render to wake it and for the app to start (measured 32.5 s in T6; see `docs/DEPLOY.md`). Open `/api/health` a minute before the demo or recording.
 
+### T13 notes (from T8a)
+- **Cold start and the first chat after waking.** After the next deploy, measure on Render the cold start (first `/api/health` after 15+ idle minutes) and the first `/api/chat` after waking. Locally the first request of a process took 20 s (building the agent, opening the first connections), and the import time grew in T8a (Known limitations). If it is slow, warm the graph up in the background right after startup (build the agent and touch the DB pools in a background thread), so `/api/health/live` still answers fast and the health check never waits for it.
+- **Keep it awake during review?** Decide whether to keep the service awake during the review days (e.g. a scheduled ping every 10 minutes). First check the free instance hours left on Render's Billing page (750 a month per workspace), since an always-awake service uses about 24 a day.
+
 ### T9 note (from T6)
 - **Client IP behind Render's proxy.** The app sees the proxy's IP, because uvicorn trusts forwarded headers only from 127.0.0.1 by default. The per-IP rate limit needs the real client IP, or every customer would share one limit. T9 decides how to trust `X-Forwarded-For` (e.g. uvicorn `--proxy-headers` with `--forwarded-allow-ips`, or reading the right entry of the header) without letting clients spoof it.
 
+### T8b notes (from T8a)
+- **One question, up to two details.** The system prompt's "at most one follow-up question" and F2's "1-2 missing details per turn" must agree: one question may ask for two details ("Could you share your name and phone number?").
+- **No claimed actions.** The system prompt now forbids saying details were saved, a callback booked or the team contacted unless a tool did it this turn; with the lead tools, keep that rule and let the tool results drive the wording. `system_prompt.md` also says "You have no tool for these yet, so you can only say that the customer can share their details and the Vantis team can follow up with them." Update that sentence when the lead tools arrive (and log it in `prompts/README.md`).
+- **Reason latency** (from T7): decide whether `create_lead`/`update_lead` write the reason inline or after the reply.
+
 ### T8 notes (from T7)
-- **Packages to kW.** The understand step gets the KB Section 8 summary chunk (read from the DB, not typed into code), so a named package like "HomePro 5" becomes `system_size_kw` 5 and counts as a clear requirement.
+- **Packages to kW.** Done in T8a: the understand step gets the KB Section 8 summary chunk from the DB, and the prompt maps a named package to its kW.
 - **Reason latency.** `create_lead` and `update_lead` call `fast_llm` for the reason (worst case about 46 s with the T5 timeouts, outside the DB transaction). If that slows the chat, write the reason in `finalize` or after the reply.
 - **Field descriptions.** `LeadData`'s field descriptions (e.g. `timeline_bucket`: "lt_1m = now, this month or next month") are part of the structured-output schema; keep them in sync with `docs/SCORING.md`.
 
 ### T8 notes (from T5)
-- **q01 retrieval.** "What solar systems do you provide?" misses KB Sections 8 and 9: its words (solar, system, provide) are not in the catalog rows, so they get no keyword hit, and the Section 8 summary chunk is only 6th on vector similarity (0.708; the best of 4 wordings tried reached 0.736 against 0.751 for the top chunk). Evidence in `docs/EVAL.md` ("T5: summary chunks").
-- **search_query in the KB's own words.** The `understand` step writes `search_query` using the KB's terms. Give its prompt the KB section titles, read from the DB (not typed by hand), so "solar systems" can map to "Product & Service Catalog". In T5, "Which Vantis solar packages and products are offered?" returned 2 Section 8 chunks in the top 4 (HomePro 5 and the summary), and "Vantis product catalog offerings" returned 4 Section 8 chunks.
-- **Small-to-big.** "Vantis product catalog offerings" returned 4 Section 8 row chunks but not the summary, so a reply would name only some packages. Evaluate a rule: when row chunks from KB Section 8 or 10 are retrieved, add that section's summary chunk to the context.
-- **Measure the rewrite.** `eval_retrieval` gets a mode that searches with the rewritten query. It must not fall below today's hybrid hit@3 of 22/24. If the rewrite alone loses hits, try fusing the raw-question and rewritten results.
-- **Tools and timeouts.** `bind_tools()` on the Gemini binding drops `http_options`; pass them again: `bind_tools(tools, http_options=GEMINI_CHAT_HTTP)` (see the `gemini_chat` docstring in `app/core/llm.py`).
-- **Welcome reply.** When the customer only says hi or asks what the assistant can do, reply with the F0 welcome text (same source as the chat page).
-- **Open (T8 or T12):** the 5 kW cost reply is correct but doesn't mention HomePro 5 (the 5 kW package). Possible cause: "5kW" in the question against "5 kW" in the KB.
+- **q01 retrieval.** Fixed in T8a by the query rewrite (first hit 6 → 1; see `docs/EVAL.md`). Before: "What solar systems do you provide?" missed KB Sections 8 and 9: its words (solar, system, provide) are not in the catalog rows, so they get no keyword hit, and the Section 8 summary chunk is only 6th on vector similarity (0.708; the best of 4 wordings tried reached 0.736 against 0.751 for the top chunk). Evidence in `docs/EVAL.md` ("T5: summary chunks").
+- **search_query in the KB's own words.** Done in T8a. The `understand` step writes `search_query` using the KB's terms. Give its prompt the KB section titles, read from the DB (not typed by hand), so "solar systems" can map to "Product & Service Catalog". In T5, "Which Vantis solar packages and products are offered?" returned 2 Section 8 chunks in the top 4 (HomePro 5 and the summary), and "Vantis product catalog offerings" returned 4 Section 8 chunks.
+- **Small-to-big.** Evaluated in T8a and switched off (not needed for q01; noise for 5 unrelated questions). Original note: "Vantis product catalog offerings" returned 4 Section 8 row chunks but not the summary, so a reply would name only some packages. Evaluate a rule: when row chunks from KB Section 8 or 10 are retrieved, add that section's summary chunk to the context.
+- **Measure the rewrite.** Done in T8a: rewrite hit@3 24/24, fused 24/24; the rewrite alone is used. Original note: `eval_retrieval` gets a mode that searches with the rewritten query. It must not fall below today's hybrid hit@3 of 22/24. If the rewrite alone loses hits, try fusing the raw-question and rewritten results.
+- **Tools and timeouts.** Solved in T8a with `GeminiChat` (part 3.7), which also covers structured output.
+- **Welcome reply.** Done in T8a (`GET /api/welcome` + the graph's welcome node).
+- **Open (T12):** the 5 kW cost reply is correct but doesn't mention HomePro 5 (the 5 kW package). T8a's rewrite now searches "Pricing for Vantis HomePro 5 rooftop solar system", but the reply still only explains that pricing needs a consultation.
 
 ---
 
@@ -397,6 +418,11 @@ Rule: no extras until the current task's "Done when" passes.
 7. The conversation is in English (Hinglish works on a best-effort basis).
 8. Sales auth is a shared API key, which is demo-grade.
 9. The KB PDF is assessment material, so it isn't committed. Reviewers use their own copy; the live demo reads from the database and doesn't need it.
+
+## 8b. Known limitations
+- **GeminiChat** relies on a private method (`_prepare_request`) of langchain-google-genai 4.4.1. Keep the pin and the test in `tests/test_llm.py`, and re-check on any upgrade.
+- **Conversation retention.** The checkpointer stores full conversations, including personal details, in Neon, with no cleanup yet. Future work: a retention period and a cleanup job (`delete_thread`).
+- **Cold start on 0.1 CPU.** Importing the agent stack (FastAPI, LangChain, LangGraph, Postgres checkpointer) takes most of the free plan's start time (measured locally at `--cpus=0.1`: about 93 s to the first health answer in T8a, against 43 s in T6; local 0.1 CPU numbers are noisy and Render's T6 cold start was faster than local). Re-measure on Render after the T8a deploy.
 
 ## 9. Future work
 WhatsApp channel (webhook adapter on the same agent), streaming replies, a reranker, Alembic migrations, real auth (JWT + roles), CRM sync, multilingual support, LLM-judged answer evals, shared rate limiting (Redis), human handoff.

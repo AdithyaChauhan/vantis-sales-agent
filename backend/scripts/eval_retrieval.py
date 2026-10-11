@@ -1,15 +1,23 @@
 """Retrieval evaluation: hit@1, hit@3 and MRR for keyword, vector and hybrid search, plus the relevance gate.
 
-Run: python -m scripts.eval_retrieval
+Run: python -m scripts.eval_retrieval [--rewrite]
 
 Reads data/eval/retrieval_eval.jsonl (KB questions with the sections that answer them) and
 data/eval/offtopic_eval.jsonl (questions the KB cannot answer). Each question is embedded once
 (about 32 API calls) and that vector is reused for every mode. Prints the report and writes
 docs/EVAL.md; the hand-written "Tuning notes" section of that file is kept.
+
+--rewrite also runs the agent's understand step on every question (one fast_llm call each, paced to stay
+under the free tier's 15 requests a minute), embeds the rewritten search_query and adds two modes:
+"rewrite" (hybrid search on the rewritten query) and "fused" (RRF of the raw-question and rewritten
+hybrid rankings). It also reports where the small-to-big rule (app/agent/graph.py) would add a table
+summary chunk to the agent's 4-chunk context.
 """
+import argparse
 import json
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 
@@ -17,7 +25,7 @@ from sqlalchemy import Engine, text
 
 from app.core.config import REPO_ROOT, get_settings
 from app.core.db import check_db, get_engine
-from app.core.llm import EmbeddingError
+from app.core.llm import EmbeddingError, LLMError, chat_llm
 from app.core.llm import embedder as get_embedder
 from app.rag.retriever import (
     COMMON_WORD_RATIO,
@@ -38,6 +46,9 @@ NOTES_PLACEHOLDER = (
 )
 TOP_K = 10  # chunks requested from each search
 MODES = ("keyword", "vector", "hybrid")
+REWRITE_MODES = ("rewrite", "fused")
+CONTEXT_K = 4  # chunks the agent gets
+REWRITE_PAUSE_S = 4.5  # about 13 understand calls a minute (free tier: 15)
 
 _KB_INFO_SQL = text(
     """
@@ -170,8 +181,16 @@ def embed_questions(questions: list[Question], embedder) -> FixedEmbedder:
     return FixedEmbedder({q.question: embedder.embed_query(q.question) for q in questions})
 
 
-def evaluate(questions: list[Question], engine: Engine, embedder: FixedEmbedder) -> list[Evaluated]:
-    """Run keyword, vector and hybrid search (top TOP_K) for every question."""
+def evaluate(
+    questions: list[Question],
+    engine: Engine,
+    embedder: FixedEmbedder,
+    rewrites: dict[str, str | None] | None = None,
+) -> list[Evaluated]:
+    """Run keyword, vector and hybrid search (top TOP_K) for every question.
+
+    With rewrites (question -> rewritten search_query, or None), also the "rewrite" and "fused" modes.
+    """
     rows = []
     for q in questions:
         results = {}
@@ -180,17 +199,75 @@ def evaluate(questions: list[Question], engine: Engine, embedder: FixedEmbedder)
             if result.degraded:  # would mean vector numbers were really keyword numbers
                 raise EvalSetupError(f"{q.id}: the {mode} search fell back to keyword-only.")
             results[mode] = result
+        if rewrites is not None:
+            query = rewrites.get(q.question)
+            if query:
+                results["rewrite"] = search(query, k=TOP_K, mode="hybrid", engine=engine, embedder=embedder)
+            else:  # the understand step found nothing to search for
+                results["rewrite"] = SearchResult(mode="hybrid", no_context=True)
+            results["fused"] = fuse_results(results["hybrid"], results["rewrite"])
         rows.append(Evaluated(q, results))
     return rows
+
+
+def fuse_results(raw: SearchResult, rewritten: SearchResult, k: int = RRF_K) -> SearchResult:
+    """RRF of two rankings with equal weight (raw-question hybrid and rewritten-query hybrid).
+
+    no_context only when both searches say so.
+    """
+    scores: dict[str, float] = {}
+    chunks = {}
+    for ranking in (raw.chunks, rewritten.chunks):
+        for rank, chunk in enumerate(ranking, start=1):
+            scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1 / (k + rank)
+            chunks.setdefault(chunk.chunk_id, chunk)
+    order = sorted(scores, key=lambda cid: (-scores[cid], cid))
+    return SearchResult(
+        chunks=[chunks[cid] for cid in order][:TOP_K],
+        mode="fused",
+        no_context=raw.no_context and rewritten.no_context,
+    )
+
+
+def rewrite_questions(questions: list[Question], llm, hints, pause_s: float = REWRITE_PAUSE_S) -> dict:
+    """question -> the understand step's search_query (None when it found nothing to search for).
+
+    A failed call keeps the raw question, as the agent does. Paced to respect the per-minute quota.
+    """
+    from app.agent.understand import understand
+
+    rewrites: dict[str, str | None] = {}
+    for i, q in enumerate(questions):
+        if i:
+            time.sleep(pause_s)
+        try:
+            rewrites[q.question] = understand(llm, hints, q.question, [])["search_query"]
+        except LLMError as exc:
+            print(f"  {q.id}: understand failed ({exc}); using the raw question")
+            rewrites[q.question] = q.question
+    return rewrites
+
+
+def table_complete(chunks: list[dict], section: int, row_counts: dict[int, int]) -> bool:
+    """True if the context holds the whole table of a section: its summary chunk, or every row chunk."""
+    if any(c["section_no"] == section and c["chunk_type"] == "table_summary" for c in chunks):
+        return True
+    rows = sum(1 for c in chunks if c["section_no"] == section and c["chunk_type"] == "table_row")
+    return rows > 0 and rows == row_counts.get(section, -1)
 
 
 # ---------- report ----------
 
 
+def report_modes(rows: list[Evaluated]) -> tuple[str, ...]:
+    """The modes present in the results (the rewrite modes only after --rewrite)."""
+    return MODES + tuple(m for m in REWRITE_MODES if rows and m in rows[0].results)
+
+
 def metrics_lines(rows: list[Evaluated]) -> list[str]:
     """Table of hit@1, hit@3 and MRR per mode."""
     lines = ["| Mode | hit@1 | hit@3 | MRR |", "|---|---|---|---|"]
-    for mode in MODES:
+    for mode in report_modes(rows):
         ranks = [row.first_hit(mode) for row in rows]
         cells = [f"{hit_rate(ranks, k):.3f} ({count_hits(ranks, k)}/{len(ranks)})" for k in (1, 3)]
         lines.append(f"| {mode} | {cells[0]} | {cells[1]} | {mrr(ranks):.3f} |")
@@ -203,7 +280,7 @@ def misses_lines(rows: list[Evaluated]) -> list[str]:
         "| Mode | Question | Expected sections | Top 3 returned | First hit at |",
         "|---|---|---|---|---|",
     ]
-    for mode in MODES:
+    for mode in report_modes(rows):
         for row in rows:
             rank = row.first_hit(mode)
             if rank is not None and rank <= 3:
@@ -269,8 +346,54 @@ def gate_lines(kb_rows: list[Evaluated], off_rows: list[Evaluated], threshold: f
     return lines
 
 
+def rewrite_lines(kb_rows: list[Evaluated], off_rows: list[Evaluated], rewrites: dict) -> list[str]:
+    """The rewritten queries, and the off-topic gate for the rewrite mode."""
+    off_blocked = sum(1 for row in off_rows if row.results["rewrite"].no_context)
+    kb_blocked = sum(1 for row in kb_rows if row.results["rewrite"].no_context)
+    lines = [
+        f"Off-topic questions marked no_context (rewrite mode): {off_blocked} of {len(off_rows)}. "
+        f"KB questions wrongly marked no_context: {kb_blocked} of {len(kb_rows)}.",
+        "",
+        "| Question | Rewritten search_query | First hit (hybrid → rewrite) |",
+        "|---|---|---|",
+    ]
+    for row in kb_rows + off_rows:
+        query = rewrites.get(row.question.question) or "(none)"
+        before = row.first_hit("hybrid") if row.question.expected else None
+        after = row.first_hit("rewrite") if row.question.expected else None
+        moved = f"{before or '-'} → {after or '-'}" if row.question.expected else "off-topic"
+        lines.append(f"| {row.question.id}: {row.question.question} | {query} | {moved} |")
+    return lines
+
+
+def small_to_big_lines(kb_rows: list[Evaluated], summaries: dict[int, dict], row_counts: dict[int, int]) -> list[str]:
+    """Where the small-to-big rule adds a table summary to the agent's 4-chunk context (rewrite mode)."""
+    from app.agent.graph import add_table_summaries
+
+    lines = ["| Question | Summary added | Full table before → after |", "|---|---|---|"]
+    fired = 0
+    for row in kb_rows:
+        chunks = [asdict(c) for c in row.results["rewrite"].chunks[:CONTEXT_K]]
+        after = add_table_summaries(chunks, summaries)
+        added = [c["chunk_id"] for c in after[len(chunks):]]
+        if not added:
+            continue
+        fired += 1
+        sections = sorted({c["section_no"] for c in after if c["chunk_type"] == "table_summary"})
+        before_ok = all(table_complete(chunks, s, row_counts) for s in sections)
+        after_ok = all(table_complete(after, s, row_counts) for s in sections)
+        lines.append(f"| {row.question.id}: {row.question.question} | {', '.join(added)} | {before_ok} → {after_ok} |")
+    return [f"The rule fires for {fired} of {len(kb_rows)} KB questions.", "", *lines] if fired else [
+        f"The rule fires for 0 of {len(kb_rows)} KB questions."
+    ]
+
+
 def build_report(
-    kb_rows: list[Evaluated], off_rows: list[Evaluated], setup: list[tuple[str, str]], threshold: float
+    kb_rows: list[Evaluated],
+    off_rows: list[Evaluated],
+    setup: list[tuple[str, str]],
+    threshold: float,
+    extra: list[str] | None = None,
 ) -> str:
     """The generated part of docs/EVAL.md, as markdown."""
     lines = [
@@ -300,6 +423,7 @@ def build_report(
         "## Relevance gate",
         "",
         *gate_lines(kb_rows, off_rows, threshold),
+        *(extra or []),
     ]
     return "\n".join(lines)
 
@@ -318,15 +442,29 @@ def write_report(path: Path, generated: str) -> None:
 def main() -> int:
     """Command-line entry point. Returns the exit code."""
     sys.stdout.reconfigure(encoding="utf-8")  # keeps a Windows console from choking on non-ASCII text
+    parser = argparse.ArgumentParser(description="Retrieval eval; writes docs/EVAL.md.")
+    parser.add_argument("--rewrite", action="store_true", help="also evaluate the understand step's rewrites")
+    args = parser.parse_args()
     settings = get_settings()
+    rewrites = None
     try:
         kb_questions = load_questions(KB_QUESTIONS)
         off_questions = load_questions(OFFTOPIC_QUESTIONS)
+        questions = kb_questions + off_questions
         engine = get_engine()
         info = read_kb_info(engine, settings.embedding_model)
-        print(f"Embedding {len(kb_questions) + len(off_questions)} questions (one API call each)...")
-        embedder = embed_questions(kb_questions + off_questions, get_embedder())
-        rows = evaluate(kb_questions + off_questions, engine, embedder)
+        print(f"Embedding {len(questions)} questions (one API call each)...")
+        embedder = embed_questions(questions, get_embedder())
+        if args.rewrite:
+            from app.agent.understand import Understanding, load_kb_hints
+
+            hints = load_kb_hints(engine)
+            print(f"Rewriting {len(questions)} questions with the understand step (paced, about 2.5 minutes)...")
+            rewrites = rewrite_questions(questions, chat_llm(settings.llm_model_fast, schema=Understanding), hints)
+            new = [q for q in dict.fromkeys(rewrites.values()) if q and q not in embedder.vectors]
+            print(f"Embedding {len(new)} rewritten queries...")
+            embedder.vectors.update({q: get_embedder().embed_query(q) for q in new})
+        rows = evaluate(questions, engine, embedder, rewrites)
     except EmbeddingError as exc:
         print(f"Embedding failed, nothing was written.\n{exc}")
         return 1
@@ -349,7 +487,21 @@ def main() -> int:
         ("Relevance threshold", f"{settings.retrieval_min_similarity} (best cosine similarity)"),
     ]
     split = len(kb_questions)
-    report = build_report(rows[:split], rows[split:], setup, settings.retrieval_min_similarity)
+    extra = None
+    if rewrites is not None:
+        with engine.connect() as conn:
+            row_counts = dict(conn.execute(text(
+                "SELECT section_no, count(*) FROM kb_chunks WHERE chunk_type = 'table_row' GROUP BY section_no"
+            )).all())
+        setup.append(("Rewrite", f"understand step ({settings.llm_model_fast}), no history; fused = RRF of "
+                                 "raw and rewritten hybrid rankings"))
+        extra = [
+            "", "## Query rewrite (understand step)", "",
+            *rewrite_lines(rows[:split], rows[split:], rewrites),
+            "", "## Small-to-big (rewrite mode, the agent's 4-chunk context)", "",
+            *small_to_big_lines(rows[:split], hints.summaries, row_counts),
+        ]
+    report = build_report(rows[:split], rows[split:], setup, settings.retrieval_min_similarity, extra)
     print(report)
     write_report(REPORT_PATH, report)
     print(f"\nWrote {REPORT_PATH}")

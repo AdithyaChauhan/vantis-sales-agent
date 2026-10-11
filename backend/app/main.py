@@ -8,7 +8,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import chat, health
+from app.agent.memory import get_checkpointer, setup_checkpointer
+from app.api import chat, health, welcome
 from app.core.config import get_settings
 from app.core.db import get_engine, init_db
 from app.core.logging import request_id_var, setup_logging
@@ -22,8 +23,9 @@ QUIET_PATHS = {"/api/health/live"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: enable pgvector (never fails the boot)."""
+    """Startup: tables and pgvector, then the conversation-memory tables (neither fails the boot)."""
     init_db(get_engine())
+    setup_checkpointer(get_checkpointer())
     yield
 
 
@@ -71,3 +73,4 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(chat.router)
+app.include_router(welcome.router)
