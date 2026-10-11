@@ -24,8 +24,6 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `scripts/search_kb.py` | Prints the mode, `no_context` and the top chunks with scores and ranks |
 | `scripts/eval_retrieval.py` | Embeds the 24 KB and 8 off-topic questions once, runs `search()` in all three modes (k = 10), prints hit@1, hit@3, MRR, the misses and the gate results, and writes `docs/EVAL.md` (its "Tuning notes" section is hand-written and kept) |
 
-Deployment files (repo root): `Dockerfile` (python:3.12-slim, app + prompts only, non-root, uvicorn on `$PORT`), `.dockerignore`, `render.yaml` (one free web service, Singapore). Steps: `docs/DEPLOY.md`.
-
 ## Request flow
 ```mermaid
 flowchart LR
@@ -91,4 +89,17 @@ flowchart LR
   embed --> run["search() in keyword, vector and hybrid mode, k = 10"]
   run --> metrics["hit@1, hit@3, MRR, misses, gate counts"]
   metrics --> md["docs/EVAL.md, hand-written notes kept"]
+```
+
+## Deployment (T6)
+Files at the repo root: `Dockerfile` (python:3.12-slim, only the app package and `prompts/`, non-root user, one uvicorn worker on `$PORT`), `.dockerignore`, `render.yaml` (one free web service, region Singapore, next to Neon). Steps and limits: `docs/DEPLOY.md`.
+```mermaid
+flowchart LR
+  dev["git push to main"] --> gh["GitHub repo"]
+  gh -->|"buildFilter: Dockerfile, backend/app, requirements, prompts"| build["Render: docker build (free, Singapore)"]
+  build --> web["Container: uvicorn app.main:app on $PORT"]
+  render["Render health check, every few seconds"] --> live["/api/health/live (no DB, not logged)"]
+  live --- web
+  web -->|"DATABASE_URL"| neon[("Neon Postgres + pgvector, AWS Singapore")]
+  web -->|"GOOGLE_API_KEY / GROQ_API_KEY"| llms["Gemini, Groq"]
 ```
