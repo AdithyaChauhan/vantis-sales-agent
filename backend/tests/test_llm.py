@@ -1,5 +1,6 @@
 """Chat-model layer: wiring of Gemini + Groq, provider, latency and reply text. No network calls."""
 import logging
+import time
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -10,7 +11,18 @@ from pydantic import BaseModel
 
 from app.core import llm
 from app.core.config import Settings
-from app.core.llm import GeminiChat, LLMError, chat_llm, gemini_chat, invoke_llm, provider_of, reply_text
+from app.core.llm import (
+    GeminiChat,
+    LLMError,
+    chat_llm,
+    deadline_chain,
+    gemini_chat,
+    invoke_llm,
+    provider_of,
+    reply_text,
+    understand_candidates,
+    understand_llm,
+)
 
 MESSAGES = [HumanMessage("hi")]
 
@@ -178,3 +190,85 @@ def test_reasoning_never_reaches_the_reply():
         [{"type": "thinking", "thinking": "secret plan"}, {"type": "text", "text": "The answer."}]
     )
     assert reply_text(blocks) == "The answer."
+
+
+# ---------- the understand step: a 5 s deadline per model, then the next one ----------
+
+def structured(text, provider="google_genai") -> dict:
+    """What a structured-output model returns (raw message kept)."""
+    return {"raw": ai("", provider), "parsed": Answer(text=text), "parsing_error": None}
+
+
+def sleeps(seconds, output):
+    def _slow(_messages):
+        time.sleep(seconds)
+        return output
+
+    return RunnableLambda(_slow)
+
+
+def timed(chain) -> tuple[dict, float]:
+    start = time.perf_counter()
+    out = chain.invoke(MESSAGES)
+    return out, time.perf_counter() - start
+
+
+def test_slow_model_falls_back_within_the_deadline():
+    chain = deadline_chain([sleeps(2, structured("late")), returns(structured("fallback", "groq"))], seconds=0.2)
+    out, elapsed = timed(chain)
+    assert out["parsed"].text == "fallback" and provider_of(out["raw"]) == "groq"
+    assert elapsed < 1  # not the slow model's 2 s
+
+
+def test_every_fallback_is_capped_by_its_own_deadline():
+    chain = deadline_chain(
+        [sleeps(2, structured("first")), sleeps(2, structured("second")), returns(structured("third"))],
+        seconds=0.2,
+    )
+    out, elapsed = timed(chain)
+    assert out["parsed"].text == "third"
+    assert elapsed < 2 * 0.2 + 0.3
+
+
+def test_unparsable_output_falls_through_to_the_next_model():
+    broken = {"raw": ai("?"), "parsed": None, "parsing_error": ValueError("bad json")}
+    out, _ = timed(deadline_chain([returns(broken), returns(structured("parsed"))], seconds=1))
+    assert out["parsed"].text == "parsed"
+
+
+def test_all_models_failing_raises():
+    chain = deadline_chain([raises(RuntimeError("quota")), sleeps(2, structured("late"))], seconds=0.2)
+    with pytest.raises(RuntimeError, match="quota"):  # the first error; understand() wraps it in LLMError
+        chain.invoke(MESSAGES)
+    with pytest.raises(LLMError):  # nothing configured: fails on call, not on build
+        deadline_chain([]).invoke(MESSAGES)
+
+
+def models_in(runnable) -> list:
+    """The chat models inside a (structured-output) runnable."""
+    return [n.data for n in runnable.get_graph().nodes.values() if isinstance(n.data, (GeminiChat, ChatGroq))]
+
+
+def test_understand_candidates_order_and_one_short_attempt_each():
+    candidates = understand_candidates(Answer, settings())
+    [main], [fast], [groq] = (models_in(c) for c in candidates)
+    assert (main.model, fast.model, groq.model_name) == ("gemini-main", "gemini-fast", "groq-model")
+    for gemini in (main, fast):
+        http = request_http(gemini)
+        # Gemini refuses deadlines under 10 s; the 5 s cut-off is with_deadline's job. No retry.
+        assert http.timeout == 10_000 and http.retry_options.attempts == 1
+    assert (groq.request_timeout, groq.max_retries) == (5, 0)
+    for runnable in candidates:  # structured output with the raw message kept
+        assert "raw" in runnable.output_schema.model_json_schema()["properties"]
+
+
+def test_understand_llm_puts_a_deadline_on_every_candidate():
+    chain = understand_llm(Answer, settings())
+    assert isinstance(chain, RunnableWithFallbacks)
+    assert [r.name for r in (chain.runnable, *chain.fallbacks)] == ["with_deadline"] * 3
+
+
+def test_understand_candidates_skip_unconfigured_providers():
+    assert len(understand_candidates(Answer, settings(groq_api_key=""))) == 2
+    assert len(understand_candidates(Answer, settings(google_api_key=""))) == 1
+    assert understand_candidates(Answer, settings(google_api_key="", groq_api_key="")) == []

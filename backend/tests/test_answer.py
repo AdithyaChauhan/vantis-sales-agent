@@ -10,6 +10,8 @@ from app.rag.answer import (
     cited_sections,
     format_context,
     pick_sources,
+    strip_tool_citations,
+    tidy_citations,
 )
 from app.rag.retriever import RetrievedChunk
 
@@ -113,3 +115,43 @@ def test_snippet_is_one_line_and_cut_at_a_word():
 def test_full_width_citation_brackets_are_normalized():
     reply = "Steps: inquiry → handover【KB Section 8: Product & Service Catalog】."
     assert normalize_citations(reply) == "Steps: inquiry → handover[KB Section 8: Product & Service Catalog]."
+
+
+TOOLS = ["search_knowledge_base", "check_service_area", "schedule_callback"]
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ("Logged; the team will confirm it [schedule_callback result].", "Logged; the team will confirm it."),
+    ("Not confirmed yet [check_service_area].", "Not confirmed yet."),
+    ("Saved [create_lead result] and logged.", "Saved and logged."),
+])
+def test_tool_citations_are_removed(reply, expected):
+    assert strip_tool_citations(reply, TOOLS + ["create_lead"]) == expected
+
+
+def test_kb_labels_and_other_brackets_stay():
+    reply = "Steps [KB Section 6: Installation & Site Assessment]. Results vary [KB Section 13: Results]. [note]"
+    assert strip_tool_citations(reply, TOOLS) == reply
+    assert strip_tool_citations("Plain [aside].", []) == "Plain [aside]."
+
+
+AREAS_SUMMARY = chunk(10, "Reference Service Locations", "All rows", chunk_id="s10-table-summary")
+
+
+def test_each_section_is_cited_once_at_its_last_place():
+    label = "[KB Section 8: Product & Service Catalog]"
+    reply = f"Options:\n1. A {label}\n2. B {label}\n3. C {label}\n\nWant me to check your city?"
+    assert tidy_citations(reply, [CATALOG]) == f"Options:\n1. A\n2. B\n3. C {label}\n\nWant me to check your city?"
+
+
+def test_a_bare_label_gets_its_title():
+    assert tidy_citations("Vantis covers Lucknow [KB Section 10].", [AREAS_SUMMARY]) == (
+        "Vantis covers Lucknow [KB Section 10: Reference Service Locations]."
+    )
+    assert tidy_citations("Unknown [KB Section 4].", [AREAS_SUMMARY]) == "Unknown [KB Section 4]."  # no title known
+
+
+def test_clean_citations_are_left_alone():
+    reply = ("Packages [KB Section 8: Product & Service Catalog]. "
+             "Lucknow [KB Section 10: Reference Service Locations].")
+    assert tidy_citations(reply, [CATALOG, AREAS_SUMMARY]) == reply

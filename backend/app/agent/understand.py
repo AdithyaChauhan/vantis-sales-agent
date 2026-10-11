@@ -1,5 +1,6 @@
-"""The understand step: the fast LLM reads the new message (with recent history) and returns intents,
-a standalone search query in the KB's own words, and the lead details the customer stated.
+"""The understand step: an LLM (app: understand_llm, i.e. main, then fast, then Groq, 5 s each) reads the new
+message (with recent history) and returns intents, a standalone search query in the KB's own words, and the
+lead details the customer stated.
 
 The KB section titles and the KB Section 8 summary chunk come from the database (never typed into code),
 so "solar systems" can map to the Product & Service Catalog and "HomePro 5" to 5 kW.
@@ -155,7 +156,7 @@ def build_prompt(hints: KbHints, message: str, history: list[BaseMessage]) -> st
 
 def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMessage]) -> dict:
     """{intents, search_query, details (raw), asked_city, callback_time, issue, project_details, declines,
-    provider, latency_ms}. Raises LLMError on any failure."""
+    provider, model, latency_ms}. Raises LLMError on any failure."""
     start = time.perf_counter()
     try:
         result = llm.invoke([HumanMessage(build_prompt(hints, message, history))])
@@ -180,5 +181,6 @@ def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMe
         "project_details": text(parsed.project_details),
         "declines": bool(parsed.declines),
         "provider": provider_of(raw) if raw is not None else "unknown",
+        "model": raw.response_metadata.get("model_name") if raw is not None else None,
         "latency_ms": latency_ms,
     }

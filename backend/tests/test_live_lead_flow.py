@@ -24,7 +24,14 @@ SCORE_WORDS_RE = re.compile(r"\b(HOT|WARM|COLD|score|lead status)\b", re.IGNOREC
 BOOKED_RE = re.compile(r"\b(booked|is confirmed|has been confirmed|is scheduled|has been scheduled)\b", re.IGNORECASE)
 NAME_AND_PHONE_RE = re.compile(r"\bname\b.*\b(phone|number|mobile)\b|\b(phone|number|mobile)\b.*\bname\b",
                                re.IGNORECASE | re.DOTALL)
+TOOL_NAMES = ("search_knowledge_base", "check_service_area", "create_lead", "update_lead", "schedule_callback",
+              "create_support_request")
+# A tool cited like a source, e.g. "[schedule_callback result]" (T10 demo, turn 4)
+TOOL_CITATION_RE = re.compile(r"\[[^\]]*(?:\bresult\b|" + "|".join(TOOL_NAMES) + r")[^\]]*\]", re.IGNORECASE)
+KB_LABEL_RE = re.compile(r"\[KB Section \d+[^\]]*\]")
 LLM_CALLS = {"total": 0}
+PAUSE_BETWEEN_TURNS_S = 15  # up to 4 main-model calls a turn; the free tier allows 15 a minute
+LAST_TURN = {"session": None}
 
 
 @pytest.fixture
@@ -45,6 +52,9 @@ def lead_agent(test_engine):
 
 
 def ask(client, message: str, session_id: str) -> dict:
+    if LAST_TURN["session"] == session_id:  # pace the turns of one conversation
+        time.sleep(PAUSE_BETWEEN_TURNS_S)
+    LAST_TURN["session"] = session_id
     start = time.perf_counter()
     response = client.post("/api/chat", json={"message": message, "session_id": session_id})
     total_ms = round((time.perf_counter() - start) * 1000)
@@ -62,6 +72,9 @@ def ask(client, message: str, session_id: str) -> dict:
           f"\ntimes: {times} | total {total_ms} ms | LLM calls {llm} (running total {LLM_CALLS['total']})")
     assert not SCORE_WORDS_RE.search(body["reply"]), "the reply mentions a score or status"
     assert not BOOKED_RE.search(body["reply"]), "the reply claims a booking"
+    assert not TOOL_CITATION_RE.search(body["reply"]), "the reply cites a tool"
+    labels = KB_LABEL_RE.findall(body["reply"])
+    assert len(labels) == len(set(labels)), "the reply repeats a KB citation"
     return body
 
 

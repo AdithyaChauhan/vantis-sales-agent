@@ -26,15 +26,18 @@ from langgraph.prebuilt import ToolNode
 from app.agent import welcome
 from app.agent.leads import LeadOps, confirmed_city, lead_summary, pending_changes, status_block
 from app.agent.state import AgentState
-from app.agent.tools import KB_TOOLS, make_tools, tool_step
+from app.agent.tools import make_tools, tool_step
 from app.agent.understand import KbHints, Understanding, load_kb_hints, understand
 from app.core.config import get_settings
 from app.core.db import get_engine
-from app.core.llm import LLMError, chat_llm, provider_of, query_embedder, reply_text
+from app.core.llm import LLMError, chat_llm, provider_of, query_embedder, reply_text, understand_llm
 from app.leads import service
 from app.core.prompts import load_prompt
 from app.leads.schemas import LeadData
-from app.rag.answer import LLM_DOWN_REPLY, normalize_citations, pick_sources, rag_message, retrieve_step
+from app.rag.answer import (
+    LLM_DOWN_REPLY, normalize_citations, pick_sources, rag_message, retrieve_step, strip_tool_citations,
+    tidy_citations,
+)
 from app.rag.chunker import SUMMARY_SECTIONS
 from app.rag.retriever import RetrievedChunk, SearchResult, search
 from app.services.service_areas import ServiceAreas, get_service_areas
@@ -55,7 +58,7 @@ MAX_ASKED_CITIES = 3
 class AgentDeps:
     """Everything the graph needs from outside."""
 
-    understand_llm: Runnable  # fast model with structured output (Understanding, include_raw)
+    understand_llm: Runnable  # structured output (Understanding, include_raw); app: understand_llm()
     agent_llm: Runnable  # main model with the tools bound
     final_llm: Runnable  # main model without tools (used after MAX_TOOL_ROUNDS)
     search_fn: Callable[[str], SearchResult]
@@ -91,9 +94,15 @@ def _dedupe(chunks: list[dict]) -> list[dict]:
     return unique
 
 
+def _tool_chunks(scratch: list[BaseMessage], name: str) -> list[dict]:
+    """The KB chunks (artifacts) of this turn's results from the tool `name`."""
+    return [c for m in scratch if isinstance(m, ToolMessage) and m.name == name for c in (m.artifact or [])]
+
+
 def build_graph(deps: AgentDeps):
     """Compile the agent graph with the given dependencies."""
     tool_node = ToolNode(deps.tools, messages_key="scratch")
+    tool_names = [t.name for t in deps.tools]
 
     def understand_node(state: AgentState) -> dict:
         message = state["messages"][-1].content
@@ -105,7 +114,7 @@ def build_graph(deps: AgentDeps):
             logger.warning("understand failed, using the raw message: %s", type(exc).__name__)
             out = {"intents": ["question"], "search_query": message, "details": {}, "asked_city": None,
                    "callback_time": None, "issue": None, "project_details": None, "declines": False,
-                   "provider": None, "latency_ms": None}
+                   "provider": None, "model": None, "latency_ms": None}
             degraded = True
         data, errors = LeadData.from_raw(out["details"])
         clean = data.model_dump(exclude_none=True)
@@ -136,6 +145,7 @@ def build_graph(deps: AgentDeps):
                 "invalid": sorted(errors),
                 "city_confirmed": bool(city),
                 "provider": out["provider"],
+                "model": out["model"],
                 "latency_ms": out["latency_ms"],
             },
         }
@@ -259,15 +269,17 @@ def build_graph(deps: AgentDeps):
         update: dict = {}
         steps = list(state["steps"])
         if not reply:  # the agent's last message is the answer
-            reply = normalize_citations(reply_text(state["scratch"][-1]))
+            reply = strip_tool_citations(normalize_citations(reply_text(state["scratch"][-1])), tool_names)
             if not reply:
                 reply, degraded = LLM_DOWN_REPLY, True
             else:
-                found = state["chunks"] + [
-                    c for m in state.get("scratch", [])
-                    if isinstance(m, ToolMessage) and m.name in KB_TOOLS for c in (m.artifact or [])
-                ]
+                # The service-area summary first: a section's first chunk is its source, and for a city
+                # answer the KB Section 10 summary supports it, not whichever row the search found (T10b)
+                scratch = state.get("scratch", [])
+                found = (_tool_chunks(scratch, "check_service_area") + state["chunks"]
+                         + _tool_chunks(scratch, "search_knowledge_base"))
                 chunks = [RetrievedChunk(**c) for c in _dedupe(found)]
+                reply = tidy_citations(reply, chunks)
                 sources = pick_sources(reply, chunks) if chunks else []
         if deps.ops is not None:
             changes = pending_changes(state.get("lead", {}), state.get("lead_saved", {}))
@@ -330,7 +342,7 @@ def build_agent(
     ops = LeadOps(engine=leads_engine or engine, areas_fn=get_service_areas, reason_now=False)
     tools = make_tools(search_fn, get_service_areas, hints_fn, ops)
     deps = AgentDeps(
-        understand_llm=chat_llm(settings.llm_model_fast, schema=Understanding),
+        understand_llm=understand_llm(Understanding),  # main, fast, Groq: 5 s each (T10b)
         agent_llm=chat_llm(main_model, tools=tools),
         final_llm=chat_llm(main_model),
         search_fn=search_fn,

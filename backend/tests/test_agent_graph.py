@@ -5,9 +5,10 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.agent import welcome
 from app.agent.graph import MAX_TOOL_ROUNDS, add_table_summaries
-from app.rag.answer import LLM_DOWN_REPLY
-from app.rag.retriever import SearchResult
+from app.rag.answer import LLM_DOWN_REPLY, snippet
+from app.rag.retriever import RetrievedChunk, SearchResult
 from tests.agent_fakes import (
+    AREAS_SUMMARY,
     CATALOG_ROW,
     CATALOG_SUMMARY,
     FAQ,
@@ -107,6 +108,26 @@ def test_tool_loop_with_the_service_area_check():
     tool_result = agent.calls[1][-1]
     assert isinstance(tool_result, ToolMessage) and '"status": "unverified"' in tool_result.content
     assert [s["section"] for s in state["sources"]] == ["10"]  # the tool's KB Section 10 chunk
+
+
+def test_city_answer_cites_the_service_area_summary_not_a_retrieved_row():
+    delhi_row = RetrievedChunk("s10-delhi-ncr", 10, "Locations", 3, "table_row",
+                               "Region: Delhi NCR Reference Locations: Delhi, Gurugram")
+    agent = Scripted(
+        tool_call("check_service_area", {"city": "Karimnagar"}),
+        answer("Service in Karimnagar isn't confirmed yet; the team can check [KB Section 10: Locations]."),
+    )
+    understand = Scripted(understood(["question"], "service area Karimnagar", asked_city="Karimnagar"))
+    graph, _ = make_graph(understand, agent, search=FakeSearch(SearchResult(chunks=[delhi_row, FAQ])))
+    state = run(graph, "can you install it in Karimnagar?")
+    [area] = [s for s in state["sources"] if s["section"] == "10"]
+    assert area["snippet"] == snippet(AREAS_SUMMARY["content"])  # the tool's summary chunk, not the Delhi row
+
+
+def test_a_tool_cited_like_a_source_is_removed_from_the_reply():
+    graph, _ = make_graph(Scripted(understood(["question"], "x")),
+                          Scripted(answer("Logged; the team will confirm it [schedule_callback result].")))
+    assert run(graph, "call me at 5")["reply"] == "Logged; the team will confirm it."
 
 
 def test_listed_city_and_the_search_tool():

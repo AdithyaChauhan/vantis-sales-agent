@@ -192,6 +192,22 @@ def test_city_confirmation_through_the_graph(ops):
     assert second["steps"][0]["data"]["city_confirmed"] is True
 
 
+def test_information_only_turn_does_not_ask_for_details():
+    info = {"lead": {"intent_level": "exploring"}, "intents": ["question"]}  # intent_level is a guess, not a detail
+    block = status_block(info)
+    assert "do not ask for their details" in block and "Still needed" not in block
+
+
+@pytest.mark.parametrize("state", [
+    {"lead": {}, "intents": ["question", "buying_interest"]},
+    {"lead": {"system_size_kw": 5.0}, "intents": ["question"]},
+    {"lead": {}, "intents": ["question"], "asked_cities": ["Karimnagar"]},
+])
+def test_interest_brings_back_the_missing_details(state):
+    block = status_block(state)
+    assert "Still needed before it can be saved" in block and "do not ask for their details" not in block
+
+
 def test_two_asked_cities_ask_which():
     state = {"lead": {}, "asked_cities": ["Delhi", "Kanpur"]}
     assert "Ask which one the property is in" in status_block(state)

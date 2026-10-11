@@ -7,8 +7,8 @@ data/eval/offtopic_eval.jsonl (questions the KB cannot answer). Each question is
 (about 32 API calls) and that vector is reused for every mode. Prints the report and writes
 docs/EVAL.md; the hand-written "Tuning notes" section of that file is kept.
 
---rewrite also runs the agent's understand step on every question (one fast_llm call each, paced to stay
-under the free tier's 15 requests a minute), embeds the rewritten search_query and adds two modes:
+--rewrite also runs the agent's understand step on every question (one understand_llm call each: the main
+model, falling back to fast and then Groq after 5 s; paced to stay under the free tier's 15 requests a minute), embeds the rewritten search_query and adds two modes:
 "rewrite" (hybrid search on the rewritten query) and "fused" (RRF of the raw-question and rewritten
 hybrid rankings). It also reports where the small-to-big rule (app/agent/graph.py) would add a table
 summary chunk to the agent's 4-chunk context.
@@ -25,7 +25,7 @@ from sqlalchemy import Engine, text
 
 from app.core.config import REPO_ROOT, get_settings
 from app.core.db import check_db, get_engine
-from app.core.llm import EmbeddingError, LLMError, chat_llm
+from app.core.llm import EmbeddingError, LLMError, understand_llm
 from app.core.llm import embedder as get_embedder
 from app.rag.retriever import (
     COMMON_WORD_RATIO,
@@ -237,14 +237,18 @@ def rewrite_questions(questions: list[Question], llm, hints, pause_s: float = RE
     from app.agent.understand import understand
 
     rewrites: dict[str, str | None] = {}
+    models: dict[str, int] = {}  # which model answered, printed so the run shows any fallback
     for i, q in enumerate(questions):
         if i:
             time.sleep(pause_s)
         try:
-            rewrites[q.question] = understand(llm, hints, q.question, [])["search_query"]
+            out = understand(llm, hints, q.question, [])
+            rewrites[q.question] = out["search_query"]
+            models[str(out.get("model"))] = models.get(str(out.get("model")), 0) + 1
         except LLMError as exc:
             print(f"  {q.id}: understand failed ({exc}); using the raw question")
             rewrites[q.question] = q.question
+    print(f"  understand answered by: {models}")
     return rewrites
 
 
@@ -460,7 +464,7 @@ def main() -> int:
 
             hints = load_kb_hints(engine)
             print(f"Rewriting {len(questions)} questions with the understand step (paced, about 2.5 minutes)...")
-            rewrites = rewrite_questions(questions, chat_llm(settings.llm_model_fast, schema=Understanding), hints)
+            rewrites = rewrite_questions(questions, understand_llm(Understanding), hints)
             new = [q for q in dict.fromkeys(rewrites.values()) if q and q not in embedder.vectors]
             print(f"Embedding {len(new)} rewritten queries...")
             embedder.vectors.update({q: get_embedder().embed_query(q) for q in new})
@@ -493,8 +497,8 @@ def main() -> int:
             row_counts = dict(conn.execute(text(
                 "SELECT section_no, count(*) FROM kb_chunks WHERE chunk_type = 'table_row' GROUP BY section_no"
             )).all())
-        setup.append(("Rewrite", f"understand step ({settings.llm_model_fast}), no history; fused = RRF of "
-                                 "raw and rewritten hybrid rankings"))
+        setup.append(("Rewrite", f"understand step ({settings.llm_model_main}; fast, then Groq after 5 s), "
+                                 "no history; fused = RRF of raw and rewritten hybrid rankings"))
         extra = [
             "", "## Query rewrite (understand step)", "",
             *rewrite_lines(rows[:split], rows[split:], rewrites),

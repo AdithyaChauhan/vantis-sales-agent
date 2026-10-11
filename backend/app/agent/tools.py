@@ -25,7 +25,6 @@ from app.services.service_areas import ServiceAreas
 logger = logging.getLogger(__name__)
 
 NO_RESULTS = "No relevant KB content found."
-KB_TOOLS = ("search_knowledge_base", "check_service_area")  # the tools whose artifacts are KB chunks
 
 
 def _json(data: dict) -> str:

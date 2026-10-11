@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 LLM_DOWN_REPLY = "I'm having trouble right now. Please try again in a minute."
 SNIPPET_CHARS = 160
 _CITATION_RE = re.compile(r"KB Section (\d+)")
+_LABEL_RE = re.compile(r"([ \t]*)\[KB Section (\d+)(?::[^\[\]]*)?\]")  # spaces before it, section number
 
 
 def citation_label(chunk: RetrievedChunk) -> str:
@@ -41,6 +42,44 @@ def rag_message(question: str, chunks: list[RetrievedChunk], lead_progress: str 
 def normalize_citations(reply: str) -> str:
     """Turn full-width brackets 【 】 into [ ] (gpt-oss on Groq sometimes cites with them)."""
     return reply.replace("【", "[").replace("】", "]")
+
+
+def strip_tool_citations(reply: str, tool_names: list[str]) -> str:
+    """Remove a tool cited like a source, e.g. "[schedule_callback result]" (only KB sections are sources).
+
+    The system prompt forbids it; this is the safety net, and it logs a warning so a slipping prompt shows.
+    """
+    words = "|".join(re.escape(w) for w in ["result", *tool_names] if w)
+    pattern = re.compile(rf"\s*\[(?!KB Section)[^\[\]]*\b(?:{words})\b[^\[\]]*\]", re.IGNORECASE)
+    cleaned = pattern.sub("", reply)
+    if cleaned != reply:
+        logger.warning("reply cited a tool; removed")
+    return cleaned
+
+
+def tidy_citations(reply: str, chunks: list[RetrievedChunk]) -> str:
+    """Each KB section cited once, with its full label (the prompt asks for this; this is the safety net).
+
+    Only a section's last citation is kept (after a list, that is the end of the list), and a bare
+    "[KB Section 10]" gets its title from the chunks so the chat page can show it as a tag.
+    """
+    titles = {c.section_no: c.section_title for c in chunks}
+    remaining: dict[int, int] = {}
+    for match in _LABEL_RE.finditer(reply):
+        remaining[int(match.group(2))] = remaining.get(int(match.group(2)), 0) + 1
+
+    def keep_last(match: re.Match) -> str:
+        section = int(match.group(2))
+        remaining[section] -= 1
+        if remaining[section]:
+            return ""  # a later citation of the same section stays
+        title = titles.get(section)
+        return match.group(1) + (f"[KB Section {section}: {title}]" if title else match.group(0).lstrip(" \t"))
+
+    tidied = _LABEL_RE.sub(keep_last, reply)
+    if tidied != reply:
+        logger.info("citations tidied")
+    return tidied
 
 
 def cited_sections(reply: str) -> list[int]:

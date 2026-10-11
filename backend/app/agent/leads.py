@@ -21,6 +21,9 @@ from app.services.service_areas import ServiceAreas
 NEED_ORDER = ["city", "requirement, monthly bill, usage, system size or property type", "name", "phone or email"]
 CONTACT_ORDER = ["name", "phone or email", "city", "requirement, monthly bill, usage, system size or property type"]
 SUPPORT_NEEDS = ("name", "phone or email", "issue", "project details")
+BUYING_INTENTS = {"buying_interest", "contact_request"}
+INFO_ONLY_LINE = ("Lead saved: no. The customer has only asked for information so far: do not ask for their "
+                  "details; after answering, offer one next step.")
 _QUESTION_RE = re.compile(r"[^.!?]*\?")
 
 
@@ -54,6 +57,14 @@ def support_missing(lead: dict, support: dict) -> list[str]:
         "project details": bool(support.get("project_details")),
     }
     return [need for need in SUPPORT_NEEDS if not have[need]]
+
+
+def shows_interest(state: dict) -> bool:
+    """The customer wants solar for their own place: a buying or contact intent this turn, a city they asked
+    about, or any detail about themselves in the draft (intent_level alone is the extractor's guess)."""
+    if set(state.get("intents", [])) & BUYING_INTENTS or state.get("asked_cities"):
+        return True
+    return any(name != "intent_level" for name in state.get("lead", {}))
 
 
 def pending_changes(lead: dict, saved: dict) -> dict:
@@ -111,7 +122,9 @@ def status_block(state: dict) -> str:
                     lines.append("Still useful, ask gently only if it fits: " + ", ".join(useful) + ".")
         else:
             missing = ordered_missing(lead, state.get("contact_request", False))
-            if missing:
+            if missing and not shows_interest(state):  # a pure information question: no details asked (T10b)
+                lines.append(INFO_ONLY_LINE)
+            elif missing:
                 lines.append("Lead saved: no. Still needed before it can be saved: " + ", ".join(missing) + ".")
             else:
                 lines.append("Lead saved: no. Ready to save: call create_lead now (sharing a phone number "

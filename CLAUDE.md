@@ -38,6 +38,7 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - venv: `cd backend && source .venv/Scripts/activate`
 - API: `cd backend && uvicorn app.main:app --reload --port 8000`
 - Tests: `cd backend && python -m pytest -q` (real-LLM tests: `python -m pytest -m live`)
+- Voice check, Adithya's 4-turn session with replies and step times (about 11 LLM calls, paced; prints "→", so set UTF-8): `cd backend && PYTHONIOENCODING=utf-8 python -m pytest -m live -s tests/test_live_voice.py`
 - List Gemini models: `cd backend && python -m scripts.list_models`
 - Ingest KB dry run (parse and print chunks, no DB): `cd backend && python -m app.rag.ingest --dry-run`
 - Ingest KB (embeds, then replaces the KB rows in one transaction): `cd backend && python -m app.rag.ingest`

@@ -103,7 +103,7 @@ def test_pune_is_checked_and_not_refused(client):
     body = ask(client, "Can you install solar panels in Pune?")
     checks = tool_steps(body, "check_service_area")
     assert checks and checks[0]["detail"].lower().startswith("pune: unverified")
-    assert "listed" in body["reply"].lower()
+    assert re.search(r"\b(?:check|confirm|verify)", body["reply"], re.IGNORECASE), "no offer to check Pune"
     assert not NOT_SERVED_RE.search(body["reply"]), "the reply says Vantis doesn't serve Pune"
 
 
