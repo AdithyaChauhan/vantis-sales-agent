@@ -62,7 +62,15 @@ Expected: an answer citing `[KB Section 10: Reference Service Locations]`, a sou
 
 ## Live check of T9 (sales API, key, chat limit): writes nothing to the main database
 
-Every step below only reads, gets refused, or fails validation, so nothing is saved in the main database and no LLM is called. Do step 10 last: it locks your IP out of the sales API for 15 minutes. `<URL>` is the service URL; `<KEY>` is `SALES_API_KEY`.
+**Passed on Render on 2026-10-11** (key required; 10 chat messages then 429 with Retry-After; `"ip_source": "header"` in the logs; lockout after 10 wrong keys).
+
+Every step below only reads, gets refused, or fails validation, so nothing is saved in the main database and no LLM is called. Do step 10 last: it locks your IP out of the sales API for 15 minutes. `<URL>` is the service URL; `<KEY>` is `SALES_API_KEY`. For the curl steps, set the URL once in Git Bash:
+
+```bash
+BASE=https://vantis-sales-agent-api.onrender.com   # your URL from the Render Dashboard
+```
+
+> **`BASE` must not end with a slash.** `https://…onrender.com/` + `/api/chat` becomes `//api/chat`, which the app doesn't route, so every check fails for the wrong reason.
 
 1. **After the deploy**, open the service → **Environment** and check that `CLIENT_IP_HEADER` = `CF-Connecting-IP`, `CHAT_LIMIT_PER_MINUTE` = `10` and `CHAT_LIMIT_PER_DAY` = `100` are there. If the Blueprint sync did not add them, add them by hand and save. Copy the value of `SALES_API_KEY` (eye icon) to use below; don't paste it anywhere else.
 2. Open `<URL>/api/health` and wait for `"status":"ok"` (about 30 s if it was asleep).
@@ -77,26 +85,27 @@ Every step below only reads, gets refused, or fails validation, so nothing is sa
 7. **GET /api/leads** again: `total` is the same as in step 4, so nothing was written.
 8. Chat limit, in Git Bash (empty messages are refused before the agent runs, but still count):
    ```bash
-   curl -s -X POST <URL>/api/chat -H "Content-Type: application/json" \
+   curl -s -X POST "$BASE/api/chat" -H "Content-Type: application/json" \
      -d '{"message":"hi","session_id":"demo-1"}'
    # → 422, errors.session_id: "session_id must be the id from an earlier reply (a UUID v4); ..."
    for i in $(seq 1 11); do
-     curl -s -o /dev/null -w "%{http_code}\n" -X POST <URL>/api/chat \
+     curl -s -o /dev/null -w "%{http_code}\n" -X POST "$BASE/api/chat" \
        -H "Content-Type: application/json" -d '{"message":""}'
    done
    # → 422 nine times (the demo-1 request counted too), then 429 twice
-   curl -si -X POST <URL>/api/chat -H "Content-Type: application/json" -d '{"message":""}' | grep -iE "^HTTP|retry-after|detail"
+   curl -si -X POST "$BASE/api/chat" -H "Content-Type: application/json" -d '{"message":""}' | grep -iE "^HTTP|retry-after|detail"
    # → HTTP 429, a Retry-After header, and "You're sending messages a little fast. Please wait N seconds ..."
    ```
 9. **The real client IP is used:** Render → service → **Logs**, search for `/api/chat`. Every request line from step 8 must show `"ip_source": "header"`. If any line says `"fallback"`, Cloudflare's header is not reaching the app and every visitor shares one limit: stop and check `CLIENT_IP_HEADER` on the Environment page.
-10. **Spoofed headers don't help (do this last):**
+10. **A spoofed header doesn't help (do this last):** send wrong keys with only a fake `X-Forwarded-For`, a different one each time:
     ```bash
     for i in $(seq 1 11); do
-      curl -s -o /dev/null -w "%{http_code}\n" <URL>/api/leads -H "X-API-Key: wrong-$i" \
-        -H "CF-Connecting-IP: 10.0.0.$i" -H "X-Forwarded-For: 10.1.0.$i"
+      curl -s -o /dev/null -w "%{http_code}\n" "$BASE/api/leads" -H "X-API-Key: wrong-$i" \
+        -H "X-Forwarded-For: 10.1.0.$i"
     done
-    # → 401 ten times, then 429: a fake IP header on each request did not give a fresh limit
+    # → 401 ten times, then 429: a fake X-Forwarded-For on each request did not give a fresh limit
     ```
+    Don't fake `CF-Connecting-IP` here. On Render, Cloudflare refuses such a request with **403** (`text/plain`, not the app's JSON) before it reaches the app, so that header can't be spoofed at all, and the loop would test Cloudflare instead of the app.
     Requests without any key never count, so they can't cause this lockout. Your IP is locked out of the sales API for 15 minutes.
 11. **Optional:** while locked out, open `<URL>/docs` on a phone using mobile data (not your Wi-Fi), authorize with the right key and run **GET /api/leads** → **200**. The limit is per real client, not one shared proxy bucket.
 
@@ -139,3 +148,31 @@ docker run --rm -p 10000:10000 --env-file backend/.env vantis-api
 ```
 
 Add `--cpus=0.1 --memory=512m` to `docker run` to feel the free plan's speed. Note that `--env-file` keeps quotes as part of the value, so the values in `backend/.env` must not be quoted.
+
+## Local check of the chat page (and later the dashboard) without touching main
+
+For trying the page on your laptop. Leads, callbacks and support requests go to the Neon **test** branch, never main.
+
+1. Terminal 1 (Git Bash):
+   ```bash
+   cd backend && source .venv/Scripts/activate && python -m scripts.serve_test_branch
+   ```
+   It prints "Leads, callbacks and support requests are on the test branch." and serves the API on `http://127.0.0.1:8000`.
+   - The chat agent's lead writes and the sales API both use `TEST_DATABASE_URL`. The KB and service areas are only read from main, and chat memory stays in the process (a restart forgets the chats).
+   - It refuses to start if `TEST_DATABASE_URL` is empty or the same as `DATABASE_URL`.
+   - It sets `CORS_ORIGINS=http://localhost:5173` and `CHAT_SHOW_LEAD_SCORE=true` unless they are already in the environment.
+   - For the dashboard (T11), give it a throwaway key: `SALES_API_KEY=any-local-key-of-16-chars python -m scripts.serve_test_branch`.
+2. Terminal 2:
+   ```bash
+   cd frontend && npm install && npm run dev
+   ```
+   Then open <http://localhost:5173>. The page calls `http://127.0.0.1:8000` unless `VITE_API_URL` says otherwise (`cp .env.example .env.local`).
+3. Phone width: Edge or Chrome DevTools (F12) → device toolbar (Ctrl+Shift+M) → **Responsive**, width 400. Dark mode: DevTools → **⋮** → More tools → **Rendering** → "Emulate CSS media feature prefers-color-scheme: dark".
+
+Use `127.0.0.1`, not `localhost`, for the API. uvicorn listens on IPv4 only, and `localhost` can resolve to IPv6 `::1` first; on this laptop a Docker/WSL relay listens on port 8000 there and answers 404. The plain `uvicorn app.main:app --port 8000` writes chat leads to **main**: use it only when that is what you want.
+
+## Frontend on Vercel (T13)
+
+- Set `VITE_API_URL` to the Render URL. A trailing slash is fine (the page removes it). Vite reads it at build time, so a change needs a redeploy.
+- Add the Vercel URL to `CORS_ORIGINS` on Render (and in `render.yaml`), or the browser blocks every call.
+- The first visit after Render's service sleeps waits about 30 seconds. The page shows "Waking up the server" after 3 seconds, and the first chat answer can take about 20 seconds.

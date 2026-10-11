@@ -1,0 +1,759 @@
+/* Vantis chat page. One accent (deep teal), cool neutrals, system fonts.
+   Radius rule: buttons and chips are pills; messages, cards and the composer use 12px. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f3f5f5;
+  --surface: #fcfdfd;
+  --surface-2: #e9eeee;
+  --text: #15201f;
+  --muted: #4b5a58;
+  --border: #d3dbda;
+  --accent: #0b6b61;
+  --accent-hover: #095a52;
+  --on-accent: #fcfdfd;
+  --accent-soft: #dcecea;
+  --danger: #9f2d27;
+  --danger-soft: #fbeceb;
+  --shadow: 0 1px 2px rgb(21 32 31 / 6%), 0 4px 16px rgb(21 32 31 / 5%);
+  --radius: 12px;
+  --pill: 999px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1413;
+    --surface: #151d1c;
+    --surface-2: #1d2827;
+    --text: #e4ebea;
+    --muted: #a3b2b0;
+    --border: #2c3937;
+    --accent: #5cc4b5;
+    --accent-hover: #7ad3c6;
+    --on-accent: #0b1513;
+    --accent-soft: #173431;
+    --danger: #f19189;
+    --danger-soft: #3a1d1b;
+    --shadow: 0 1px 2px rgb(0 0 0 / 30%), 0 4px 16px rgb(0 0 0 / 25%);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+p,
+h1,
+h2,
+h3,
+ul,
+ol,
+dl,
+dd {
+  margin: 0;
+}
+
+button,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- Page frame ---------- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 64px;
+  padding: 10px 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* The mark: a sun rising over the horizon (same shapes as public/favicon.svg) */
+.mark {
+  position: relative;
+  flex: none;
+  width: 32px;
+  height: 32px;
+}
+
+.mark::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 11px;
+  width: 20px;
+  height: 10px;
+  border-radius: 10px 10px 0 0;
+  background: var(--accent);
+}
+
+.mark::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 24px;
+  width: 28px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.brand-name {
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.brand-sub {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 24px;
+  width: 100%;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 24px 4px 16px;
+}
+
+/* ---------- Buttons ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 8px 18px;
+  border-radius: var(--pill);
+  border: 1px solid transparent;
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1.3;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.1s ease;
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-secondary {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+/* ---------- Messages ---------- */
+
+.message {
+  max-width: 68ch;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+}
+
+.message p + p,
+.message p + ul,
+.message p + ol,
+.message ul + p,
+.message ol + p {
+  margin-top: 8px;
+}
+
+.message ul,
+.message ol {
+  padding-left: 20px;
+}
+
+.message li + li {
+  margin-top: 2px;
+}
+
+.message-assistant {
+  align-self: flex-start;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.message-user {
+  align-self: flex-end;
+  background: var(--accent-soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.reply-text {
+  overflow-wrap: anywhere;
+}
+
+/* "[KB Section 8: ...]" in a reply, shown as a small tag */
+.cite {
+  display: inline-block;
+  padding: 0 7px;
+  border-radius: var(--pill);
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+  vertical-align: 1px;
+  cursor: help;
+}
+
+.starters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.starter {
+  white-space: normal;
+  text-align: left;
+  font-weight: 500;
+}
+
+/* ---------- Source chips ---------- */
+
+.sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.message .sources {
+  padding: 0;
+}
+
+.message .sources li + li {
+  margin-top: 0;
+}
+
+/* A closed chip is only as wide as its label (browsers can otherwise size it by the hidden snippet) */
+.chip:not([open]) > :not(summary) {
+  display: none;
+}
+
+.chip {
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg);
+  font-size: 13px;
+}
+
+.chip summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  padding: 4px 12px;
+  border-radius: 16px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.chip summary::-webkit-details-marker {
+  display: none;
+}
+
+.chip summary::after {
+  content: "+";
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.chip[open] summary::after {
+  content: "\2212"; /* minus sign */
+}
+
+.chip-section {
+  font-weight: 650;
+}
+
+.chip-title {
+  color: var(--muted);
+}
+
+.chip-snippet,
+.chip-page {
+  padding: 0 12px;
+  max-width: 60ch;
+}
+
+.chip-snippet {
+  padding-top: 2px;
+}
+
+.chip-page {
+  padding-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---------- How I answered ---------- */
+
+.steps {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.steps summary {
+  width: fit-content;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.steps summary:hover {
+  color: var(--text);
+}
+
+.steps ol {
+  margin-top: 8px;
+  padding-left: 20px;
+}
+
+.steps li {
+  padding: 3px 0;
+}
+
+.step-label {
+  font-weight: 600;
+}
+
+.step-detail {
+  margin-left: 8px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.step-time {
+  margin-left: 8px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Loading, typing, notices ---------- */
+
+.skeleton {
+  display: grid;
+  gap: 8px;
+  width: min(420px, 70vw);
+}
+
+.skeleton span {
+  height: 10px;
+  border-radius: var(--pill);
+  background: var(--surface-2);
+}
+
+.skeleton span:nth-child(2) {
+  width: 85%;
+}
+
+.skeleton span:nth-child(3) {
+  width: 55%;
+}
+
+.wake {
+  margin-top: 12px;
+  color: var(--muted);
+}
+
+.typing .dots {
+  display: inline-flex;
+  gap: 5px;
+  padding: 6px 0;
+}
+
+.dots span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: 0.4;
+}
+
+.typing-slow {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.notice {
+  margin: 0 0 8px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  font-size: 14px;
+}
+
+.notice-error {
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: 500;
+}
+
+.notice-countdown {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Composer ---------- */
+
+.composer {
+  margin-bottom: 16px;
+  padding: 10px 12px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.composer:focus-within {
+  border-color: var(--accent);
+}
+
+.composer textarea {
+  display: block;
+  width: 100%;
+  max-height: 160px;
+  border: 0;
+  padding: 2px 0;
+  background: transparent;
+  resize: none;
+  line-height: 1.5;
+}
+
+.composer textarea:focus-visible {
+  outline: none; /* the whole composer shows the focus */
+}
+
+.composer textarea::placeholder {
+  color: var(--muted);
+}
+
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.composer-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---------- Sales view (demo) ---------- */
+
+.sales-panel {
+  padding-top: 24px;
+}
+
+.lead-card {
+  position: sticky;
+  top: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.lead-title {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.lead-note {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.lead-empty {
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.lead-body {
+  margin: 12px -8px 0;
+  padding: 4px 8px;
+  border-radius: 8px;
+}
+
+.lead-row {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 14px;
+}
+
+.lead-row + .lead-row {
+  border-top: 1px solid var(--border);
+}
+
+.lead-row dt {
+  color: var(--muted);
+}
+
+.lead-row dd {
+  font-weight: 600;
+}
+
+.lead-score {
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 10px;
+  border-radius: var(--pill);
+  border: 1px solid var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.badge-hot {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.badge-warm {
+  color: var(--accent);
+}
+
+.badge-cold {
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+.lead-missing {
+  margin-top: 10px;
+  font-size: 14px;
+}
+
+.lead-missing h3 {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.lead-missing ul {
+  margin-top: 4px;
+  padding-left: 18px;
+}
+
+/* Phone: the lead card folds into a strip under the header */
+.sales-strip {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 14px;
+}
+
+.sales-strip summary {
+  padding: 8px 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.sales-strip .lead-card {
+  position: static;
+  margin: 0 16px 12px;
+  box-shadow: none;
+}
+
+/* ---------- Motion (only when the visitor allows it) ---------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  .dots span {
+    animation: blink 1.2s infinite ease-in-out;
+  }
+
+  .dots span:nth-child(2) {
+    animation-delay: 0.2s;
+  }
+
+  .dots span:nth-child(3) {
+    animation-delay: 0.4s;
+  }
+
+  .skeleton span {
+    animation: pulse 1.6s infinite ease-in-out;
+  }
+
+  .lead-body {
+    animation: highlight 1.5s ease-out;
+  }
+}
+
+@keyframes blink {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 0.9;
+  }
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes highlight {
+  from {
+    background: var(--accent-soft);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+/* ---------- Narrow screens (same breakpoint as App.jsx) ---------- */
+
+@media (max-width: 899px) {
+  .topbar {
+    min-height: 56px;
+    padding: 8px 16px;
+  }
+
+  .brand-sub {
+    display: none;
+  }
+
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0 16px;
+  }
+
+  .transcript {
+    padding: 16px 0 12px;
+  }
+
+  .message {
+    max-width: 100%;
+  }
+
+  .message-user {
+    max-width: 88%;
+  }
+
+  .composer {
+    margin-bottom: 12px;
+  }
+
+  .composer-hint {
+    display: none;
+  }
+
+  .composer-bar {
+    justify-content: flex-end;
+  }
+}

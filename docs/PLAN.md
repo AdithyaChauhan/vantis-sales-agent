@@ -2,7 +2,7 @@
 
 The single source of truth for what we build and why.
 Roles: Adithya owns the project. Claude (chat) reviews and writes the tasks. Claude Code builds.
-Last updated: 2026-10-11 (T9).
+Last updated: 2026-10-12 (T10).
 
 ---
 
@@ -327,7 +327,19 @@ Tables are created on startup with `create_all` + `CREATE EXTENSION IF NOT EXIST
 | `LOG_LEVEL` | `INFO` |
 | `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT` | Optional |
 
-Frontend: `VITE_API_URL`.
+Frontend (`frontend/.env.example`): `VITE_API_URL`, default `http://127.0.0.1:8000`, with or without a trailing slash. Use `127.0.0.1`, not `localhost`: uvicorn listens on IPv4 only, and `localhost` can resolve to `::1` first (on Adithya's laptop a Docker/WSL relay answers there with 404).
+
+### 3.14 Chat page (T10, `frontend/`)
+React 19 + Vite 8, plain JavaScript (JSX with JSDoc on exported functions) and plain CSS. Dependencies: react, react-dom; dev only: vite, @vitejs/plugin-react, vitest, jsdom, @testing-library/react + @testing-library/dom. Exact versions, lockfile committed.
+- **Welcome (F0):** `GET /api/welcome` on load, shown as the first assistant message with the starter questions as buttons (only before the first message). After 3 s without an answer: "Waking up the server. This can take up to a minute." After 90 s or a network error: "Couldn't reach the server" + **Try again**.
+- **Session:** the first `POST /api/chat` has no `session_id`; the page keeps the returned one and sends it every time. Id, transcript and latest lead live in **sessionStorage** (survive a reload, gone when the tab closes, so personal details don't stay on a shared computer). **New chat** clears them.
+- **Replies:** React text nodes only (never HTML; `<script>` shows as text). Lines become paragraphs, `- ` lines a list, `**x**` bold. `[KB Section N: Title]` becomes a small "KB Section N" tag (full title on hover and for screen readers); text that doesn't match stays as it is. Sources are chips ("KB Section 8 Product & Service Catalog"); a click opens the snippet and page. **How I answered** (collapsed): each step's label, detail and time, the client's total time, and "Fallback used" when degraded.
+- **Lead card ("Sales view (demo)"):** from the `lead` field: not saved yet + still needed, or saved as lead #N + details that would add points; callback status. Status and score only when the API sends them (`CHAT_SHOW_LEAD_SCORE`). Desktop: a sticky side panel; phone (< 900 px): a strip under the header.
+- **Sending:** one message at a time (Send disabled, box read-only, typing dots). After 8 s: "the first answer after the server wakes up can take about 20 seconds". Client timeout 90 s.
+- **Errors:** the typed text always goes back into the box. 429: the API's `detail`, Send disabled for `retry_after` (body, else the `Retry-After` header) with a countdown. 422: the field's message (a refused `session_id` is dropped, so the next message starts a new chat). Anything else: "Something went wrong. Please try again."
+- **Accessibility:** Enter sends, Shift+Enter adds a line (not while an input method is composing), visible focus ring, a polite live region reads each new reply once, labels on all controls, light and dark themes, motion only without `prefers-reduced-motion`.
+- **Design:** a fictional brand (text name + a CSS rising-sun mark, also the favicon), cool neutrals, one teal accent, system fonts, pill buttons and chips, 12 px cards.
+- **Local checks never write to main:** `python -m scripts.serve_test_branch` runs the API with the chat agent's lead writes and the sales API on the test branch (KB read from main, chat memory in the process). It refuses to start when `TEST_DATABASE_URL` is empty or equals `DATABASE_URL`.
 
 ---
 
@@ -346,14 +358,25 @@ One task = one Claude Code session = one `/handoff`.
 | T7 | Mon | Leads layer: tables, validation, scoring, reason (LLM + template fallback), unit tests | Scoring tests pass for HOT / WARM / COLD / caps. **Done 2026-10-11:** Rahul 97 HOT; same lead in Pune 82 → 74 WARM; round trip on the test branch |
 | T8a | Mon | LangGraph agent part 1: understand (fast LLM, structured output, query rewrite), retrieve, agent with `search_knowledge_base` + `check_service_area`, finalize; Postgres checkpointer memory; welcome/closing/redirect replies; `GET /api/welcome`; `eval_retrieval --rewrite` | `/api/chat` runs the graph with the v0 shape (`lead` null), never a 500; Delhi → "And in Kanpur?" answered from memory; q01 names the 5 packages and cites KB Section 8 (xfail removed); Pune uses `check_service_area` and is "not in the listed areas; the team can check"; "hi" gets the welcome text; rewrite eval hybrid hit@3 ≥ 22/24. **Done 2026-10-11:** rewrite hit@3 24/24 |
 | T8b | Mon | Lead tools `create_lead`, `update_lead`, `schedule_callback`, `create_support_request` (reading the validated draft from graph state); flows F2-F4; lead status block in the agent prompt; `lead` in the response | The demo script via the API creates a HOT lead (live test); a callback is logged as requested, never booked; an inverter issue becomes a support request, not a lead; the reason-latency decision is made (T8 notes). **Done 2026-10-11:** demo (4 turns) → lead 97 HOT with reason and action plus a callback `requested` on the test branch; "Yes please, connect me" asks for name and phone; the reason is written after the reply (it added about 3.2 s) |
-| T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint. **Done 2026-10-11:** 5 sales endpoints behind `X-API-Key` (fail closed, failed-key lockout), chat 10/min + 100/day per IP with 429 + Retry-After, client IP from `CF-Connecting-IP`, UUID v4 session ids |
-| T10 | Tue | Chat page: welcome message + starter buttons (F0, no LLM call), messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser |
+| T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint. **Done 2026-10-11:** 5 sales endpoints behind `X-API-Key` (fail closed, failed-key lockout), chat 10/min + 100/day per IP with 429 + Retry-After, client IP from `CF-Connecting-IP`, UUID v4 session ids. **Render check passed** (all 6 steps): key required; 10 chat messages then 429 with Retry-After; `"ip_source": "header"` in the logs; lockout after 10 wrong keys |
+| T10 | Tue | Chat page: welcome message + starter buttons (F0, no LLM call), messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser. **Done 2026-10-12** (part 3.14): the 4-turn demo in headless Edge against the local API on the test branch: cited answer (KB Section 8) → Lucknow listed, asks name and phone → lead #1 saved, HOT 97 → callback requested; turns 7.9 / 5.2 / 4.8 / 3.8 s; transcript and session survive a reload; no horizontal scroll at 400 px |
 | T11 | Tue | Dashboard: API-key prompt, leads table + filter, lead detail with breakdown | Rahul shows as HOT with reason and action |
 | T12 | Wed | Edge-case pass, live scenario tests, prompt fixes logged | Every scenario in part 5 passes or is documented |
 | T13 | Wed | GitHub Actions CI, deploy backend (Render) + frontend (Vercel), CORS, live smoke test | CI green; the demo flow works on the live URL |
 | T14 | Thu | README (17 sections), `docs/ARCHITECTURE.md`, ZIP, video | Submitted by 20:00 IST |
 
 Rule: no extras until the current task's "Done when" passes.
+
+### T13 notes (from T10)
+- **Vercel:** set `VITE_API_URL` to the Render URL (a trailing slash is fine) and add the Vercel URL to `CORS_ORIGINS` (render.yaml and `PROD_DIFFERS` in `tests/test_deploy_config.py`). Vite reads `VITE_*` at build time, so changing it needs a redeploy.
+- **The demo card in production:** with `CHAT_SHOW_LEAD_SCORE=false` the card shows no score or status, but it still shows lead and callback state to customers. Decide whether the deployed page shows the card at all (e.g. a `VITE_SHOW_SALES_VIEW` flag), or keep it on for the review and say so in the README.
+
+### T11 notes (from T10)
+- **Local dashboard checks:** `python -m scripts.serve_test_branch` already points the sales API (`leads_engine`) at the test branch, so the dashboard shows and writes only test-branch leads. Pass a throwaway `SALES_API_KEY=... python -m scripts.serve_test_branch` to use a known key locally.
+- Reuse `frontend/src/api.js` (`apiUrl`, `ApiError`, `errorFrom`) for the dashboard's calls.
+
+### T12 notes (from T10)
+- **Tool name in a reply:** in the T10 demo run, turn 4 ended with "… the team will confirm it [schedule_callback result]." The model cited the tool result like a KB section. The page shows it as plain text. Fix in `system_prompt.md` (cite only KB sections, never tools) and log it in `prompts/README.md`.
 
 ### T13 note (from T6)
 - Once GitHub Actions CI exists, switch `autoDeployTrigger` in `render.yaml` from `commit` to `checksPass`, so a push that fails CI is not deployed. Add the Vercel URL to `CORS_ORIGINS` (`render.yaml`, and to `PROD_DIFFERS` in `tests/test_deploy_config.py`).

@@ -2,7 +2,7 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T9)
+## Backend modules (as of T10)
 | Module | Role |
 |---|---|
 | `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware (skips `QUIET_PATHS`: `/api/health/live`; adds `ip_source` for rate-limited requests, never the IP), error handlers (`ApiError`, 422 with one message per field, database down → 503), CORS (GET/POST; `Content-Type`, `X-API-Key`, `X-Request-ID`; exposes `Retry-After`), routers |
@@ -40,6 +40,7 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/services/service_areas.py` | `ServiceAreas.lookup(city, state)`: alias map + rapidfuzz (score 85); loads from the `service_areas` table (`get_service_areas()`, cached) |
 | `scripts/list_models.py` | Lists Gemini chat and embedding models for the key |
 | `scripts/search_kb.py` | Prints the mode, `no_context` and the top chunks with scores and ranks |
+| `scripts/serve_test_branch.py` | Dev only: runs the API on 127.0.0.1:8000 with the chat agent's lead writes and the sales API (`leads_engine`) on `TEST_DATABASE_URL`; KB and service areas read from main; chat memory in the process (`InMemorySaver`). `engine_for_test_branch` refuses an empty or same-as-main URL |
 | `scripts/eval_retrieval.py` | Embeds the 24 KB and 8 off-topic questions once, runs `search()` in all three modes (k = 10), prints hit@1, hit@3, MRR, the misses and the gate results, and writes `docs/EVAL.md` (its "Tuning notes" section is hand-written and kept). `--rewrite` adds the understand step's rewritten query (`rewrite` and `fused` modes) and the small-to-big report |
 
 ## Request flow
@@ -167,4 +168,33 @@ flowchart TD
   finalize --> reply(["reply + sources + steps"])
   memory[("Postgres checkpointer<br/>thread = session_id")] -.-> understand
   finalize -.-> memory
+```
+
+## Chat page (T10, `frontend/`)
+React 19 + Vite 8, plain JavaScript and CSS. Behaviour: PLAN.md part 3.14.
+
+| Module | Role |
+|---|---|
+| `src/api.js` | `apiUrl(path)` (VITE_API_URL, trailing slashes removed, default `http://127.0.0.1:8000`), `getWelcome()`, `postChat({message, sessionId})`, `ApiError` (`rate_limit` / `invalid` / `server` / `network`), `errorFrom` (429 → `detail` + `retry_after` or the `Retry-After` header; 422 → first field message; else a generic message); 90 s timeout |
+| `src/storage.js` | `loadChat` / `saveChat` / `clearChat`: session id, transcript and lead in sessionStorage; never throws |
+| `src/useChat.js` | The conversation hook: messages, lead, session id, draft, `pending` / `slow` (8 s), `notice`, `waitLeft` (429 countdown), `send(text)` (one at a time; on failure the text goes back into the draft), `newChat()` |
+| `src/useWelcome.js` | `GET /api/welcome` once; `slow` after 3 s (the waking-up notice), `retry()` after an error |
+| `src/App.jsx` | Layout (header, transcript, notices, composer, sales panel or phone strip at 900 px), welcome + starters, typing indicator, screen-reader announcer |
+| `src/components/ReplyText.jsx` | Reply text as React text nodes: paragraphs, lists, bold, `[KB Section N: Title]` → "KB Section N" tag |
+| `src/components/SourceChips.jsx`, `StepsPanel.jsx`, `Message.jsx` | Source chips (`<details>`: section + title, snippet on open); "How I answered" (`<details>`: step label, detail, time); one message |
+| `src/components/LeadCard.jsx` | "Sales view (demo)": saved or not, still needed / would add points, callback; status and score only when sent |
+| `src/components/Composer.jsx` | Textarea (Enter sends, Shift+Enter new line, 1,000 characters), Send / "Wait N s" |
+| `src/*.test.js(x)` | Vitest + Testing Library, `fetch` stubbed (`src/test-utils.js`) |
+
+```mermaid
+flowchart LR
+  page["App.jsx"] --> welcome["useWelcome"]
+  page --> chat["useChat"]
+  welcome -->|"GET /api/welcome (3 s: waking-up notice)"| api["api.js: apiUrl, ApiError"]
+  chat -->|"POST /api/chat {message, session_id}"| api
+  api --> backend["FastAPI (Render, or local 127.0.0.1:8000)"]
+  chat <--> store[("sessionStorage: session id, transcript, lead")]
+  chat --> view["Message: ReplyText, SourceChips, StepsPanel"]
+  chat --> card["LeadCard (Sales view, demo)"]
+  chat --> composer["Composer + notices (429 countdown, 422, errors)"]
 ```

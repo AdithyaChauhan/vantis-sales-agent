@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- The Vantis mark: a sun rising over the horizon (a half-disc on a line) -->
+  <style>
+    .mark { fill: #0b6b61; }
+    @media (prefers-color-scheme: dark) { .mark { fill: #5cc4b5; } }
+  </style>
+  <path class="mark" d="M6 21 A10 10 0 0 1 26 21 Z" />
+  <rect class="mark" x="2" y="24" width="28" height="3" rx="1.5" />
+</svg>

@@ -44,7 +44,11 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - Search the KB: `cd backend && python -m scripts.search_kb "question" [--mode keyword|vector|hybrid]`
 - Retrieval eval: `cd backend && python -m scripts.eval_retrieval`
 - Retrieval eval with the agent's query rewrite (about 32 fast-LLM calls, paced): `cd backend && python -m scripts.eval_retrieval --rewrite`
-- Frontend: `cd frontend && npm run dev`
+- API for local page checks, leads on the Neon test branch (never main): `cd backend && python -m scripts.serve_test_branch`
+- Frontend setup: `cd frontend && npm install`
+- Frontend: `cd frontend && npm run dev` (http://localhost:5173; calls the API at `VITE_API_URL`, default http://127.0.0.1:8000)
+- Frontend tests: `cd frontend && npm test`
+- Frontend build: `cd frontend && npm run build`
 - Docker image (repo root, Docker Desktop running): `docker build -t vantis-api .`
 - Run the image: `docker run --rm -p 10000:10000 --env-file backend/.env vantis-api` (add `--cpus=0.1 --memory=512m` to match Render's free plan)
 - Deploy: push to `main`; Render builds from `render.yaml` (steps in `docs/DEPLOY.md`)
