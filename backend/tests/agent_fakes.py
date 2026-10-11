@@ -22,9 +22,15 @@ AREAS_SUMMARY = {
 HINTS = KbHints("KB Section 8: Catalog\nKB Section 10: Locations", {8: CATALOG_SUMMARY, 10: AREAS_SUMMARY})
 
 
+TOP_LEVEL = ("asked_city", "callback_time", "issue", "project_details", "declines")
+
+
 def understood(intents, search_query=None, provider="google_genai", **details) -> dict:
-    """What the structured-output model returns: raw message, parsed Understanding, no parsing error."""
-    parsed = Understanding(intents=intents, search_query=search_query, details=details)
+    """What the structured-output model returns: raw message, parsed Understanding, no parsing error.
+
+    Keyword arguments are lead details, except the top-level fields in TOP_LEVEL."""
+    top = {key: details.pop(key) for key in TOP_LEVEL if key in details}
+    parsed = Understanding(intents=intents, search_query=search_query, details=details, **top)
     raw = AIMessage(content="", response_metadata={"model_provider": provider})
     return {"raw": raw, "parsed": parsed, "parsing_error": None}
 
@@ -70,10 +76,12 @@ class FakeSearch:
         return self.result
 
 
-def make_graph(understand_llm, agent_llm, final_llm=None, search=None, small_to_big=False, checkpointer=None):
-    """The real graph with fakes. Returns (graph, search)."""
+def make_graph(
+    understand_llm, agent_llm, final_llm=None, search=None, small_to_big=False, checkpointer=None, ops=None
+):
+    """The real graph with fakes. Returns (graph, search). ops: the leads database (lead tools on)."""
     search = search or FakeSearch()
-    tools = make_tools(search, lambda: AREAS, lambda: HINTS)
+    tools = make_tools(search, lambda: AREAS, lambda: HINTS, ops)
     deps = AgentDeps(
         understand_llm=understand_llm,
         agent_llm=agent_llm,
@@ -84,9 +92,10 @@ def make_graph(understand_llm, agent_llm, final_llm=None, search=None, small_to_
         tools=tools,
         checkpointer=checkpointer or InMemorySaver(),
         small_to_big=small_to_big,
+        ops=ops,
     )
     return build_graph(deps), search
 
 
 def run(graph, message: str, thread: str = "t-1") -> dict:
-    return graph.invoke(turn_input(message), {"configurable": {"thread_id": thread}})
+    return graph.invoke(turn_input(message, thread), {"configurable": {"thread_id": thread}})

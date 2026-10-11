@@ -3,11 +3,12 @@
 understand ─┬─ only a greeting ─► welcome ─┐
             ├─ only thanks/bye ─► closing ─┤
             ├─ only off-topic, no query ─► redirect ─┤
-            ├─ search_query ─► retrieve ─► agent ⇄ tools ─┤
-            └─ anything else ─────────────► agent ⇄ tools ─┴─► finalize
+            ├─ search_query (not details-only) ─► retrieve ─► agent ⇄ tools ─┤
+            └─ anything else ─────────────────────────────► agent ⇄ tools ─┴─► finalize
 
-Every external piece (LLMs, search, service areas, KB hints, checkpointer) comes in through AgentDeps,
-so tests run the real graph with fakes.
+Every external piece (LLMs, search, service areas, KB hints, leads database, checkpointer) comes in
+through AgentDeps, so tests run the real graph with fakes. The lead tools (T8b) read the draft from the
+state; finalize saves new details of an existing lead once (if the update_lead tool did not already).
 """
 import logging
 import time
@@ -23,12 +24,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from app.agent import welcome
+from app.agent.leads import LeadOps, confirmed_city, lead_summary, pending_changes, status_block
 from app.agent.state import AgentState
-from app.agent.tools import make_tools, tool_step
+from app.agent.tools import KB_TOOLS, make_tools, tool_step
 from app.agent.understand import KbHints, Understanding, load_kb_hints, understand
 from app.core.config import get_settings
 from app.core.db import get_engine
 from app.core.llm import LLMError, chat_llm, provider_of, query_embedder, reply_text
+from app.leads import service
 from app.core.prompts import load_prompt
 from app.leads.schemas import LeadData
 from app.rag.answer import LLM_DOWN_REPLY, normalize_citations, pick_sources, rag_message, retrieve_step
@@ -41,6 +44,11 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 4
 AGENT_HISTORY = 12  # persisted messages the agent sees, including the current one
 CONTEXT_CHUNKS = 4
+# No KB search for a message that only gives details or asks to be contacted (a short "yes please" may
+# come with it); a short reply alone that accepts an info offer still searches.
+NO_SEARCH_INTENTS = {"gives_details", "contact_request", "reply_to_assistant"}
+NO_SEARCH_TRIGGERS = {"gives_details", "contact_request"}
+MAX_ASKED_CITIES = 3
 
 
 @dataclass
@@ -55,6 +63,7 @@ class AgentDeps:
     hints_fn: Callable[[], KbHints]
     tools: list[BaseTool]
     checkpointer: BaseCheckpointSaver | None = None
+    ops: LeadOps | None = None  # the leads database for the lead tools; None: no lead tools (T8a)
     # Off: in the T8a eval it was not needed for q01 and added the whole catalog to 5 unrelated
     # questions (docs/EVAL.md). Kept switchable so the eval keeps measuring it.
     small_to_big: bool = False
@@ -94,11 +103,29 @@ def build_graph(deps: AgentDeps):
             degraded = False
         except LLMError as exc:  # carry on with the raw message as the search query
             logger.warning("understand failed, using the raw message: %s", type(exc).__name__)
-            out = {"intents": ["question"], "search_query": message, "details": {}, "provider": None,
-                   "latency_ms": None}
+            out = {"intents": ["question"], "search_query": message, "details": {}, "asked_city": None,
+                   "callback_time": None, "issue": None, "project_details": None, "declines": False,
+                   "provider": None, "latency_ms": None}
             degraded = True
         data, errors = LeadData.from_raw(out["details"])
         clean = data.model_dump(exclude_none=True)
+        intents = set(out["intents"])
+        asked = list(state.get("asked_cities", []))
+        previous = state["messages"][-2] if len(state["messages"]) > 1 else None
+        city = confirmed_city(asked, previous, out)
+        if city:  # the customer confirmed the city the assistant's question named
+            clean["city"] = city
+        if clean.get("city"):
+            asked = []  # a stated or confirmed city replaces the guesses
+        elif out["asked_city"] and out["asked_city"] not in asked:
+            asked = (asked + [out["asked_city"]])[-MAX_ASKED_CITIES:]
+        support = dict(state.get("support", {}))
+        for key in ("issue", "project_details"):
+            if out[key]:
+                support[key] = out[key]
+        support_case = bool(state.get("support_case")) or "existing_customer_issue" in intents
+        if "buying_interest" in intents and "existing_customer_issue" not in intents:
+            support_case = False  # the customer moved on to buying: sales rules apply again
         step = {
             "node": "understand",
             "detail": ("failed, raw message used" if degraded else "intents: " + ", ".join(out["intents"])),
@@ -107,6 +134,7 @@ def build_graph(deps: AgentDeps):
                 "search_query": out["search_query"],
                 "details": sorted(clean),
                 "invalid": sorted(errors),
+                "city_confirmed": bool(city),
                 "provider": out["provider"],
                 "latency_ms": out["latency_ms"],
             },
@@ -116,6 +144,11 @@ def build_graph(deps: AgentDeps):
             "search_query": out["search_query"],
             "lead": {**state.get("lead", {}), **clean},
             "validation_errors": errors,
+            "asked_cities": asked,
+            "callback_time": out["callback_time"] or state.get("callback_time"),
+            "support": support,
+            "support_case": support_case,
+            "contact_request": "contact_request" in intents,
             "degraded": degraded,
             "steps": state["steps"] + [step],
         }
@@ -128,6 +161,8 @@ def build_graph(deps: AgentDeps):
             return "closing"
         if intents == {"off_topic"} and not state["search_query"]:
             return "redirect"
+        if intents <= NO_SEARCH_INTENTS and intents & NO_SEARCH_TRIGGERS:  # details or contact request only
+            return "agent"
         return "retrieve" if state["search_query"] else "agent"
 
     def retrieve_node(state: AgentState) -> dict:
@@ -152,10 +187,11 @@ def build_graph(deps: AgentDeps):
         persisted = state["messages"][-AGENT_HISTORY:]
         current = persisted[-1]
         chunks = [RetrievedChunk(**c) for c in state["chunks"]]
+        lead_progress = status_block(state) if deps.ops is not None else ""
         return [
             SystemMessage(load_prompt("system_prompt")),
             *persisted[:-1],
-            rag_message(str(current.content), chunks),
+            rag_message(str(current.content), chunks, lead_progress),
             *state.get("scratch", []),
         ]
 
@@ -188,9 +224,27 @@ def build_graph(deps: AgentDeps):
         return "tools" if getattr(last, "tool_calls", None) else "finalize"
 
     def tools_node(state: AgentState, config) -> dict:
+        start = time.perf_counter()
         out = tool_node.invoke(state, config)
         results = out["scratch"]
-        return {"scratch": results, "steps": state["steps"] + [tool_step(m) for m in results]}
+        update = {"scratch": results}
+        for message in results:  # what the lead tools did, from their artifacts (never shown to the model)
+            artifact = message.artifact if isinstance(message.artifact, dict) else {}
+            if artifact.get("kind") == "lead":
+                update["lead_id"] = artifact["lead_id"]
+                update["lead_saved"] = artifact["saved_fields"]
+                if artifact.get("reason_pending"):
+                    update["reason_pending"] = artifact["lead_id"]
+            elif artifact.get("kind") == "callback":
+                update["callback_status"] = artifact["status"]
+                update["callback_logged"] = artifact["time"]
+            elif artifact.get("kind") == "support":
+                update["support_request_id"] = artifact["id"]
+        steps = [tool_step(m) for m in results]
+        if steps:
+            steps[-1]["data"]["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        update["steps"] = state["steps"] + steps
+        return update
 
     def fixed_reply(text: str, detail: str):
         def node(state: AgentState) -> dict:
@@ -202,17 +256,34 @@ def build_graph(deps: AgentDeps):
         reply = state.get("reply") or ""
         sources: list[dict] = []
         degraded = state["degraded"]
+        update: dict = {}
+        steps = list(state["steps"])
         if not reply:  # the agent's last message is the answer
             reply = normalize_citations(reply_text(state["scratch"][-1]))
             if not reply:
                 reply, degraded = LLM_DOWN_REPLY, True
             else:
                 found = state["chunks"] + [
-                    c for m in state.get("scratch", []) if isinstance(m, ToolMessage) for c in (m.artifact or [])
+                    c for m in state.get("scratch", [])
+                    if isinstance(m, ToolMessage) and m.name in KB_TOOLS for c in (m.artifact or [])
                 ]
                 chunks = [RetrievedChunk(**c) for c in _dedupe(found)]
                 sources = pick_sources(reply, chunks) if chunks else []
-        return {"reply": reply, "sources": sources, "degraded": degraded, "messages": [AIMessage(reply)]}
+        if deps.ops is not None:
+            changes = pending_changes(state.get("lead", {}), state.get("lead_saved", {}))
+            if state.get("lead_id") and changes:  # new details the update_lead tool did not save this turn
+                start = time.perf_counter()
+                result = service.update_lead(deps.ops.engine, state["lead_id"], changes,
+                                             llm=deps.ops.reason_llm, reason_now=deps.ops.reason_now)
+                deps.ops.calls.append("sync")
+                if result.lead.reason_source == "template" and not deps.ops.reason_now:
+                    update["reason_pending"] = state["lead_id"]
+                update["lead_saved"] = dict(state["lead"])
+                steps.append({"node": "sync", "detail": "saved: " + ", ".join(sorted(changes)),
+                              "data": {"latency_ms": round((time.perf_counter() - start) * 1000)}})
+            update["lead_summary"] = lead_summary({**state, **update}, deps.ops.engine)
+        return {"reply": reply, "sources": sources, "degraded": degraded, "steps": steps,
+                "messages": [AIMessage(reply)], **update}
 
     graph = StateGraph(AgentState)
     graph.add_node("understand", understand_node)
@@ -232,13 +303,19 @@ def build_graph(deps: AgentDeps):
     for name in ("welcome", "closing", "redirect"):
         graph.add_edge(name, "finalize")
     graph.add_edge("finalize", END)
-    return graph.compile(checkpointer=deps.checkpointer)
+    compiled = graph.compile(checkpointer=deps.checkpointer)
+    compiled.lead_ops = deps.ops  # the API uses it to write a pending lead reason after replying
+    return compiled
 
 
-def build_agent(engine, checkpointer: BaseCheckpointSaver | None, *, main_model: str | None = None):
+def build_agent(
+    engine, checkpointer: BaseCheckpointSaver | None, *, main_model: str | None = None, leads_engine=None
+):
     """The agent with the real models, KB search and service areas on `engine`.
 
-    main_model overrides LLM_MODEL_MAIN (the live fallback test uses a model name that does not exist).
+    leads_engine: where leads, callbacks and support requests are written (default: `engine`; the live
+    tests pass the Neon test branch). main_model overrides LLM_MODEL_MAIN (the live fallback test uses a
+    model name that does not exist).
     """
     settings = get_settings()
     main_model = main_model or settings.llm_model_main
@@ -249,7 +326,9 @@ def build_agent(engine, checkpointer: BaseCheckpointSaver | None, *, main_model:
     def hints_fn() -> KbHints:
         return load_kb_hints(engine)
 
-    tools = make_tools(search_fn, get_service_areas, hints_fn)
+    # The lead reason (an LLM call of about 3 s) is written after the reply, not inside the turn (T8b)
+    ops = LeadOps(engine=leads_engine or engine, areas_fn=get_service_areas, reason_now=False)
+    tools = make_tools(search_fn, get_service_areas, hints_fn, ops)
     deps = AgentDeps(
         understand_llm=chat_llm(settings.llm_model_fast, schema=Understanding),
         agent_llm=chat_llm(main_model, tools=tools),
@@ -259,6 +338,7 @@ def build_agent(engine, checkpointer: BaseCheckpointSaver | None, *, main_model:
         hints_fn=hints_fn,
         tools=tools,
         checkpointer=checkpointer,
+        ops=ops,
     )
     return build_graph(deps)
 

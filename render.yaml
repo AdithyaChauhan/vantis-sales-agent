@@ -54,10 +54,13 @@ services:
         value: http://localhost:5173
       - key: LOG_LEVEL
         value: INFO
+      # Demo panel shows the lead status and score; set "false" in production (customer-facing)
+      - key: CHAT_SHOW_LEAD_SCORE
+        value: "true"
       - key: LANGSMITH_TRACING
         value: "false"
       - key: LANGSMITH_PROJECT
         value: vantis-sales-agent
       # Left out on purpose: TEST_DATABASE_URL (tests only), KB_PATH (ingest only; the PDF is not
       # in the image), LANGSMITH_API_KEY (tracing is off; add it in the Dashboard if you turn it on),
-      # PORT (Render sets it).
+      # PORT (Render sets it), LANGSMITH_HIDE_INPUTS/OUTPUTS/METADATA (tracing is off on Render; T13 decides).

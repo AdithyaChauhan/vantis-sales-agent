@@ -36,9 +36,16 @@ class Settings(BaseSettings):
     kb_path: str = "data/kb/Vantis_Energy_Solutions_Knowledge_Base.pdf"
     log_level: str = "INFO"
 
+    # Lead score and status in /api/chat's `lead` field: on for the demo panel, off for production
+    chat_show_lead_score: bool = False
+
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""
     langsmith_project: str = "vantis-sales-agent"
+    # Hide parts of every trace (LangSmith only hides on exactly "true"; see app/core/tracing.py)
+    langsmith_hide_inputs: bool = False
+    langsmith_hide_outputs: bool = False
+    langsmith_hide_metadata: bool = False
 
     @property
     def sqlalchemy_database_url(self) -> str:

@@ -2,7 +2,7 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T8a)
+## Backend modules (as of T8b)
 | Module | Role |
 |---|---|
 | `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware (skips `QUIET_PATHS`: `/api/health/live`), CORS, routers |
@@ -13,13 +13,15 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/core/prompts.py` | `load_prompt(name)`: reads `prompts/<name>.md` (cached) |
 | `app/agent/state.py` | `AgentState` (persisted `messages` and `lead`; per-turn fields) and `turn_input()`, which resets the per-turn fields |
 | `app/agent/understand.py` | `Understanding` schema (intents, `search_query`, details generated from `LeadData`), `load_kb_hints` (section titles + table summary chunks from `kb_chunks`), `understand()` |
-| `app/agent/tools.py` | `make_tools`: `search_knowledge_base`, `check_service_area` (content + KB chunk artifacts); `tool_step` |
+| `app/agent/tools.py` | `make_tools`: `search_knowledge_base`, `check_service_area` (content + KB chunk artifacts) and, with `LeadOps`, `create_lead`, `update_lead`, `schedule_callback`, `create_support_request` (no arguments; read the draft via `InjectedState`; no score in results); `tool_step` |
 | `app/agent/graph.py` | `build_graph(AgentDeps)`: understand → retrieve → agent ⇄ tools → finalize, plus welcome / closing / redirect; `build_agent()`, `get_agent()` (FastAPI dependency) |
+| `app/agent/leads.py` | `LeadOps` (leads database, reason model, `reason_now`), the lead progress block (`status_block`), `confirmed_city`, `pending_changes` (write-once sync), `lead_summary` for the API |
+| `app/core/tracing.py` | `configure_tracing`: optional LangSmith; copies LANGSMITH_* settings into os.environ only when tracing is on and a key is set |
 | `app/agent/memory.py` | `get_checkpointer()` (PostgresSaver over a psycopg pool), `setup_checkpointer()` (never fails the boot) |
 | `app/agent/welcome.py` | Fixed texts: welcome (F0), starter questions, closing line, off-topic redirect |
 | `app/api/welcome.py` | `GET /api/welcome` |
 | `app/api/health.py` | `GET /api/health` (status, db, kb_chunks); `GET /api/health/live` (`{"status":"ok"}`, no DB, Render's health check) |
-| `app/api/chat.py` | `POST /api/chat`: validates the message, runs the agent with `thread_id` = `session_id`, returns reply, sources, steps, `lead` (null until T8b) and degraded. DB errors → 503; anything else → 200 degraded |
+| `app/api/chat.py` | `POST /api/chat`: validates the message, runs the agent with `thread_id` = `session_id`, returns reply, sources, steps, `lead` (summary; status and score only with `CHAT_SHOW_LEAD_SCORE`) and degraded. One turn per session (striped locks, 60 s timeout); a pending lead reason is written after the reply (background task). DB errors → 503; anything else → 200 degraded |
 | `app/rag/answer.py` | Helpers the agent reuses: `format_context` (`[KB Section N: Title]` labels), `rag_message`, `cited_sections`, `pick_sources` (one per cited section), `normalize_citations`, `retrieve_step`, `LLM_DOWN_REPLY` |
 | `app/rag/pdf_parser.py` | `parse_kb(path)`: KB PDF to numbered sections with text lines and tables (pdfplumber; cover, header and footer removed) |
 | `app/rag/chunker.py` | `Chunk`, `chunk_sections()`: one chunk per table row (KB Sections 8-12) plus one `table_summary` chunk listing every row (8, 10), one per FAQ item (15), prose split at ~1,200 chars, Sections 16-19 tagged `policy`; `embed_text()` = `title: ... \| text: ...` |
@@ -141,12 +143,14 @@ flowchart TD
   understand -->|"only hello / what can you do"| welcome["welcome text"]
   understand -->|"only thanks / bye"| closing["closing line"]
   understand -->|"only off-topic, no query"| redirect["polite redirect"]
-  understand -->|"search_query"| retrieve["retrieve<br/>hybrid search, top 4"]
+  understand -->|"search_query, not details-only"| retrieve["retrieve<br/>hybrid search, top 4"]
   understand -->|"anything else"| agent
   retrieve --> agent["agent<br/>main LLM + tools<br/>(Gemini, Groq fallback)"]
-  agent -->|"tool calls (max 4 rounds)"| tools["tools<br/>search_knowledge_base<br/>check_service_area"]
+  agent -->|"tool calls (max 4 rounds)"| tools["tools<br/>search_knowledge_base, check_service_area<br/>create_lead, update_lead,<br/>schedule_callback, create_support_request"]
+  tools -.->|"lead tools (test branch in live tests)"| leadsdb[("leads, callbacks,<br/>support_requests")]
   tools --> agent
-  agent -->|"answer"| finalize["finalize<br/>reply, sources, steps"]
+  agent -->|"answer"| finalize["finalize<br/>reply, sources, steps,<br/>write-once lead sync, lead summary"]
+  finalize -.-> leadsdb
   welcome --> finalize
   closing --> finalize
   redirect --> finalize

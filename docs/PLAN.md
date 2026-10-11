@@ -116,7 +116,14 @@ The turn input resets every per-turn field (`scratch` with `RemoveMessage(REMOVE
 3. **agent.** The main LLM gets `system_prompt.md`, the last 12 persisted messages with the current one wrapped in `rag_prompt.md` (context block), and this turn's tool messages, with the tools bound. After 4 tool rounds it is called without tools, which forces a final answer. If it fails: the friendly "trouble" reply, degraded. T8b adds a lead status block (known fields, missing fields, validation errors, location status).
 4. **tools.** The LangGraph ToolNode (`messages_key="scratch"`) runs the calls. Each call is recorded in `steps` (e.g. "Pune: unverified").
 5. **welcome / closing / redirect.** Fixed texts (`app/agent/welcome.py`), no LLM call, only when that intent is the only one; "yes" and "no thanks" always go to the agent with the history.
-6. **finalize.** Reply text (text blocks only, citations normalized), sources from the retrieved chunks plus the tool artifacts (one per cited section), the final reply added to `messages`. T8b: if a lead exists and new details arrived, update it and re-score (`auto-sync`).
+6. **finalize.** Reply text (text blocks only, citations normalized), sources from the KB tools' artifacts and the retrieved chunks (one per cited section), the final reply added to `messages`, and the lead summary for the API. **Write-once sync (T8b):** `lead_saved` is a snapshot of what the leads table holds; if a lead exists and the draft differs from the snapshot (the `update_lead` tool did not run this turn), finalize calls `service.update_lead` once and refreshes the snapshot. So new details are written by the tool or by the sync, never both.
+
+**T8b additions.**
+- **Understand** also returns `contact_request` and `gives_details` intents, `asked_city`, `callback_time`, `issue`, `project_details` and `declines`; the lead tools read these from the state, so the model passes no free-text arguments.
+- **Retrieval gate:** no KB search when the intents are only `gives_details`, `contact_request` and/or `reply_to_assistant` with at least one of the first two (details-only or a contact request); otherwise the search runs whenever there is a query.
+- **City confirmation (code):** a city the customer only asked about (`asked_cities`) becomes `lead.city` when the assistant's last question named it and the reply gives no other city, isn't off-topic and doesn't say no (`declines`).
+- **Support conversations:** a persisted `support_case` flag (set by `existing_customer_issue`, cleared by later `buying_interest`) makes `create_lead` refuse and the progress block list what the support request needs.
+- **Lead progress block** (in `rag_prompt.md`): field names, what is still needed (F2 order; name and phone first after a contact request), invalid values as messages (never the value), "Ready to save", the likely city, callback and support status. Never a score, status or reason.
 
 **Why this shape** (the interview answer): understanding and acting are split, so each step can be tested on its own. Retrieval always runs for questions, so answers can't skip the KB. The LLM decides *when* to save a lead; code decides *what* gets saved and computes the score.
 
@@ -132,6 +139,8 @@ The turn input resets every per-turn field (`scratch` with `RemoveMessage(REMOVE
 | `create_support_request` | `issue: str, project_details: str \| None` | Needs a name and a phone or email from the draft. Stores the request and returns its id |
 
 The lead tools take no free-form fields: they read the validated draft through injected graph state. The LLM chooses when; it cannot write made-up data to the DB.
+
+**T8b lead tools** (`app/agent/tools.py`, glue in `app/agent/leads.py`): `create_lead()`, `update_lead()`, `schedule_callback()` and `create_support_request()` take **no arguments**; they read the validated draft (`lead`, `callback_time`, `support`) through `InjectedState` and call the T7 service. Their results tell the model what happened (`saved`, `fields_saved`, `missing`, `logged`, `status: requested`) and never contain a score, a status or a reason. `create_lead` refuses in a support conversation; `schedule_callback` needs a saved lead and a time and never logs the same time twice. Their artifacts update `lead_id`, `lead_saved`, `callback_status` and `support_request_id`.
 
 T8a builds `search_knowledge_base` and `check_service_area` (`app/agent/tools.py`). Both return `(content, artifact)`: the content is what the LLM reads (context blocks with KB Section labels, or the service-area result as JSON plus the KB Section 10 summary block); the artifact holds the KB chunks, so the reply's sources include what a tool found. The tools return data only; the system prompt says how to word "unverified". The lead tools come in T8b.
 
@@ -181,6 +190,7 @@ Plain-language version with worked examples: `docs/SCORING.md`. Code: `app/leads
   - WARM: "Follow up within 24 hours." plus the gaps: "Verify service availability for <city>.", "Check whether the requirement fits the reference packages.", "Confirm the owner's permission for a rooftop installation.", "Collect: <missing details>."
   - COLD: "Add to the nurture list, share product information and follow up in 30 days."
   - If a callback was requested, append "Customer asked for a callback: <time>."
+- **Reason timing (T8b):** regenerated only when `lead_score` or `lead_status` changes. Measured: the LLM reason added about 3.2 s to `create_lead` (3,569 and 3,359 ms against 319 and 313 ms with the template), so in the app the lead is saved with the template reason and `/api/chat` runs `service.refresh_reason` as a background task after the reply; it writes the LLM sentence only if the score and status are unchanged.
 - **Reason:** one sentence by the fast LLM (`prompts/lead_qualification_prompt.md`) from the breakdown only: status, score, rule labels, caps and city. No name, phone, email or money amount is sent. A template sentence is used when the LLM fails or its reply is empty, too long, more than one sentence, names another status, or mentions prices, savings, subsidies, financing, EMIs or guarantees (KB Section 16). It is regenerated only when the status or breakdown changes.
 - Store `score_breakdown` as JSON (each rule with its points, maximum and label; `raw_score`; caps; `lead_score`; `lead_status`) so the dashboard can show where every point came from.
 - Output names match the assignment: `lead_score`, `lead_status`, `reason`, `recommended_action`.
@@ -251,7 +261,7 @@ Response:
   "degraded": false
 }
 ```
-`lead`, when present (T8b): `{"id", "status", "score", "missing_fields"}`. Each step is `{"node", "name" (tools only), "detail", "data"}`.
+`lead` (T8b): `{"id", "status", "score", "missing_fields", "callback_status"}`, or null while nothing about a lead is known. Before saving, `missing_fields` is what the lead still needs; after saving, the details that would still add points. **`status` and `score` are filled only when `CHAT_SHOW_LEAD_SCORE=true`**: on for the demo panel, **off for production** (the chat is customer-facing; the README says so in T14). The model never sees these values. Each step is `{"node", "name" (tools only), "detail", "data"}`.
 
 | Method | Path | Notes |
 |---|---|---|
@@ -282,6 +292,7 @@ Tables are created on startup with `create_all` + `CREATE EXTENSION IF NOT EXIST
 - **LLM down:** retries → Groq → a friendly reply ("I'm having trouble right now. Please try again in a minute.") with `degraded: true`. Never a 500 on chat.
 - **DB down:** `/api/health` reports it; chat returns 503 with a friendly message. Never claim a lead was saved if the write failed.
 - **Tool loop:** at most 4 rounds per turn.
+- **One turn per session at a time (T8b):** `/api/chat` takes one of 64 striped locks per `session_id` (60 s timeout; then a friendly "still working on your last message" reply). `service.create_lead` also handles a race on the UNIQUE `session_id` (updates the existing lead), so two requests never create two leads.
 - **Prompt injection:** the rules sit in the system prompt; KB text is treated as data; the lead tools can't accept invented fields.
 - **PII:** sales endpoints need the API key. Logs mask phone numbers and emails.
 
@@ -323,7 +334,7 @@ One task = one Claude Code session = one `/handoff`.
 | T6 | Sun | Dockerfile + deploy the skeleton to Render | Live `/api/health` returns ok. **Done 2026-10-11:** the Render service `vantis-sales-agent-api` (Singapore; URL in the Render Dashboard, README in T14): `/api/health` → ok, db ok, kb_chunks 54; `/api/chat` Delhi → 200, KB Section 10, gemini, about 1 s warm |
 | T7 | Mon | Leads layer: tables, validation, scoring, reason (LLM + template fallback), unit tests | Scoring tests pass for HOT / WARM / COLD / caps. **Done 2026-10-11:** Rahul 97 HOT; same lead in Pune 82 → 74 WARM; round trip on the test branch |
 | T8a | Mon | LangGraph agent part 1: understand (fast LLM, structured output, query rewrite), retrieve, agent with `search_knowledge_base` + `check_service_area`, finalize; Postgres checkpointer memory; welcome/closing/redirect replies; `GET /api/welcome`; `eval_retrieval --rewrite` | `/api/chat` runs the graph with the v0 shape (`lead` null), never a 500; Delhi → "And in Kanpur?" answered from memory; q01 names the 5 packages and cites KB Section 8 (xfail removed); Pune uses `check_service_area` and is "not in the listed areas; the team can check"; "hi" gets the welcome text; rewrite eval hybrid hit@3 ≥ 22/24. **Done 2026-10-11:** rewrite hit@3 24/24 |
-| T8b | Mon | Lead tools `create_lead`, `update_lead`, `schedule_callback`, `create_support_request` (reading the validated draft from graph state); flows F2-F4; lead status block in the agent prompt; `lead` in the response | The demo script via the API creates a HOT lead (live test); a callback is logged as requested, never booked; an inverter issue becomes a support request, not a lead; the reason-latency decision is made (T8 notes) |
+| T8b | Mon | Lead tools `create_lead`, `update_lead`, `schedule_callback`, `create_support_request` (reading the validated draft from graph state); flows F2-F4; lead status block in the agent prompt; `lead` in the response | The demo script via the API creates a HOT lead (live test); a callback is logged as requested, never booked; an inverter issue becomes a support request, not a lead; the reason-latency decision is made (T8 notes). **Done 2026-10-11:** demo (4 turns) → lead 97 HOT with reason and action plus a callback `requested` on the test branch; "Yes please, connect me" asks for name and phone; the reason is written after the reply (it added about 3.2 s) |
 | T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint |
 | T10 | Tue | Chat page: welcome message + starter buttons (F0, no LLM call), messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser |
 | T11 | Tue | Dashboard: API-key prompt, leads table + filter, lead detail with breakdown | Rahul shows as HOT with reason and action |
@@ -339,6 +350,9 @@ Rule: no extras until the current task's "Done when" passes.
 ### T14 note (from T6)
 - The README gets the live backend URL and the sleep/wake note: the free service sleeps after 15 idle minutes, and the first request after that waits for Render to wake it and for the app to start (measured 32.5 s in T6; see `docs/DEPLOY.md`). Open `/api/health` a minute before the demo or recording.
 
+### T13 note (from T8b)
+- **Tracing privacy.** LangSmith tracing is off on Render. Before turning it on with real customers, decide: keep it off in production, or set `LANGSMITH_HIDE_INPUTS=true` and `LANGSMITH_HIDE_OUTPUTS=true` (langsmith 0.14.7 hides only on exactly "true"), since inputs and outputs hold names, phone numbers and emails. Also set `CHAT_SHOW_LEAD_SCORE=false` for production.
+
 ### T13 notes (from T8a)
 - **Cold start and the first chat after waking.** After the next deploy, measure on Render the cold start (first `/api/health` after 15+ idle minutes) and the first `/api/chat` after waking. Locally the first request of a process took 20 s (building the agent, opening the first connections), and the import time grew in T8a (Known limitations). If it is slow, warm the graph up in the background right after startup (build the agent and touch the DB pools in a background thread), so `/api/health/live` still answers fast and the health check never waits for it.
 - **Keep it awake during review?** Decide whether to keep the service awake during the review days (e.g. a scheduled ping every 10 minutes). First check the free instance hours left on Render's Billing page (750 a month per workspace), since an always-awake service uses about 24 a day.
@@ -348,7 +362,7 @@ Rule: no extras until the current task's "Done when" passes.
 
 ### T8b notes (from T8a)
 - **One question, up to two details.** The system prompt's "at most one follow-up question" and F2's "1-2 missing details per turn" must agree: one question may ask for two details ("Could you share your name and phone number?").
-- **No claimed actions.** The system prompt now forbids saying details were saved, a callback booked or the team contacted unless a tool did it this turn; with the lead tools, keep that rule and let the tool results drive the wording. `system_prompt.md` also says "You have no tool for these yet, so you can only say that the customer can share their details and the Vantis team can follow up with them." Update that sentence when the lead tools arrive (and log it in `prompts/README.md`).
+- **No claimed actions.** The system prompt now forbids saying details were saved, a callback booked or the team contacted unless a tool did it this turn; with the lead tools, keep that rule and let the tool results drive the wording. `system_prompt.md` also says "You have no tool for these yet, so you can only say that the customer can share their details and the Vantis team can follow up with them." Update that sentence when the lead tools arrive (and log it in `prompts/README.md`). **Done in T8b.**
 - **Reason latency** (from T7): decide whether `create_lead`/`update_lead` write the reason inline or after the reply.
 
 ### T8 notes (from T7)

@@ -36,7 +36,7 @@ LLM_CALLS = {"total": 0}
 
 
 @pytest.fixture(autouse=True)
-def live_agent():
+def live_agent(test_engine):
     """The real agent with in-process memory; skips without the database, keys or KB."""
     settings = get_settings()
     engine = get_engine()
@@ -44,7 +44,7 @@ def live_agent():
         pytest.skip("DATABASE_URL and GOOGLE_API_KEY are needed")
     if not count_kb_chunks(engine):
         pytest.skip("kb_chunks is empty; run python -m app.rag.ingest first")
-    agent = build_agent(engine, InMemorySaver())
+    agent = build_agent(engine, InMemorySaver(), leads_engine=test_engine)  # lead writes: test branch only
     app.dependency_overrides[get_agent] = lambda: agent
     yield agent
     time.sleep(4)  # stay under 15 requests a minute per Gemini model
@@ -118,11 +118,12 @@ def test_no_claimed_actions_after_yes_please(client):
     assert not CLAIMED_ACTION_RE.search(body["reply"]), "the reply claims an action that did not happen"
 
 
-def test_groq_answers_when_gemini_fails(client):
+def test_groq_answers_when_gemini_fails(client, test_engine):
     settings = get_settings()
     if not (settings.groq_api_key and settings.fallback_model):
         pytest.skip("GROQ_API_KEY and FALLBACK_MODEL are needed")
-    agent = build_agent(get_engine(), InMemorySaver(), main_model="gemini-model-does-not-exist")
+    agent = build_agent(get_engine(), InMemorySaver(), main_model="gemini-model-does-not-exist",
+                        leads_engine=test_engine)
     app.dependency_overrides[get_agent] = lambda: agent
     body = ask(client, "What is your installation process?")
     agent_steps = [s for s in body["steps"] if s["node"] == "agent"]

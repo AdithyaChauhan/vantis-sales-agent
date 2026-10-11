@@ -29,6 +29,8 @@ Intent = Literal[
     "buying_interest",
     "greeting",
     "reply_to_assistant",
+    "contact_request",
+    "gives_details",
     "thanks_or_bye",
     "existing_customer_issue",
     "off_topic",
@@ -66,6 +68,21 @@ class Understanding(BaseModel):
     details: ExtractedDetails = Field(  # type: ignore[valid-type]
         default_factory=ExtractedDetails,
         description="Only details the customer stated about themselves in the conversation",
+    )
+    asked_city: str | None = Field(
+        None, description="A city the customer only asked about (not stated as theirs), as written"
+    )
+    callback_time: str | None = Field(
+        None, description="When the customer wants to be called back, copied word for word"
+    )
+    issue: str | None = Field(
+        None, description="An existing customer's problem with their system, in the customer's words"
+    )
+    project_details: str | None = Field(
+        None, description="An existing customer's project details (system, install date, city), as written"
+    )
+    declines: bool = Field(
+        False, description="True if the message says no to, or refuses, what the assistant last asked"
     )
 
 
@@ -137,7 +154,8 @@ def build_prompt(hints: KbHints, message: str, history: list[BaseMessage]) -> st
 
 
 def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMessage]) -> dict:
-    """{intents, search_query, details (raw), provider, latency_ms}. Raises LLMError on any failure."""
+    """{intents, search_query, details (raw), asked_city, callback_time, issue, project_details, declines,
+    provider, latency_ms}. Raises LLMError on any failure."""
     start = time.perf_counter()
     try:
         result = llm.invoke([HumanMessage(build_prompt(hints, message, history))])
@@ -148,11 +166,19 @@ def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMe
     if parsed is None:
         raise LLMError("understand returned no parsable output")
     raw = result.get("raw")
-    query = (parsed.search_query or "").strip() or None
+
+    def text(value: str | None) -> str | None:
+        return " ".join(value.split()) or None if value else None
+
     return {
         "intents": list(dict.fromkeys(parsed.intents)),
-        "search_query": query,
+        "search_query": text(parsed.search_query),
         "details": parsed.details.model_dump(exclude_none=True),
+        "asked_city": text(parsed.asked_city),
+        "callback_time": text(parsed.callback_time),
+        "issue": text(parsed.issue),
+        "project_details": text(parsed.project_details),
+        "declines": bool(parsed.declines),
         "provider": provider_of(raw) if raw is not None else "unknown",
         "latency_ms": latency_ms,
     }

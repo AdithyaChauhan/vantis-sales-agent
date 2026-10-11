@@ -27,12 +27,14 @@ def format_context(chunks: list[RetrievedChunk]) -> str:
     return "\n\n".join(f"{citation_label(c)}\n{c.content}" for c in chunks)
 
 
-def rag_message(question: str, chunks: list[RetrievedChunk]) -> HumanMessage:
-    """The customer's message wrapped in the RAG prompt with the context (empty when nothing was found).
+def rag_message(question: str, chunks: list[RetrievedChunk], lead_progress: str = "") -> HumanMessage:
+    """The customer's message wrapped in the RAG prompt with the context (empty when nothing was found)
+    and the lead progress block (what is known and still needed; "(not tracked)" without the lead tools).
 
-    The context is filled in first, so a "{context}" typed by the customer is left as it is.
+    The customer's text is filled in last, so a "{context}" typed by the customer is left as it is.
     """
     text = load_prompt("rag_prompt").replace("{context}", format_context(chunks))
+    text = text.replace("{lead_progress}", lead_progress or "(not tracked)")
     return HumanMessage(text.replace("{question}", question))
 
 

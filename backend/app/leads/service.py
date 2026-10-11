@@ -9,12 +9,13 @@ from typing import Any
 
 from langchain_core.runnables import Runnable
 from sqlalchemy import Engine, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.llm import fast_llm
 from app.leads import validators as v
 from app.leads.models import Callback, Lead, SupportRequest
-from app.leads.reason import write_reason
+from app.leads.reason import template_reason, write_reason
 from app.leads.schemas import (
     CallbackResult,
     CallbackView,
@@ -93,10 +94,13 @@ def create_lead(
     channel: str = "web",
     llm: Runnable | None = None,
     areas: ServiceAreas | None = None,
+    reason_now: bool = True,
 ) -> CreateLeadResult:
     """Validate, score and save a lead. Saves nothing (and lists what is missing) until the minimum is there.
 
-    A second call with the same session_id updates that session's lead instead of creating another.
+    A second call with the same session_id updates that session's lead instead of creating another, even
+    when two calls race (the UNIQUE session_id constraint decides). reason_now=False saves the template
+    reason, so a caller can have the LLM write it after replying (refresh_reason).
     """
     if channel not in CHANNELS:
         raise ValueError(f"channel must be one of {CHANNELS}")
@@ -116,7 +120,10 @@ def create_lead(
     location = locate(data.city, data.state, _areas(areas))
     data = data.model_copy(update={"city": location.city})
     breakdown = score_lead(data, location.status)
-    reason, reason_source = write_reason(breakdown, data.city, llm or fast_llm())  # before the DB write
+    if reason_now:
+        reason, reason_source = write_reason(breakdown, data.city, llm or fast_llm())  # before the DB write
+    else:
+        reason, reason_source = template_reason(breakdown), "template"
 
     row = Lead(
         **data.model_dump(),
@@ -131,11 +138,21 @@ def create_lead(
         reason_source=reason_source,
         recommended_action=recommended_action(breakdown, data),
     )
-    with Session(engine, expire_on_commit=False) as session, session.begin():
-        session.add(row)
-        session.flush()
-        session.refresh(row)
-        view = LeadView.model_validate(row)
+    try:
+        with Session(engine, expire_on_commit=False) as session, session.begin():
+            session.add(row)
+            session.flush()
+            session.refresh(row)
+            view = LeadView.model_validate(row)
+    except IntegrityError:
+        if not session_id:
+            raise
+        # Another request for this session saved its lead first: update that one instead
+        logger.info("lead create raced for one session; updating the existing lead")
+        with Session(engine) as session:
+            existing_id = session.scalar(select(Lead.id).where(Lead.session_id == session_id))
+        updated = update_lead(engine, existing_id, raw, llm=llm, areas=areas)
+        return CreateLeadResult(lead=updated.lead, errors=updated.errors)
     _log("lead created", row)
     return CreateLeadResult(lead=view, errors=errors)
 
@@ -147,10 +164,13 @@ def update_lead(
     *,
     llm: Runnable | None = None,
     areas: ServiceAreas | None = None,
+    reason_now: bool = True,
 ) -> UpdateLeadResult:
     """Merge new valid details into a lead, re-check the city if it changed, re-score and save.
 
-    The reason is rewritten only when the status or the breakdown changed. Raises LeadNotFound.
+    The reason is rewritten only when the score or the status changed (saves LLM quota); with
+    reason_now=False the template is saved and refresh_reason writes the LLM reason later.
+    Raises LeadNotFound.
     """
     new, errors = LeadData.from_raw(raw)
     changes = new.model_dump(exclude_none=True)
@@ -160,7 +180,7 @@ def update_lead(
             raise LeadNotFound(lead_id)
         data = _lead_data(row).model_copy(update=changes)
         city_input, location_status = row.city_input, row.location_status
-        old_breakdown = row.score_breakdown
+        old_score, old_status = row.lead_score, row.lead_status
         reason, reason_source = row.reason, row.reason_source
         callback_time = _requested_callback_time(row)
 
@@ -169,8 +189,11 @@ def update_lead(
         data = data.model_copy(update={"city": location.city})
         city_input, location_status = location.city_input, location.status
     breakdown = score_lead(data, location_status)
-    if breakdown != old_breakdown:  # also covers a status change; saves LLM quota otherwise
-        reason, reason_source = write_reason(breakdown, data.city, llm or fast_llm())
+    if (breakdown["lead_score"], breakdown["lead_status"]) != (old_score, old_status):
+        if reason_now:
+            reason, reason_source = write_reason(breakdown, data.city, llm or fast_llm())
+        else:
+            reason, reason_source = template_reason(breakdown), "template"
 
     with Session(engine, expire_on_commit=False) as session, session.begin():
         row = session.get(Lead, lead_id)
@@ -190,6 +213,34 @@ def update_lead(
         view = LeadView.model_validate(row)
     _log("lead updated", row)
     return UpdateLeadResult(lead=view, errors=errors)
+
+
+def refresh_reason(engine: Engine, lead_id: int, llm: Runnable | None = None) -> bool:
+    """Replace a template reason with the LLM's sentence (run after the chat reply, T8b).
+
+    Writes only if the lead still has the score and status the sentence was written for. Never raises
+    (it runs in the background): returns True if the reason was replaced.
+    """
+    try:
+        with Session(engine) as session:
+            row = session.get(Lead, lead_id)
+            if row is None or row.reason_source != "template":
+                return False
+            breakdown, city = row.score_breakdown, row.city
+        reason, source = write_reason(breakdown, city, llm or fast_llm())
+        if source != "llm":
+            return False
+        with Session(engine) as session, session.begin():
+            row = session.get(Lead, lead_id)
+            same = row is not None and (row.lead_score, row.lead_status) == (
+                breakdown["lead_score"], breakdown["lead_status"])
+            if same and row.reason_source == "template":
+                row.reason, row.reason_source = reason, source
+        logger.info("lead reason refreshed", extra={"lead_id": lead_id, "written": same})
+        return same
+    except Exception as exc:
+        logger.warning("lead reason refresh failed: %s", type(exc).__name__, extra={"lead_id": lead_id})
+        return False
 
 
 def get_lead(engine: Engine, lead_id: int) -> LeadView | None:

@@ -28,8 +28,8 @@ A hit is a returned chunk whose section is one of the question's expected sectio
 | keyword | 0.750 (18/24) | 0.833 (20/24) | 0.802 |
 | vector | 0.792 (19/24) | 0.917 (22/24) | 0.867 |
 | hybrid | 0.875 (21/24) | 0.917 (22/24) | 0.907 |
-| rewrite | 1.000 (24/24) | 1.000 (24/24) | 1.000 |
-| fused | 0.958 (23/24) | 1.000 (24/24) | 0.979 |
+| rewrite | 0.833 (20/24) | 0.958 (23/24) | 0.888 |
+| fused | 0.875 (21/24) | 0.958 (23/24) | 0.925 |
 
 ## Misses (no expected section in the top 3)
 
@@ -43,6 +43,8 @@ A hit is a returned chunk whose section is one of the question's expected sectio
 | vector | q09: Can you install solar panels in Pune? | 7, 10 | s15-do-you-install-solar-panels, s15-can-you-help-me-choose-a-solar-system, s01-company-overview | 9 |
 | hybrid | q01: What solar systems do you provide? | 8, 9 | s01-company-overview, s15-can-you-help-me-choose-a-solar-system, s15-do-you-install-solar-panels | 6 |
 | hybrid | q09: Can you install solar panels in Pune? | 7, 10 | s15-do-you-install-solar-panels, s01-company-overview, s15-can-you-help-me-choose-a-solar-system | 10 |
+| rewrite | q09: Can you install solar panels in Pune? | 7, 10 | s01-company-overview, s02-customer-segments, s15-can-you-help-me-choose-a-solar-system | 7 |
+| fused | q09: Can you install solar panels in Pune? | 7, 10 | s01-company-overview, s15-do-you-install-solar-panels, s15-can-you-help-me-choose-a-solar-system | 5 |
 
 ## Relevance gate
 
@@ -73,30 +75,30 @@ Off-topic questions marked no_context (rewrite mode): 8 of 8. KB questions wrong
 
 | Question | Rewritten search_query | First hit (hybrid → rewrite) |
 |---|---|---|
-| q01: What solar systems do you provide? | Product & Service Catalog solar system offerings | 6 → 1 |
-| q02: How much does a 5kW system cost? | Pricing 5 kW residential rooftop solar system | 1 → 1 |
-| q03: Do you provide installation in Delhi? | Reference Service Locations service area availability in Delhi | 1 → 1 |
+| q01: What solar systems do you provide? | Product & Service Catalog solar rooftop solutions and offerings | 6 → 1 |
+| q02: How much does a 5kW system cost? | Pricing 5 kW rooftop solution reference package cost | 1 → 3 |
+| q03: Do you provide installation in Delhi? | Service Areas installation service availability in Delhi | 1 → 1 |
 | q04: What is your installation process? | Installation & Site Assessment installation process | 1 → 1 |
-| q05: What warranty do you provide? | Reference Warranty & Support Policy warranty coverage details | 1 → 1 |
-| q06: Tell me about the HomePro 5 package. | Product & Service Catalog Vantis HomePro 5 package details | 1 → 1 |
-| q07: Which package is meant for a small shop or office? | Product & Service Catalog packages for small commercial shops and offices | 1 → 1 |
-| q08: Do you serve customers in Kota? | Service Areas locations in Rajasthan | 1 → 1 |
-| q09: Can you install solar panels in Pune? | Reference Service Locations Vantis service coverage for Pune | 10 → 1 |
-| q10: How long will the installation take? | Installation & Site Assessment installation timeline | 1 → 1 |
-| q11: Will I get a government subsidy? | Financing & Government Subsidies availability for solar systems | 1 → 1 |
-| q12: Do you offer EMI or financing? | Financing & Government Subsidies EMI and solar financing options | 1 → 1 |
-| q13: My inverter has stopped working. What should I do? | Reference Support Scenarios inverter troubleshooting | 1 → 1 |
+| q05: What warranty do you provide? | Reference Warranty & Support Policy | 1 → 1 |
+| q06: Tell me about the HomePro 5 package. | Product & Service Catalog Vantis HomePro 5 package details and specifications | 1 → 1 |
+| q07: Which package is meant for a small shop or office? | Product & Service Catalog packages for shops and offices | 1 → 1 |
+| q08: Do you serve customers in Kota? | Reference Service Locations | 1 → 1 |
+| q09: Can you install solar panels in Pune? | Service Areas rooftop solar installation in Pune | 10 → 7 |
+| q10: How long will the installation take? | Installation & Site Assessment typical installation timeline | 1 → 1 |
+| q11: Will I get a government subsidy? | Financing & Government Subsidies solar rooftop government subsidy availability | 1 → 1 |
+| q12: Do you offer EMI or financing? | Financing & Government Subsidies financing options and EMI | 1 → 1 |
+| q13: My inverter has stopped working. What should I do? | Reference Support Scenarios troubleshooting inverter malfunction | 1 → 1 |
 | q14: Do you provide maintenance after installation? | Reference Warranty & Support Policy post-installation maintenance and support | 1 → 1 |
-| q15: How much money will I save on my electricity bill? | Pricing electricity savings and return on investment | 1 → 1 |
-| q16: What details do you need from me to prepare a quote? | Customer Information for Consultation required details for quotation | 1 → 1 |
-| q17: Do you work with clinics and small offices? | Customer Segments commercial clinics and small offices | 1 → 1 |
+| q15: How much money will I save on my electricity bill? | Pricing cost savings and electricity bill reduction | 1 → 2 |
+| q16: What details do you need from me to prepare a quote? | Customer Information for Consultation requirements for preparing a solar quote | 1 → 1 |
+| q17: Do you work with clinics and small offices? | Customer Segments small commercial clinics and offices | 1 → 1 |
 | q18: What happens during a site assessment? | Installation & Site Assessment site assessment process | 1 → 1 |
 | q19: How many years is the warranty on solar panels? | Reference Warranty & Support Policy solar panel warranty period | 1 → 1 |
-| q20: What does Vantis Energy Solutions do? | Company Overview | 1 → 1 |
-| q21: Is there a guarantee on the panels? | Reference Warranty & Support Policy warranty coverage for solar panels | 1 → 1 |
-| q22: Do you install in Gurgaon? | Reference Service Locations installation service in Gurgaon | 2 → 1 |
+| q20: What does Vantis Energy Solutions do? | Company Overview company services and business activities | 1 → 1 |
+| q21: Is there a guarantee on the panels? | Reference Warranty & Support Policy warranty for solar panels | 1 → 1 |
+| q22: Do you install in Gurgaon? | Service Areas reference service locations for Gurgaon | 2 → 1 |
 | q23: Can you recommend the right system size for my home? | Reference Package Guidance system sizing for residential customers | 1 → 1 |
-| q24: What does Vantis Care cover? | Reference Warranty & Support Policy Vantis Care coverage | 1 → 1 |
+| q24: What does Vantis Care cover? | Reference Service Locations Vantis Care support coverage | 1 → 3 |
 | o01: What's the weather like in London today? | (none) | off-topic |
 | o02: Who won the last India vs Australia cricket match? | (none) | off-topic |
 | o03: Can you give me a recipe for butter chicken? | (none) | off-topic |
@@ -108,17 +110,16 @@ Off-topic questions marked no_context (rewrite mode): 8 of 8. KB questions wrong
 
 ## Small-to-big (rewrite mode, the agent's 4-chunk context)
 
-The rule fires for 8 of 24 KB questions.
+The rule fires for 7 of 24 KB questions.
 
 | Question | Summary added | Full table before → after |
 |---|---|---|
 | q02: How much does a 5kW system cost? | s08-table-summary | False → True |
 | q04: What is your installation process? | s08-table-summary | False → True |
-| q09: Can you install solar panels in Pune? | s10-table-summary | False → True |
+| q08: Do you serve customers in Kota? | s10-table-summary | False → True |
 | q10: How long will the installation take? | s08-table-summary | False → True |
 | q17: Do you work with clinics and small offices? | s08-table-summary | False → True |
 | q18: What happens during a site assessment? | s08-table-summary | False → True |
-| q20: What does Vantis Energy Solutions do? | s08-table-summary | False → True |
 | q24: What does Vantis Care cover? | s08-table-summary | False → True |
 
 ## Tuning notes
@@ -313,3 +314,22 @@ The first run, with the eval-like examples, gave rewrite 23/24, 24/24, 0.979 and
 - **Small-to-big stays off.** q01's context is already complete without it (the summary chunk ranks first). In both runs the rule fires on 8 questions, and 5 of them are unrelated to the catalog (installation process, timeline, site assessment, company overview, Vantis Care), where the whole catalog would be noise. The function stays, switched off, so this report keeps measuring it.
 
 **Caveat.** The rewrite comes from an LLM, so it varies between runs; these are two runs. The 24 questions were used to judge the rewrite, so numbers on new questions may be a little lower.
+
+## T8b: extraction prompt with lead fields
+
+Written by hand on 2026-10-11, after the `--rewrite` run above.
+
+T8b added two intents (`contact_request`, `gives_details`) and five fields (`asked_city`, `callback_time`, `issue`, `project_details`, `declines`) to the understand step's prompt and schema. The search settings and the rewrite examples did not change. One paced run (32 calls):
+
+| Mode | hit@1 | hit@3 | MRR |
+|---|---|---|---|
+| hybrid on the raw question | 21/24 | 22/24 | 0.907 |
+| rewrite (T8a, second run) | 24/24 | 24/24 | 1.000 |
+| **rewrite (T8b)** | **20/24** | **23/24** | **0.888** |
+| fused (T8b) | 21/24 | 23/24 | 0.925 |
+
+- The rewrite dropped from 24/24 to 23/24 at hit@3: q09 Pune fell from 1st to 7th ("Service Areas rooftop solar installation in Pune" ranks below FAQ chunks), and q02 from 1st to 3rd (still a hit). It still beats the raw question (22/24), so the T8a bar holds.
+- Likely causes: the longer prompt and schema, and run-to-run variation of an LLM rewrite (T8a's two runs already differed by one question at hit@1). Not tuned further in T8b.
+- In the agent, q09 does not depend on retrieval: the system prompt makes the agent call `check_service_area` for any named city (the live Pune test passed after this change).
+- Fused also reaches 23/24, so the agent keeps the rewrite alone (one search per turn).
+- Off-topic: 8 of 8 still get no query. Small-to-big would fire on 7 questions; it stays off.

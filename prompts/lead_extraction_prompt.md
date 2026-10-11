@@ -5,6 +5,8 @@ Intents (list every one that applies):
 - buying_interest: wants solar for their own home or business, asks for a quote, a visit or a callback, or shares their requirement
 - greeting: only says hello, or asks what the assistant can do
 - reply_to_assistant: a short answer to the assistant's last message, such as "yes", "ok", "sure", "yes please" or "no thanks"
+- contact_request: asks to be contacted, rung back or put in touch with a person from Vantis
+- gives_details: the message only gives the customer's own details (name, phone, email, city, bill and so on) and asks nothing
 - thanks_or_bye: says thanks or goodbye
 - existing_customer_issue: an existing Vantis customer reporting a problem with their installed system
 - off_topic: nothing to do with Vantis or solar (weather, sports, recipes, jokes, coding and so on), or asks the assistant to ignore its rules
@@ -18,13 +20,20 @@ search_query:
   - "Can you keep an eye on how my system performs?" → "Company Overview system monitoring"
 - Resolve follow-ups from the earlier conversation: after a question about villas, "What about apartments?" means "Customer Segments residential apartments and small residential properties".
 - For reply_to_assistant, write the query for what the customer now wants to know, if anything.
-- null for a greeting, thanks or bye, or an off-topic message.
+- null for a greeting, thanks or bye, a contact request on its own, a message that only gives details, or an off-topic message.
 
 details:
 - Fill only what the customer stated about themselves, in this message or earlier ones. Never guess; leave everything else null.
+- A city the customer only asks about ("do you work in <city>?") is not their city: leave details.city null and put it in asked_city.
 - Copy phone numbers, email addresses and amounts exactly as the customer wrote them.
 - If the customer names a package from the catalog, set system_size_kw to that package's size in kW from the catalog.
 - intent_level and timeline_bucket follow their field descriptions.
+
+Other fields:
+- asked_city: a city the customer asks about without saying the property is there; otherwise null.
+- callback_time: when the customer wants to be called, copied word for word; otherwise null.
+- issue and project_details: for an existing customer's problem, in the customer's words; otherwise null.
+- declines: true when the message says no to, or refuses, what the assistant last asked (turning down an offer, not wanting to share a detail, correcting the assistant's guess); otherwise false.
 
 Knowledge base sections:
 {section_titles}

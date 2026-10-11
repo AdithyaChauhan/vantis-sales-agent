@@ -142,3 +142,73 @@ def test_log_line_has_no_message_text(client, use_agent, caplog):
     record = next(r for r in caplog.records if r.getMessage() == "chat")
     assert "9876543210" not in str(record.__dict__)
     assert record.nodes == ["understand", "retrieve", "agent"]
+
+
+# ---------- T8b: session lock and lead summary ----------
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from app.api import chat as chat_api  # noqa: E402
+from app.core.config import get_settings  # noqa: E402
+
+SUMMARY = {"id": 7, "status": "HOT", "score": 97, "missing_fields": ["ownership"], "callback_status": "requested"}
+
+
+class StateAgent:
+    """A fake agent returning a fixed final state; optionally slow, recording overlapping turns."""
+
+    def __init__(self, summary=None, delay=0.0):
+        self.summary, self.delay = summary, delay
+        self.active = self.max_active = 0
+        self.guard = threading.Lock()
+
+    def invoke(self, payload, config):
+        with self.guard:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(self.delay)
+        with self.guard:
+            self.active -= 1
+        return {"reply": "ok", "steps": [], "sources": [], "lead_summary": self.summary, "degraded": False}
+
+
+def test_lead_summary_hides_status_and_score_by_default(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_show_lead_score", False)
+    app.dependency_overrides[get_agent] = lambda: StateAgent(SUMMARY)
+    lead = post(client, "hi").json()["lead"]
+    assert lead == {"id": 7, "status": None, "score": None, "missing_fields": ["ownership"],
+                    "callback_status": "requested"}
+
+
+def test_lead_summary_shows_status_and_score_for_the_demo(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_show_lead_score", True)
+    app.dependency_overrides[get_agent] = lambda: StateAgent(SUMMARY)
+    assert post(client, "hi").json()["lead"] == SUMMARY
+
+
+def test_no_lead_summary_is_null(client):
+    app.dependency_overrides[get_agent] = lambda: StateAgent(None)
+    assert post(client, "hi").json()["lead"] is None
+
+
+def test_turns_of_one_session_never_overlap(client):
+    agent = StateAgent(delay=0.3)
+    app.dependency_overrides[get_agent] = lambda: agent
+    threads = [threading.Thread(target=post, args=(client, "hi"), kwargs={"session_id": "same"}) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert agent.max_active == 1
+
+
+def test_busy_session_gets_a_friendly_reply(client, monkeypatch):
+    monkeypatch.setattr(chat_api, "LOCK_TIMEOUT_S", 0.1)
+    app.dependency_overrides[get_agent] = lambda: StateAgent()
+    lock = chat_api.session_lock("busy-1")
+    lock.acquire()
+    try:
+        body = post(client, "hi", session_id="busy-1").json()
+    finally:
+        lock.release()
+    assert body["reply"] == chat_api.BUSY_REPLY and body["degraded"] is True

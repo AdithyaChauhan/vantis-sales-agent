@@ -13,9 +13,11 @@ from app.api import chat, health, welcome
 from app.core.config import get_settings
 from app.core.db import get_engine, init_db
 from app.core.logging import request_id_var, setup_logging
+from app.core.tracing import configure_tracing
 
 settings = get_settings()
 setup_logging(settings.log_level)
+configure_tracing(settings)  # optional LangSmith; before anything runs a chain
 logger = logging.getLogger("app.request")
 # Not logged: Render calls the health check every few seconds and would bury the real logs.
 QUIET_PATHS = {"/api/health/live"}

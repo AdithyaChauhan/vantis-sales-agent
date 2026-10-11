@@ -10,6 +10,9 @@ LEFT_OUT = {
     "TEST_DATABASE_URL": "tests only",
     "KB_PATH": "ingest only; the PDF is not in the image",
     "LANGSMITH_API_KEY": "tracing is off; set it in the Dashboard if you turn it on",
+    "LANGSMITH_HIDE_INPUTS": "tracing is off on Render; T13 decides the privacy settings",
+    "LANGSMITH_HIDE_OUTPUTS": "tracing is off on Render; T13 decides the privacy settings",
+    "LANGSMITH_HIDE_METADATA": "tracing is off on Render; T13 decides the privacy settings",
 }
 # Plain values meant to differ from backend/.env.example in production, and why (T13: CORS_ORIGINS)
 PROD_DIFFERS: dict[str, str] = {}

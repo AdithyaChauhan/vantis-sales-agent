@@ -123,7 +123,7 @@ def score_lead(lead: LeadData, location_status: str) -> dict:
     }
 
 
-def _missing_details(lead: LeadData, breakdown: dict) -> list[str]:
+def missing_details(lead: LeadData, breakdown: dict) -> list[str]:
     """Details worth collecting for a WARM lead (each would add points)."""
     rules = {r["rule"]: r for r in breakdown["rules"]}
     missing = []
@@ -159,7 +159,7 @@ def recommended_action(breakdown: dict, lead: LeadData, callback_time: str | Non
             parts.append("Check whether the requirement fits the reference packages.")
         if lead.ownership == "rent":
             parts.append("Confirm the owner's permission for a rooftop installation.")
-        missing = _missing_details(lead, breakdown)
+        missing = missing_details(lead, breakdown)
         if missing:
             parts.append("Collect: " + ", ".join(missing) + ".")
     if callback_time:

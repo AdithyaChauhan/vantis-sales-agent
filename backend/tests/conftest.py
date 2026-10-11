@@ -1,11 +1,16 @@
 """Shared fixtures."""
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+import os
 
-from app.core.config import get_settings, to_sqlalchemy_url
-from app.core.db import get_engine
-from app.main import app
+# Tests never send traces to LangSmith, whatever backend/.env says (the environment beats .env).
+os.environ["LANGSMITH_TRACING"] = "false"
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
+
+from app.core.config import get_settings, to_sqlalchemy_url  # noqa: E402
+from app.core.db import get_engine  # noqa: E402
+from app.main import app  # noqa: E402
 
 # Nothing listens on port 1, so connecting fails instantly.
 UNREACHABLE_URL = "postgresql+psycopg://u:p@127.0.0.1:1/x"
