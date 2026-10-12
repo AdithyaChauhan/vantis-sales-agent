@@ -17,7 +17,9 @@ TEXT_CHARS = 500  # requirement, timeline, motivation
 LONG_TEXT_CHARS = 1000  # other info, issue, project details
 
 _PHONE_JUNK = re.compile(r"[\s\-.()]")
-_MULTIPLIERS = {
+# Its numbers come from code, not the KB, so the number check of scripts/live_scenarios.py allows them (T12b)
+PHONE_INVALID = "That doesn't look like a 10-digit Indian mobile number (it should start with 6, 7, 8 or 9)."
+AMOUNT_MULTIPLIERS = {  # also used by the number guard (app/rag/numbers.py)
     None: 1, "k": 1_000, "thousand": 1_000,
     "l": 1_00_000, "lac": 1_00_000, "lacs": 1_00_000, "lakh": 1_00_000, "lakhs": 1_00_000,
     "cr": 1_00_00_000, "crore": 1_00_00_000, "crores": 1_00_00_000,
@@ -68,9 +70,7 @@ def clean_phone(value) -> str:
     elif len(text) == 11 and text.startswith("0"):
         text = text[1:]
     if len(text) != 10 or text[0] not in "6789":
-        raise InvalidValue(
-            "That doesn't look like a 10-digit Indian mobile number (it should start with 6, 7, 8 or 9)."
-        )
+        raise InvalidValue(PHONE_INVALID)
     return "+91" + text
 
 
@@ -104,7 +104,7 @@ def _number(value, pattern: re.Pattern, what: str, multipliers: dict | None = No
 
 def parse_inr(value, *, what: str, limits: tuple[int, int]) -> int:
     """Rupees from '₹4,000', 'Rs 4000', '4k', '1.2 lakh' or a number; must be within limits."""
-    amount = _number(value, _AMOUNT, what, _MULTIPLIERS)
+    amount = _number(value, _AMOUNT, what, AMOUNT_MULTIPLIERS)
     low, high = limits
     if not low <= amount <= high:
         raise InvalidValue(

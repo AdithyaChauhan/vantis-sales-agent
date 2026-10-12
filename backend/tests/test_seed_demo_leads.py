@@ -135,3 +135,16 @@ def test_a_chat_lead_with_a_demo_name_is_not_mistaken_for_demo_data(db):
     with Session(db) as session:
         channels = session.scalars(select(Lead.source_channel).where(Lead.name == "Priya Verma")).all()
         assert sorted(channels) == ["demo", "web"]
+
+
+def test_the_seed_writes_reasons_on_the_patient_offline_path(monkeypatch):
+    # T12b: offline scripts wait and retry; only the chat is fail-fast
+    patient = object()
+    seen = {}
+    monkeypatch.setattr(demo, "offline_reason_llm", lambda: patient)
+    monkeypatch.setattr(demo, "target_engine", lambda settings, use_main: "engine")
+    monkeypatch.setattr(demo, "init_db", lambda engine: None)
+    monkeypatch.setattr(demo, "seed", lambda engine, **kwargs: seen.update(kwargs) or demo.SeedReport())
+    monkeypatch.setattr(demo, "print_summary", lambda *args: None)
+    demo.main([])
+    assert seen["llm"] is patient

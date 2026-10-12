@@ -241,3 +241,28 @@ def test_a_promise_of_a_human_action_becomes_can(reply, softened):
 ])
 def test_other_wording_is_left_alone(reply):
     assert soften_promises(reply) == (reply, 0)
+
+
+# ---------- T12b: "service areas", not the KB's "reference locations" ----------
+
+def test_reference_location_words_become_service_areas_outside_tags():
+    from app.rag.answer import plain_service_area_words
+
+    reply = ("Delhi is a reference service area. Reference locations include Kota "
+             "[KB Section 10: Reference Service Locations].")
+    text, changed = plain_service_area_words(reply)
+    assert changed == 2
+    assert text == "Delhi is a service area. Service areas include Kota [KB Section 10: Reference Service Locations]."
+    assert plain_service_area_words("Vantis covers Kota [KB Section 10: Reference Service Locations].")[1] == 0
+
+
+def test_every_model_reads_the_checklist_last_and_offers_stay_answerable():
+    # T12b: Groq (the fallback) invented durations and asked two questions; the rules now close the message
+    from app.rag.answer import rag_message
+
+    text = rag_message("How long does it take?", []).content
+    assert text.index("How long does it take?") < text.index("Before you reply, check:")
+    assert text.rstrip().endswith("At most one question.")
+    system = load_prompt("system_prompt")
+    assert "what each part covers" not in system  # an offer the KB can't answer (T12a run 3)
+    assert "never \"reference locations\"" in system

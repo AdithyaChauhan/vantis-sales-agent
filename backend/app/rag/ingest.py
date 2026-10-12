@@ -85,7 +85,8 @@ def ingest_sections(
     """
     chunks = chunk_sections(sections)
     area_rows = ServiceAreas.from_sections(sections).rows()
-    vectors = embedder.embed_documents([c.embed_text() for c in chunks])  # raises on any failure
+    # The patient path (30 s, 3 attempts on 429/5xx), never the chat's fail-fast embed_query (T12b). Raises on failure.
+    vectors = embedder.embed_documents([c.embed_text() for c in chunks])
     if len(vectors) != len(chunks):
         raise EmbeddingError(f"expected {len(chunks)} vectors, got {len(vectors)}")
     records = [

@@ -31,6 +31,18 @@ def _json(data: dict) -> str:
     return json.dumps(data)
 
 
+def service_area_data(areas: ServiceAreas, city: str, state: str | None = None) -> dict:
+    """The service-area result the model reads, for the tool and for the code's own check before the model (T12b)."""
+    result = areas.lookup(city, state)
+    return {
+        "city": city,
+        "status": result.status,  # listed | unverified
+        "matched_city": result.matched_city,
+        "regions": result.regions,
+        "source": result.source,
+    }
+
+
 def make_tools(
     search_fn: Callable[[str], SearchResult],
     areas_fn: Callable[[], ServiceAreas],
@@ -53,20 +65,13 @@ def make_tools(
 
     @tool(response_format="content_and_artifact")
     def check_service_area(city: str, state: str | None = None) -> tuple[str, list[dict]]:
-        """Check whether a city is in Vantis's listed service areas (KB Section 10). Call it whenever the
-        customer names a city, before saying anything about service there."""
+        """Check whether a city is in Vantis's listed service areas (KB Section 10). The system already checks every
+        city named in the customer's message; call it for any other city before saying anything about service there."""
         try:
-            result = areas_fn().lookup(city, state)
+            data = service_area_data(areas_fn(), city, state)
         except Exception as exc:  # DB down or not ingested
             logger.warning("service-area check unavailable: %s", type(exc).__name__)
             return json.dumps({"city": city, "status": "unknown", "note": "service-area list unavailable"}), []
-        data = {
-            "city": city,
-            "status": result.status,  # listed | unverified
-            "matched_city": result.matched_city,
-            "regions": result.regions,
-            "source": result.source,
-        }
         summary = hints_fn().summaries.get(SERVICE_AREA_SECTION)
         if not summary:
             return json.dumps(data), []
@@ -197,6 +202,8 @@ def _lead_tool_detail(content: str) -> str:
         return "updated"
     if data.get("logged"):
         return "requested"
+    if data.get("saved") and data.get("support_request_id"):  # the id the customer is told (T12b)
+        return f"saved: request {data['support_request_id']}"
     if data.get("saved"):
         return "saved" + (f": {', '.join(data['fields_saved'])}" if data.get("fields_saved") else "")
     if data.get("missing"):

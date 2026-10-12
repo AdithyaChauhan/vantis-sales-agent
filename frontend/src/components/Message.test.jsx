@@ -56,6 +56,14 @@ describe("How I answered", () => {
     expect(within(panel).getByText("Lucknow: listed")).toBeTruthy();
   });
 
+  it("names the city check the code made before the model (T12b)", () => {
+    const steps = [{ node: "area_check", detail: "Kanpur: listed", data: { by: "code" } }];
+    const { container } = render(<Message message={assistant({ steps })} />);
+    const panel = container.querySelector("details.steps");
+    expect(within(panel).getByText("Service area check")).toBeTruthy();
+    expect(within(panel).getByText("Kanpur: listed")).toBeTruthy();
+  });
+
   it("says when a fallback was used", () => {
     render(<Message message={assistant({ steps: STEPS, degraded: true })} />);
     expect(screen.getByText("Fallback used")).toBeTruthy();

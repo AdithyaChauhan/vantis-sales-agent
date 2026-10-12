@@ -191,3 +191,51 @@ def test_rewrite_questions_keeps_the_raw_question_on_failure():
     assert rewrite_questions(questions[:1], Scripted(RuntimeError("down")), HINTS, pause_s=0) == {
         "What do you sell?": "What do you sell?",
     }
+
+
+# ---- T12b: held-out questions and the patient embedding path ----
+
+def test_the_held_out_file_is_labelled_with_one_best_section_each():
+    from scripts.eval_retrieval import HOLDOUT_QUESTIONS
+
+    held = load_questions(HOLDOUT_QUESTIONS)
+    assert [q.id for q in held] == [f"h{i:02d}" for i in range(1, 9)]
+    best = {q.id: sorted(q.best) for q in held}
+    assert best == {"h01": [9], "h02": [9], "h03": [6], "h04": [11], "h05": [13], "h06": [10], "h07": [], "h08": [5]}
+    assert all(q.best <= q.expected for q in held)
+    original = (HOLDOUT_QUESTIONS.parent / "holdout_questions.txt").read_text(encoding="utf-8").splitlines()
+    assert [q.question for q in held] == [" ".join(line.split()) for line in original if line.strip()]
+
+
+def test_holdout_lines_report_best_and_any_side_by_side():
+    from scripts.eval_retrieval import holdout_lines
+
+    covered = evaluated("h1", {3, 8, 9}, keyword=[8, 9], vector=[9], hybrid=[8, 9])
+    covered.question.best = {9}
+    uncovered = evaluated("h7", set(), keyword=[1], vector=[1], hybrid=[1], no_context=(True, False))
+    lines = holdout_lines([covered, uncovered], None)
+    text = "\n".join(lines)
+    assert "| hybrid | 0/1 | 1/1 | 0.500 | 1/1 | 1/1 | 1.000 |" in text  # best at 2, any at 1
+    assert "| vector | 1/1 | 1/1 | 1.000 | 1/1 | 1/1 | 1.000 |" in text
+    assert "Not covered by the KB: h7" in text and "no_context (hybrid) True" in text
+
+
+def test_questions_are_embedded_once_in_batches_on_the_patient_path():
+    from scripts.eval_retrieval import embed_questions
+
+    class Patient:
+        def __init__(self):
+            self.batches = []
+
+        def embed_queries(self, texts):
+            self.batches.append(texts)
+            return [[float(i)] for i, _ in enumerate(texts)]
+
+        def embed_query(self, text):
+            raise AssertionError("the fail-fast chat path")
+
+    embedder = Patient()
+    questions = [Question("a", "one?", {1}), Question("b", "two?", {2}), Question("c", "one?", {1})]
+    fixed = embed_questions(questions, embedder)
+    assert embedder.batches == [["one?", "two?"]]
+    assert fixed.embed_query("two?") == [1.0]

@@ -5,8 +5,8 @@ Run: python -m scripts.seed_demo_leads           (the test branch, TEST_DATABASE
      python -m scripts.seed_demo_leads --main    (the main database; you must type "main" first)
 
 Every lead goes through app.leads.service, exactly like a chat lead: the same checks, score, status,
-caps, recommended action and reason (written by the main model, or the template if that fails; about
-one call per new lead). The leads have source_channel "demo", so the dashboard tags them. Contacts are
+caps, recommended action and reason (written by the main model on the patient offline path, T12b: 30 s and
+retries; the template if that still fails; about one call per new lead). The leads have source_channel "demo", so the dashboard tags them. Contacts are
 clearly fake: phone numbers 90000 0000N (valid in format only) and @example.com emails.
 
 --reset (T12a) deletes every lead, callback and support request on the test branch (chat leads from local
@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.db import init_db
+from app.core.llm import offline_reason_llm
 from app.leads import service
 from app.leads.models import Callback, Lead, SupportRequest
 from app.services.service_areas import ServiceAreas
@@ -199,7 +200,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.reset:
         leads, callbacks, support = reset(engine)
         print(f"Reset the test branch: deleted {leads} leads, {callbacks} callbacks and {support} support requests.")
-    report = seed(engine)
+    report = seed(engine, llm=offline_reason_llm())  # patient: 30 s per call, retried (T12b)
     print_summary(engine, report, "main" if args.main else "the test branch")
 
 

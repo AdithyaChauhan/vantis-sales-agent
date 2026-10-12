@@ -44,9 +44,11 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - Ingest KB (embeds, then replaces the KB rows in one transaction): `cd backend && python -m app.rag.ingest`
 - Search the KB: `cd backend && python -m scripts.search_kb "question" [--mode keyword|vector|hybrid]`
 - Retrieval eval: `cd backend && python -m scripts.eval_retrieval`
-- Retrieval eval with the agent's query rewrite (about 32 fast-LLM calls, paced): `cd backend && python -m scripts.eval_retrieval --rewrite`
+- Retrieval eval with the agent's query rewrite (about 40 understand calls, paced, on the patient offline path; also reports the 8 held-out questions): `cd backend && python -m scripts.eval_retrieval --rewrite`
 - API for local page checks, leads on the Neon test branch (never main): `cd backend && python -m scripts.serve_test_branch` (for the dashboard add a throwaway key: `SALES_API_KEY=any-local-key-of-16-chars python -m scripts.serve_test_branch`)
 - Slow-Google drill (every Gemini chat call hangs, so the deadlines, Groq and the skip list answer; test server only): `cd backend && python -m scripts.serve_test_branch --slow-gemini`
+- Test server on another port (when an older server holds 8000): `cd backend && python -m scripts.serve_test_branch --port 8001`
+- Live scenarios against a running test server (real chat turns: run after the backend tests and `seed_demo_leads --reset`; holdout about 20 model calls, edge about 32, slow about 8 on Groq and needs the server started with `--slow-gemini`; prints PASS/FAIL per check and a table for EVAL.md): `cd backend && PYTHONIOENCODING=utf-8 python -m scripts.live_scenarios --group holdout --base-url http://127.0.0.1:8001` (or `--group edge`, `--group slow`; `--only C3a` runs one scenario)
 - Demo leads on the test branch (8 leads, 2 callbacks, 1 support request; about 8 main-model calls for the reasons; a second run adds nothing): `cd backend && python -m scripts.seed_demo_leads` (`--main` writes to main only after you type "main")
 - Reset the test branch's leads, callbacks and support requests, then seed again (test branch only): `cd backend && python -m scripts.seed_demo_leads --reset`. Pytest empties these tables before and after each DB test, so run it after the tests and never between live checks
 - Frontend setup: `cd frontend && npm install`

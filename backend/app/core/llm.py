@@ -9,6 +9,10 @@ over a model that failed recently (SKIPS), so a slow Google day costs seconds, n
 - understand_llm(): main, Groq, fast; 4 s each
 - chat_llm(): the answer step; Gemini 8 s, then Groq 10 s, then the fast model 8 s (last resort)
 - reason_llm(): the lead reason; the main model only, 4 s (the caller falls back to a template)
+
+Offline scripts (eval, seed; T12b) use the patient path instead: offline_understand_llm() and offline_reason_llm()
+(30 s per call, no skip list, the whole chain retried after a timeout, 429 or 5xx) and Embedder.embed_queries
+(batched, with HTTP retries like ingest). Only the chat stays fail-fast.
 """
 import contextvars
 import logging
@@ -179,6 +183,43 @@ class SkipList:
 SKIPS = SkipList()
 
 
+class NoSkips(SkipList):
+    """The offline scripts' skip list: never skips a model. They wait and retry instead (patient), because a
+    script has no customer waiting and a skipped model would only make the next retry fail at once."""
+
+    def left(self, key: str) -> float:
+        return 0.0
+
+    def failed(self, key: str, use: str, kind: str) -> bool:
+        return False
+
+
+# Offline scripts (T12b): 30 s per call, the whole chain tried 3 times, 5 s then 20 s apart
+OFFLINE_TIMEOUT_S = 30
+OFFLINE_WAITS_S = (5, 20)
+
+
+def patient(chain: Runnable, waits: tuple[float, ...] = OFFLINE_WAITS_S,
+            sleep: Callable[[float], None] = time.sleep) -> Runnable:
+    """`chain`, tried again after a timeout, 429 or 5xx (failure_kind) once per wait; any other error (a 400, a
+    missing model) is raised at once. For offline scripts only: the chat never waits like this."""
+
+    def call(messages, config: RunnableConfig) -> Any:
+        for attempt in range(len(waits) + 1):
+            try:
+                return chain.invoke(messages, config)
+            except Exception as exc:
+                kind = failure_kind(exc)
+                if attempt == len(waits) or kind is None:
+                    raise
+                logger.warning("offline llm retry", extra={"attempt": attempt + 1, "failure": kind,
+                                                            "wait_s": waits[attempt]})
+                sleep(waits[attempt])
+        raise AssertionError("unreachable")
+
+    return RunnableLambda(call, name="patient")
+
+
 # ---------- embeddings ----------
 
 def query_text(query: str) -> str:
@@ -201,6 +242,16 @@ class Embedder:
         for start in range(0, len(texts), EMBED_BATCH_SIZE):
             batch = texts[start : start + EMBED_BATCH_SIZE]
             vectors += self._embed(batch, DOCUMENT_HTTP)
+        return vectors
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        """Embed questions for an offline script (the eval, T12b): batches of 20 with ingest's patient HTTP options
+        (30 s, 3 attempts on 429 and 5xx), no skip list and no cache. The chat uses embed_query (fail-fast).
+        A Google 503 stopped a T12a eval run that embedded through the chat path."""
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), EMBED_BATCH_SIZE):
+            batch = texts[start : start + EMBED_BATCH_SIZE]
+            vectors += self._embed([query_text(t) for t in batch], DOCUMENT_HTTP)
         return vectors
 
     def embed_query(self, text: str) -> list[float]:
@@ -470,7 +521,7 @@ def main_llm() -> Runnable:
     return chat_llm(get_settings().llm_model_main)
 
 
-def reason_candidates(settings: Settings | None = None) -> list[Candidate]:
+def reason_candidates(settings: Settings | None = None, seconds: float = REASON_TIMEOUT_S) -> list[Candidate]:
     """The lead reason's model (T12a): the main model only, 4 s. It was the fast model, which took 14-30 s
     and returned 504s in T11; Groq is left out to keep its tokens for customers."""
     settings = settings or get_settings()
@@ -478,7 +529,7 @@ def reason_candidates(settings: Settings | None = None) -> list[Candidate]:
     def make() -> list[Candidate]:
         if not (settings.google_api_key and settings.llm_model_main):
             return []
-        return [_gemini(settings.llm_model_main, settings, "reason", REASON_TIMEOUT_S)]
+        return [_gemini(settings.llm_model_main, settings, "reason", seconds)]
 
     return _build(make, "reason")
 
@@ -489,7 +540,9 @@ def reason_llm() -> Runnable:
     return model_chain(reason_candidates())
 
 
-def understand_candidates(schema: type, settings: Settings | None = None) -> list[Candidate]:
+def understand_candidates(
+    schema: type, settings: Settings | None = None, seconds: float = UNDERSTAND_TIMEOUT_S
+) -> list[Candidate]:
     """The understand step's models in order (T12a): main Gemini, Groq, then fast Gemini, each one attempt cut
     off after 4 s, with structured output and the raw message kept. Groq is second because the fast model
     took 17 s in T10b and returned 504s in T11, while Groq answered in about 1 s. Unconfigured ones are left out."""
@@ -498,13 +551,11 @@ def understand_candidates(schema: type, settings: Settings | None = None) -> lis
     def make() -> list[Candidate]:
         candidates = []
         if settings.google_api_key and settings.llm_model_main:
-            candidates.append(_gemini(settings.llm_model_main, settings, "understand", UNDERSTAND_TIMEOUT_S,
-                                      schema=schema))
+            candidates.append(_gemini(settings.llm_model_main, settings, "understand", seconds, schema=schema))
         if settings.groq_api_key and settings.fallback_model:
-            candidates.append(_groq(settings, "understand", UNDERSTAND_TIMEOUT_S, schema=schema))
+            candidates.append(_groq(settings, "understand", seconds, schema=schema))
         if settings.google_api_key and settings.llm_model_fast:
-            candidates.append(_gemini(settings.llm_model_fast, settings, "understand", UNDERSTAND_TIMEOUT_S,
-                                      schema=schema))
+            candidates.append(_gemini(settings.llm_model_fast, settings, "understand", seconds, schema=schema))
         return candidates
 
     return _build(make, "understand")
@@ -514,6 +565,18 @@ def understand_llm(schema: type, settings: Settings | None = None) -> Runnable:
     """The understand step's model: understand_candidates through model_chain. Raises when every one fails
     or is skipped; the understand node then searches with the raw message."""
     return model_chain(understand_candidates(schema, settings))
+
+
+def offline_understand_llm(schema: type, settings: Settings | None = None) -> Runnable:
+    """The understand step for offline scripts (eval_retrieval --rewrite, T12b): the same models in the same order,
+    30 s each, no skip list, the chain retried after a timeout, 429 or 5xx."""
+    candidates = understand_candidates(schema, settings, seconds=OFFLINE_TIMEOUT_S)
+    return patient(model_chain(candidates, skips=NoSkips()))
+
+
+def offline_reason_llm(settings: Settings | None = None) -> Runnable:
+    """The lead reason for offline scripts (seed_demo_leads, T12b): the main model, 30 s, retried like above."""
+    return patient(model_chain(reason_candidates(settings, seconds=OFFLINE_TIMEOUT_S), skips=NoSkips()))
 
 
 def provider_of(message: BaseMessage) -> str:

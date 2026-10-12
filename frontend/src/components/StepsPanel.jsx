@@ -12,6 +12,7 @@ const NODE_LABELS = {
   sync: "Saved new details",
   guard: "Safety check on the reply",
   reply: "Fixed reply, no model call",
+  area_check: "Service area check",
 };
 const MS_IN_DETAIL = /,?\s*(\d+) ms\b/;
 

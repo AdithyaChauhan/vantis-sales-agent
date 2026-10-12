@@ -6,7 +6,8 @@ from rapidfuzz import fuzz
 
 from app.core.config import BACKEND_DIR
 from app.core.prompts import PROMPTS_DIR
-from scripts.eval_retrieval import KB_QUESTIONS, OFFTOPIC_QUESTIONS, load_questions
+from scripts.eval_retrieval import HOLDOUT_QUESTIONS, KB_QUESTIONS, OFFTOPIC_QUESTIONS, load_questions
+from scripts.live_scenarios import EDGE, SLOW
 
 MAX_SIMILARITY = 70  # rapidfuzz score (0-100); 70 or more counts as a paraphrase
 QUOTED_RE = re.compile(r'"([^"]{3,})"')
@@ -23,9 +24,12 @@ REPLAY_T12 = [
 
 
 def test_questions() -> list[str]:
-    """Every eval question, every message the live tests send and the replayed T12 conversation."""
-    questions = [q.question for q in load_questions(KB_QUESTIONS) + load_questions(OFFTOPIC_QUESTIONS)]
+    """Every eval question (T12b: the held-out ones too), every message the live tests and the live scenarios
+    send and the replayed T12 conversation."""
+    files = (KB_QUESTIONS, OFFTOPIC_QUESTIONS, HOLDOUT_QUESTIONS)
+    questions = [q.question for path in files for q in load_questions(path)]
     questions += REPLAY_T12
+    questions += [turn.message for scenario in EDGE + SLOW for turn in scenario.turns]
     for path in sorted((BACKEND_DIR / "tests").glob("test_live_*.py")):  # every live test file
         questions += LIVE_MESSAGE_RE.findall(path.read_text(encoding="utf-8"))
     return questions
@@ -52,6 +56,7 @@ test_questions.__test__ = False  # a helper, not a test
 def test_live_messages_are_found():
     found = set(test_questions())
     assert {"And in Kanpur?", "Yes please, connect me", "Rahul Sharma, 9876543210, rahul.sharma@example.com"} <= found
+    assert {"rahul@gmail", "Do you also clean the water tank on the roof when installing solar?"} <= found
 
 
 @pytest.mark.parametrize("prompt, example", prompt_examples())

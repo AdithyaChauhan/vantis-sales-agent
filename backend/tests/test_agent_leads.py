@@ -618,3 +618,15 @@ def test_asking_what_is_needed_skips_the_kb_search(ops):
     state = run(graph, "is roof space info needed?")
     assert not any(s["node"] == "retrieve" for s in state["steps"])  # no KB context, so nothing to quote
     assert ASKED_WHAT_LINE.format(detail="rooftop availability") in lead_status_text(agent)
+
+
+def test_a_model_failure_after_the_save_says_the_lead_is_saved_not_try_again(ops):
+    # T12b drill: Groq ran out of tokens on the call after a tool round; "try again" after a save would be false
+    details = {"name": "Rohan Verma", "phone": "9876500002", "city": "Kanpur", "system_size_kw": 3,
+               "property_type": "house"}
+    agent = Scripted(tool_call("create_lead", {}), RuntimeError("Groq 429, every model failed"))
+    graph, _ = make_graph(Scripted(understood(["gives_details"], None, **details)), agent, ops=ops)
+    state = run(graph, "Rohan Verma, 9876500002")
+    assert state["reply"] == welcome.SAVED_FALLBACK_TEXT and state["degraded"] is True
+    assert state["lead_id"] and count(ops.engine, Lead) == 1
+    assert any(s["detail"] == "LLM failed; the reply says what the tools did" for s in state["steps"])

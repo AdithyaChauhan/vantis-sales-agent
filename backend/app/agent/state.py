@@ -28,6 +28,7 @@ class AgentState(TypedDict, total=False):
     support_request_id: int | None
     asked_cities: list[str]  # cities asked about but not (yet) confirmed as the customer's
     ruled_out: list[str]  # details the customer ruled out ("apart from timing"); never asked for again (T12a)
+    area_checks: list[dict]  # this turn's service-area checks of every city named, made in code (T12b)
     # This turn's tool calls and tool results
     scratch: Annotated[list[AnyMessage], add_messages]
     intents: list[str]
@@ -63,6 +64,7 @@ def turn_input(message: str, session_id: str = "") -> dict:
         "lead_summary": None,
         "reason_pending": None,
         "scratch": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
+        "area_checks": [],
         "intents": [],
         "search_query": None,
         "chunks": [],

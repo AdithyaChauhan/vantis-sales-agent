@@ -63,3 +63,8 @@ def test_the_drill_switch_can_never_reach_render():
     assert not any(word in name for name in Settings.model_fields for word in ("slow", "force", "drill"))
     copied = [line for line in (REPO_ROOT / "Dockerfile").read_text().splitlines() if line.startswith("COPY")]
     assert copied and not any("scripts" in line for line in copied)  # backend/scripts is not in the image
+
+
+def test_port_flag_defaults_to_8000():
+    assert serve_test_branch.parse_args([]).port == 8000
+    assert serve_test_branch.parse_args(["--port", "8001", "--slow-gemini"]).port == 8001

@@ -419,3 +419,45 @@ def test_skips_are_logged_without_message_text(caplog):
     assert (skipped.model, skipped.use) == ("gemini:main", "understand")
     for record in caplog.records:
         assert "9876543210" not in record.getMessage() and "9876543210" not in str(record.__dict__)
+
+
+# ---------- the patient path for offline scripts (T12b) ----------
+
+def test_patient_retries_a_503_then_answers():
+    calls, waits = [], []
+
+    def flaky(_messages):
+        calls.append(1)
+        if len(calls) == 1:
+            raise StatusError(503)
+        return structured("second try")
+
+    chain = llm.patient(RunnableLambda(flaky), waits=(5, 20), sleep=waits.append)
+    assert chain.invoke(MESSAGES)["parsed"].text == "second try"
+    assert (len(calls), waits) == (2, [5])
+
+
+def test_patient_gives_up_after_its_waits_and_never_retries_a_400():
+    waits = []
+    with pytest.raises(StatusError):
+        llm.patient(raises(StatusError(503)), waits=(5, 20), sleep=waits.append).invoke(MESSAGES)
+    assert waits == [5, 20]
+    waits.clear()
+    with pytest.raises(StatusError):
+        llm.patient(raises(StatusError(400)), waits=(5, 20), sleep=waits.append).invoke(MESSAGES)
+    assert waits == []
+
+
+def test_no_skips_never_opens_a_window():
+    skips = llm.NoSkips()
+    chain = model_chain([candidate(raises(StatusError(503)), "gemini:main", "understand"), GROQ_OK], skips)
+    chain.invoke(MESSAGES)
+    assert skips.left("gemini:main") == 0 and llm.SKIPS.left("gemini:main") == 0
+
+
+def test_offline_models_have_30_s_deadlines_and_the_chat_keeps_its_own():
+    understand = understand_candidates(Answer, settings(), seconds=llm.OFFLINE_TIMEOUT_S)
+    assert [c.seconds for c in understand] == [30, 30, 30]
+    assert [c.seconds for c in reason_candidates(settings(), seconds=llm.OFFLINE_TIMEOUT_S)] == [30]
+    assert [c.seconds for c in understand_candidates(Answer, settings())] == [4, 4, 4]
+    assert [c.seconds for c in reason_candidates(settings())] == [4]

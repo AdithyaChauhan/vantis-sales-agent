@@ -10,7 +10,9 @@ Every external piece (LLMs, search, service areas, KB hints, leads database, che
 through AgentDeps, so tests run the real graph with fakes. The lead tools (T8b) read the draft from the
 state; finalize saves new details of an existing lead once (if the update_lead tool did not already).
 """
+import json
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
@@ -25,11 +27,12 @@ from langgraph.prebuilt import ToolNode
 
 from app.agent import welcome
 from app.agent.leads import (
-    LeadOps, changed_fields, confirmed_city, fix_callback_claims, is_clock_time, lead_summary, merge_callback_time,
-    pending_changes, remove_false_claims, ruled_out_details, short_answer_details, status_block,
+    LeadOps, changed_fields, confirmed_city, fix_callback_claims, is_clock_time, keep_one_question, lead_summary,
+    merge_callback_time, own_details_question, pending_changes, remove_false_claims, ruled_out_details,
+    short_answer_details, status_block,
 )
 from app.agent.state import AgentState
-from app.agent.tools import make_tools, tool_step
+from app.agent.tools import make_tools, service_area_data, tool_step
 from app.agent.understand import KbHints, Understanding, load_kb_hints, understand
 from app.core.config import get_settings
 from app.core.db import get_engine
@@ -38,10 +41,11 @@ from app.leads import service
 from app.core.prompts import load_prompt
 from app.leads.schemas import LeadData
 from app.rag.answer import (
-    LLM_DOWN_REPLY, normalize_citations, pick_sources, rag_message, retrieve_step, soften_promises,
-    strip_tool_citations, strip_unsourced_citations, tidy_citations,
+    LLM_DOWN_REPLY, normalize_citations, pick_sources, plain_service_area_words, rag_message, retrieve_step,
+    soften_promises, strip_tool_citations, strip_unsourced_citations, tidy_citations,
 )
-from app.rag.chunker import SUMMARY_SECTIONS
+from app.rag.chunker import CATALOG_SECTION, SERVICE_AREA_SECTION, SUMMARY_SECTIONS
+from app.rag.numbers import remove_unsupported_numbers
 from app.rag.retriever import RetrievedChunk, SearchResult, search
 from app.services.service_areas import ServiceAreas, get_service_areas
 
@@ -56,6 +60,13 @@ CONTEXT_CHUNKS = 4
 NO_SEARCH_INTENTS = {"gives_details", "contact_request", "asks_what_is_needed", "reply_to_assistant"}
 NO_SEARCH_TRIGGERS = {"gives_details", "contact_request", "asks_what_is_needed"}
 MAX_ASKED_CITIES = 3
+# T12b: every city named in the message is checked in code before the model answers (it saves one model round per
+# city turn, which Groq's 8K tokens a minute could not carry in the slow-Google drill); not for these intents alone
+MAX_CITY_CHECKS = 3
+NO_CITY_CHECK_INTENTS = {"greeting", "thanks_or_bye", "off_topic"}
+# A system size in the message ("5kW", "3 kW"): the catalog summary joins the context, so the reply can name the
+# package of that size (T12b; T5 answered "How much does a 5kW system cost?" without naming HomePro 5)
+_SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:kw|kwp|kilowatts?)\b", re.IGNORECASE)
 
 
 @dataclass
@@ -89,6 +100,61 @@ def add_table_summaries(chunks: list[dict], summaries: dict[int, dict]) -> list[
     return chunks + added
 
 
+def add_catalog_for_size(
+    chunks: list[dict], message: str, new_details: list[str], summaries: dict[int, dict]
+) -> list[dict]:
+    """When the customer mentions a system size this turn, add the KB Section 8 summary chunk (every package with
+    its kW, read from the KB) if it is not in the context yet, so a 5 kW question can name the 5 kW package (T12b)."""
+    summary = summaries.get(CATALOG_SECTION)
+    if not summary or not (_SIZE_RE.search(message) or "system_size_kw" in new_details):
+        return chunks
+    if any(c["chunk_id"] == summary["chunk_id"] for c in chunks):
+        return chunks
+    return chunks + [summary]
+
+
+def check_named_cities(names: list[str], areas_fn: Callable[[], ServiceAreas]) -> list[dict]:
+    """The service-area result (the check_service_area tool's data) for every city named, once each, at most
+    MAX_CITY_CHECKS. Empty when the list can't be read; the model can still call the tool then."""
+    checks, seen = [], set()
+    for name in names:
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        try:
+            checks.append(service_area_data(areas_fn(), name))
+        except Exception as exc:  # DB down or not ingested
+            logger.warning("service-area check before the model unavailable: %s", type(exc).__name__)
+            break
+        if len(checks) == MAX_CITY_CHECKS:
+            break
+    return checks
+
+
+def area_checks_text(checks: list[dict]) -> str:
+    """The checks for the agent's message: one JSON line per city, the same data the tool returns."""
+    return "\n".join(json.dumps(c) for c in checks)
+
+
+def tool_outcome_reply(scratch: list[BaseMessage]) -> str | None:
+    """What this turn's tools wrote, in fixed words, for when the model fails after them (T12b): in the slow-Google
+    drill Groq ran out of tokens on the call after a tool round, and "try again" after a saved lead is false.
+    None when no tool wrote anything (the reply is then the usual "try again")."""
+    lines = []
+    for message in scratch:
+        artifact = message.artifact if isinstance(message, ToolMessage) and isinstance(message.artifact, dict) else {}
+        if artifact.get("kind") == "lead" and artifact.get("created"):
+            lines.append(welcome.SAVED_FALLBACK_TEXT)
+        elif artifact.get("kind") == "callback":
+            text = welcome.CALLBACK_UPDATED_TEXT if artifact.get("updated") else welcome.CALLBACK_LOGGED_TEXT
+            lines.append(text.format(time=artifact["time"]))
+        elif artifact.get("kind") == "support":
+            lines.append(welcome.SUPPORT_SAVED_FALLBACK_TEXT.format(id=artifact["id"]))
+    if any("callback request" in line for line in lines):  # the callback is logged: no need to ask for a time
+        lines = [line.replace(" What time would suit you for a callback?", "") for line in lines]
+    return " ".join(lines) or None
+
+
 def _dedupe(chunks: list[dict]) -> list[dict]:
     seen, unique = set(), []
     for chunk in chunks:
@@ -117,7 +183,7 @@ def build_graph(deps: AgentDeps):
             degraded = False
         except LLMError as exc:  # carry on with the raw message as the search query
             logger.warning("understand failed, using the raw message: %s", type(exc).__name__)
-            out = {"intents": ["question"], "search_query": message, "details": {}, "asked_city": None,
+            out = {"intents": ["question"], "search_query": message, "details": {}, "asked_city": None, "cities": [],
                    "callback_time": None, "issue": None, "project_details": None, "declines": False,
                    "provider": None, "model": None, "latency_ms": None, "tokens": None}
             degraded = True
@@ -131,7 +197,21 @@ def build_graph(deps: AgentDeps):
             clean.pop("timeline_bucket", None)
         if not out["callback_time"] and is_clock_time(str(message)):  # a message that is only "4pm"
             callback_time = merge_callback_time(callback_time, str(message).strip().rstrip(".!"))
-        intents = set(out["intents"])
+        intents_list, search_query, query_note = list(out["intents"]), out["search_query"], None
+        # T12b: "what else do you need?" is about their own details (no KB search); "what do I need for
+        # installation?" is a KB question, whatever intent the model gave it
+        if "asks_what_is_needed" in intents_list and not own_details_question(str(message)):
+            intents_list = [i for i in intents_list if i != "asks_what_is_needed"] or ["question"]
+            if "question" not in intents_list:
+                intents_list.append("question")
+            query_note = "not about their details: searches the KB"
+        # A question always searches: with no query from the model, the raw message is the query (q13 in T12a)
+        skip_raw = {"off_topic", "reply_to_assistant", "greeting", "thanks_or_bye"} | NO_SEARCH_TRIGGERS
+        if "question" in intents_list and not search_query and not set(intents_list) & skip_raw:
+            search_query = str(message)
+            query_note = query_note or "no query from the model: the message is the query"
+        out = {**out, "intents": intents_list, "search_query": search_query}
+        intents = set(intents_list)
         asked = list(state.get("asked_cities", []))
         city = confirmed_city(asked, previous, out)
         if city:  # the customer confirmed the city the assistant's question named
@@ -147,12 +227,19 @@ def build_graph(deps: AgentDeps):
         support_case = bool(state.get("support_case")) or "existing_customer_issue" in intents
         if "buying_interest" in intents and "existing_customer_issue" not in intents:
             support_case = False  # the customer moved on to buying: sales rules apply again
+        # T12b: every city named is checked in code; its step and the KB Section 10 summary (the source) go along
+        named = [str(n) for n in [*out.get("cities", []), out["asked_city"], out["details"].get("city")] if n]
+        checks = [] if intents <= NO_CITY_CHECK_INTENTS else check_named_cities(named, deps.areas_fn)
+        area_steps = [{"node": "area_check", "detail": f"{c['city']}: {c['status']}", "data": {"by": "code"}}
+                      for c in checks]
+        summary = deps.hints_fn().summaries.get(SERVICE_AREA_SECTION) if checks else None
         step = {
             "node": "understand",
             "detail": ("failed, raw message used" if degraded else "intents: " + ", ".join(out["intents"])),
             "data": {
                 "intents": out["intents"],
                 "search_query": out["search_query"],
+                "query_note": query_note,
                 "details": sorted(clean),
                 "invalid": sorted(errors),
                 "city_confirmed": bool(city),
@@ -180,7 +267,9 @@ def build_graph(deps: AgentDeps):
             "support_case": support_case,
             "contact_request": "contact_request" in intents,
             "degraded": degraded,
-            "steps": state["steps"] + [step],
+            "area_checks": checks,
+            "chunks": [summary] if summary else [],
+            "steps": state["steps"] + [step] + area_steps,
         }
 
     def route_after_understand(state: AgentState) -> str:
@@ -198,15 +287,19 @@ def build_graph(deps: AgentDeps):
     def retrieve_node(state: AgentState) -> dict:
         start = time.perf_counter()
         result = deps.search_fn(state["search_query"])  # DB errors propagate: the API answers 503
-        chunks = [] if result.no_context else [asdict(c) for c in result.chunks]
-        found = len(chunks)
+        found = [] if result.no_context else [asdict(c) for c in result.chunks]
+        chunks = found
         if chunks and deps.small_to_big:
             chunks = add_table_summaries(chunks, deps.hints_fn().summaries)
+        if chunks:
+            message = str(state["messages"][-1].content)
+            chunks = add_catalog_for_size(chunks, message, state.get("new_details", []), deps.hints_fn().summaries)
         step = retrieve_step(result)
         step["data"]["latency_ms"] = round((time.perf_counter() - start) * 1000)
-        step["data"]["added_summaries"] = len(chunks) - found
+        step["data"]["added_summaries"] = len(chunks) - len(found)
         return {
-            "chunks": chunks,
+            # a city check's KB Section 10 summary stays first, so it is that answer's source (T12b, as T10b)
+            "chunks": _dedupe(state.get("chunks", []) + chunks),
             "no_context": result.no_context,
             "search_mode": result.mode,
             "degraded": state["degraded"] or result.degraded,
@@ -221,7 +314,7 @@ def build_graph(deps: AgentDeps):
         return [
             SystemMessage(load_prompt("system_prompt")),
             *persisted[:-1],
-            rag_message(str(current.content), chunks, lead_progress),
+            rag_message(str(current.content), chunks, lead_progress, area_checks_text(state.get("area_checks", []))),
             *state.get("scratch", []),
         ]
 
@@ -233,8 +326,10 @@ def build_graph(deps: AgentDeps):
             message = llm.invoke(agent_messages(state))
         except Exception as exc:
             logger.warning("agent call failed: %s", type(exc).__name__)
-            step = {"node": "agent", "detail": "LLM failed", "data": {"provider": None, "latency_ms": None}}
-            return {"reply": LLM_DOWN_REPLY, "degraded": True, "steps": state["steps"] + [step]}
+            done = tool_outcome_reply(state.get("scratch", []))  # never "try again" after a save (T12b)
+            detail = "LLM failed; the reply says what the tools did" if done else "LLM failed"
+            step = {"node": "agent", "detail": detail, "data": {"provider": None, "latency_ms": None}}
+            return {"reply": done or LLM_DOWN_REPLY, "degraded": True, "steps": state["steps"] + [step]}
         latency_ms = round((time.perf_counter() - start) * 1000)
         provider = provider_of(message)
         calls = [c["name"] for c in getattr(message, "tool_calls", [])]
@@ -309,6 +404,15 @@ def build_graph(deps: AgentDeps):
                 if removed:
                     steps.append({"node": "guard", "detail": f"removed {removed} KB tag(s) not backed by this "
                                                              "turn's sources", "data": {"removed": removed}})
+                # T12b: no number, duration, amount or percentage that nothing in the conversation gave (KB Section 16)
+                allowed = ([c.content for c in chunks]
+                           + [str(m.content) for m in scratch if isinstance(m, ToolMessage)]
+                           + [str(m.content) for m in state["messages"]]  # the customer's and earlier replies
+                           + list(state.get("validation_errors", {}).values()))
+                reply, numbers = remove_unsupported_numbers(reply, allowed, welcome.NUMBERS_CONFIRM_TEXT)
+                if numbers:
+                    steps.append({"node": "guard", "detail": f"removed {len(numbers)} number(s) no source gave",
+                                  "data": {"removed": len(numbers)}})
                 reply, fixed = remove_false_claims(reply, state) if deps.ops is not None else (reply, False)
                 if fixed:
                     steps.append({"node": "guard", "detail": "removed a claim that details were saved (no lead "
@@ -321,6 +425,13 @@ def build_graph(deps: AgentDeps):
                 if softened:
                     steps.append({"node": "guard", "detail": "a promise that the team will act became 'can'",
                                   "data": {}})
+                reply, plain = plain_service_area_words(reply)
+                if plain:
+                    steps.append({"node": "guard", "detail": "'reference locations' became 'service areas'",
+                                  "data": {}})
+                reply, trimmed = keep_one_question(reply, state)
+                if trimmed:
+                    steps.append({"node": "guard", "detail": "kept one question", "data": {}})
                 reply = tidy_citations(reply, chunks)
                 sources = pick_sources(reply, chunks) if chunks else []
         if deps.ops is not None:

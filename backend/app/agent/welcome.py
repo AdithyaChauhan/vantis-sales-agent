@@ -34,6 +34,19 @@ REDIRECT_TEXT = (
 CALLBACK_LOGGED_TEXT = "I've logged a callback request for {time}; the team will confirm it."
 CALLBACK_UPDATED_TEXT = "I've updated your callback request to {time}; the team will confirm it."
 CALLBACK_EXISTS_TEXT = "Your callback request for {time} is logged; the team will confirm it."
+# T12b: what replaces a sentence that stated an invented duration, amount or percentage (app/rag/numbers.py),
+# unless the reply already says the team confirms something (KB Section 16).
+NUMBERS_CONFIRM_TEXT = (
+    "The Vantis team can confirm exact numbers, such as costs, timings or amounts, after a consultation or "
+    "site assessment."
+)
+# T12b: when the model fails after a tool already wrote something this turn, the reply says what was done
+# (app/agent/graph.py, tool_outcome_reply) instead of "try again", which would be false
+SAVED_FALLBACK_TEXT = (
+    "Your details are saved, and the Vantis sales team can follow up with you. What time would suit you for a "
+    "callback?"
+)
+SUPPORT_SAVED_FALLBACK_TEXT = "I've saved your support request (id {id}); the Vantis team can follow up on it."
 CALLBACK_TIME_ASK = "What time would suit you for the call?"
 STILL_NEEDED_ASK = "Could you share your {items}? Then I can pass your details to the sales team."
 SUPPORT_STILL_NEEDED_ASK = "Could you share your {items}? Then I can pass your request to the Vantis team."

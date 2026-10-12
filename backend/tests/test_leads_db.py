@@ -51,8 +51,9 @@ def test_round_trip_create_update_rescore_read(db, llm):
     assert created.missing_fields == [] and created.errors == {}
     assert (lead.lead_score, lead.lead_status, lead.location_status) == (74, "WARM", "unverified")
     assert lead.score_breakdown["raw_score"] == 82
-    # A WARM reason ends with what keeps it from HOT; for a capped lead, the cap's cause (T12a)
-    expected = "Ready buyer with a clear 5 kW requirement and full contact details, not HOT yet: " \
+    # A WARM reason ends with what keeps it from HOT; for a capped lead, the cap's cause (T12a). T12b: code
+    # writes that ending once, after the LLM's part (the fake's own ", not HOT yet: ..." is cut off)
+    expected = "Ready buyer with a clear 5 kW requirement and full contact details; not HOT yet: " \
                "city not in the listed service areas."
     assert (lead.reason, lead.reason_source) == (expected, "llm")
     assert "Verify service availability for Pune." in lead.recommended_action

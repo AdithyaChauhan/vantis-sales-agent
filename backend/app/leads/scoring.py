@@ -58,6 +58,8 @@ CAP_CAUSES = {
     "unverified_location": "city not in the listed service areas",
     "outside_catalog": "requirement outside the reference packages",
 }
+# The rule a cap's cause belongs to, so a reason never names it twice (T12b); outside_catalog has no rule of its own
+CAP_RULES = {"unverified_location": "location", "outside_catalog": "catalog"}
 GAP_ORDER = ["timeline", "requirement", "intent", "location", "contact", "property"]  # ties: timeline first
 
 
@@ -176,8 +178,9 @@ def _gap_label(rule: dict) -> str | None:
     return GAP_LABELS.get(rule["rule"], {}).get(rule["value"])
 
 
-def next_status_gap(breakdown: dict) -> tuple[str, list[str]] | None:
-    """What keeps a lead from the next status (T12a): ("HOT", ["no timeline"]), or None for a HOT lead.
+def status_gaps(breakdown: dict) -> tuple[str, list[tuple[str, str]]] | None:
+    """What keeps a lead from the next status, with the rule each gap belongs to (T12b):
+    ("HOT", [("timeline", "no timeline")]), or None for a HOT lead. A cap's cause has its CAP_RULES rule.
 
     A capped lead: the cap's cause (without it the lead would be HOT). Otherwise the missing signals worth the
     most points, most first (timeline first on a tie), until they would reach the next status's score.
@@ -187,20 +190,26 @@ def next_status_gap(breakdown: dict) -> tuple[str, list[str]] | None:
         return None
     next_status, threshold = NEXT_STATUS[status]
     if breakdown["caps"]:
-        return next_status, [CAP_CAUSES[c["rule"]] for c in breakdown["caps"]]
+        return next_status, [(CAP_RULES[c["rule"]], CAP_CAUSES[c["rule"]]) for c in breakdown["caps"]]
     gaps = []
     for rule in breakdown["rules"]:
         label = _gap_label(rule)
         if label:
-            gaps.append((rule["max"] - rule["points"], GAP_ORDER.index(rule["rule"]), label))
+            gaps.append((rule["max"] - rule["points"], GAP_ORDER.index(rule["rule"]), rule["rule"], label))
     gaps.sort(key=lambda gap: (-gap[0], gap[1]))
     needed, gained, named = threshold - breakdown["lead_score"], 0, []
-    for gain, _, label in gaps:
+    for gain, _, rule, label in gaps:
         if gained >= needed:
             break
-        named.append(label)
+        named.append((rule, label))
         gained += gain
     return next_status, named
+
+
+def next_status_gap(breakdown: dict) -> tuple[str, list[str]] | None:
+    """What keeps a lead from the next status (T12a): ("HOT", ["no timeline"]), or None for a HOT lead."""
+    gap = status_gaps(breakdown)
+    return None if gap is None else (gap[0], [label for _, label in gap[1]])
 
 
 def recommended_action(breakdown: dict, lead: LeadData, callback_time: str | None = None) -> str:

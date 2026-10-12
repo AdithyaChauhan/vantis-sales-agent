@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
 
 MAX_MESSAGE_CHARS = 1000
-DB_DOWN_DETAIL = "Our knowledge base is not reachable right now. Please try again in a minute."
+# Search, memory or a lead write failed (T12b: neutral words, since a lead write is not the knowledge base)
+DB_DOWN_DETAIL = "We can't reach our database right now. Please try again in a minute."
 # Search (SQLAlchemy) and memory (psycopg pool) failures: the database is the problem, not the request
 DB_ERRORS = (DBAPIError, psycopg.OperationalError, psycopg_pool.PoolTimeout)
 # One turn at a time per session (no two leads, no clashing memory writes). 64 striped locks keep

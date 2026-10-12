@@ -5,6 +5,7 @@ Calls the T7 leads service; never decides scores itself.
 The model never sees a score, a status, a reason or any personal value: the status block lists field
 names and plain messages only.
 """
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Callable
@@ -19,6 +20,8 @@ from app.leads.schemas import LeadData
 from app.leads.scoring import missing_details, missing_for_creation, score_lead
 from app.rag.answer import is_claim, split_sentences, without_tags
 from app.services.service_areas import ServiceAreas
+
+logger = logging.getLogger(__name__)
 
 # The order F2 asks for what is missing; a contact request puts name and phone first
 NEED_ORDER = ["city", "requirement, monthly bill, usage, system size or property type", "name", "phone or email"]
@@ -81,6 +84,21 @@ _DETAIL_WORDS = {
     "phone number": ("phone", "mobile", "number"),
 }
 _DETAIL_OF_WORD = {word: detail for detail, words in _DETAIL_WORDS.items() for word in words}
+# "What else do you need?" is about the customer's own details only together with a need-from-me phrase (T12b):
+# "what else do I need for installation?" and "anything else besides panels?" are KB questions
+_ELSE_RE = re.compile(r"\b(?:else|other|more|anything|still|apart from)\b", re.I)
+_FROM_ME_RE = re.compile(r"\b(?:you\s+need|u\s+need|need\s+from\s+me|info|information|details?)\b", re.I)
+# The words of each still-missing item, to find the question that asks for it (keep_one_question, T12b)
+_ITEM_WORDS = {
+    "city": ("city", "where", "location", "town"),
+    "requirement, monthly bill, usage, system size or property type": (
+        "bill", "usage", "units", "consumption", "size", "kw", "property", "house", "home", "shop", "office"),
+    "name": ("name",),
+    "phone or email": ("phone", "number", "mobile", "email", "contact"),
+    "issue": ("issue", "problem", "happening", "wrong"),
+    "project details": ("system", "installed", "size", "details"),
+    **_DETAIL_WORDS,
+}
 
 
 @dataclass
@@ -202,6 +220,15 @@ def details_named(text: str) -> list[str]:
     return found
 
 
+def own_details_question(message: str) -> bool:
+    """True if a "what is needed" message is about the customer's own lead details (T12b): it names one ("is my
+    bill needed?") or asks what else the assistant needs ("what else do you need from me?"). A question about
+    what an installation or a quote requires is not, so it searches the KB."""
+    if details_named(message):
+        return True
+    return bool(_ELSE_RE.search(message) and _FROM_ME_RE.search(message))
+
+
 def ruled_out_details(message: str) -> list[str]:
     """Details the customer rules out in a message: "anything else apart from timing?" -> ["timeline"]."""
     return [_DETAIL_OF_WORD[word.lower()] for word in _EXCEPT_RE.findall(message) if word.lower() in _DETAIL_OF_WORD]
@@ -304,6 +331,55 @@ def remove_false_claims(reply: str, state: dict) -> tuple[str, bool]:
     if "?" not in text:
         text = f"{text} {_still_needed_ask(state)}".strip()
     return text, True
+
+
+def _wanted_item(state: dict) -> str | None:
+    """The detail the reply should ask for next, if any: the support request's next need, the lead's next
+    missing field once the customer showed interest, or after the save the next useful detail."""
+    lead = state.get("lead", {})
+    if state.get("support_case") and not state.get("support_request_id"):
+        missing = support_missing(lead, state.get("support", {}))
+        return missing[0] if missing else None
+    if not state.get("lead_id"):
+        missing = ordered_missing(lead, state.get("contact_request", False))
+        return missing[0] if missing and shows_interest(state) else None
+    ruled_out = set(state.get("ruled_out", []))
+    useful = [d for d in missing_details(LeadData.model_validate(lead), _breakdown_stub(lead)) if d not in ruled_out]
+    return next_detail(state, useful) if useful else None
+
+
+def keep_one_question(reply: str, state: dict) -> tuple[str, bool]:
+    """At most one question per reply (T12b; the system prompt's rule, which Groq broke in the T12a drill). With
+    several, keep the one that asks for the next missing detail, else the last one (usually the closing offer:
+    "Is that helpful? Would you like a callback?" keeps the callback question). Returns (reply, changed)."""
+    pieces = [(i, j, piece) for i, line in enumerate(reply.split("\n"))
+              for j, piece in enumerate(split_sentences(line))]
+    questions = [(i, j) for i, j, piece in pieces if without_tags(piece).endswith("?")]
+    if len(questions) < 2:
+        return reply, False
+    item = _wanted_item(state)
+    words = _ITEM_WORDS.get(item, ()) if item else ()
+    asking = [(i, j) for i, j, piece in pieces if (i, j) in questions
+              and any(re.search(rf"\b{w}\b", without_tags(piece), re.I) for w in words)]
+    keep = asking[0] if asking else questions[-1]
+    lines: dict[int, list[str]] = {}
+    dropped_last = False
+    for i, j, piece in pieces:
+        lines.setdefault(i, [])
+        bare = without_tags(piece)
+        if (i, j) in questions and (i, j) != keep:
+            dropped_last = True
+            continue
+        if not bare and dropped_last:  # tags of a dropped question go with it
+            continue
+        dropped_last = False
+        if piece.strip():
+            lines[i].append(piece.strip())
+    original = reply.split("\n")
+    text = "\n".join(re.match(r"[ \t]*", original[i]).group(0) + " ".join(kept) if kept else ""
+                     for i, kept in sorted(lines.items()))
+    logger.warning("reply asked more than one question; kept one", extra={"questions": len(questions)})
+    return re.sub(r"\n{3,}", "\n\n", text).strip(), True
 
 
 def _saved_lead_next(state: dict, useful: list[str]) -> str:

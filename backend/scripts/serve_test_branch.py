@@ -7,6 +7,7 @@ dashboard, so they never put leads into main.
 
 Run: python -m scripts.serve_test_branch                 (then the chat page: cd frontend && npm run dev)
      python -m scripts.serve_test_branch --slow-gemini   (the slow-Google drill: every Gemini chat call hangs)
+     python -m scripts.serve_test_branch --port 8001     (another port, e.g. when an older server holds 8000)
 
 --slow-gemini (T12a) exists only here: it is a command-line flag, not a setting, and the Docker image does not
 contain backend/scripts, so it can never be switched on in Render.
@@ -60,12 +61,18 @@ def engine_for_test_branch(settings: Settings) -> Engine:
     return create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Start uvicorn on 127.0.0.1:8000 with the agent's lead writes pointed at the test branch."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """--slow-gemini and --port (T12b: another port when an older server holds 8000)."""
     parser = argparse.ArgumentParser(description="Run the API locally with leads on the Neon test branch.")
     parser.add_argument("--slow-gemini", action="store_true",
                         help="drill: every Gemini chat call hangs, so the deadlines, Groq and the skip list answer")
-    args = parser.parse_args(argv)
+    parser.add_argument("--port", type=int, default=PORT, help=f"port to listen on (default {PORT})")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Start uvicorn on 127.0.0.1 (port 8000 by default) with the agent's lead writes pointed at the test branch."""
+    args = parse_args(argv)
     for key, value in DEV_ENV.items():
         os.environ.setdefault(key, value)
 
@@ -94,8 +101,8 @@ def main(argv: list[str] | None = None) -> None:
     print("Leads, callbacks and support requests are on the test branch.", flush=True)
     if args.slow_gemini:
         print(f"Drill: every Gemini chat call hangs for {HANG_S} s (--slow-gemini).", flush=True)
-    print(f"API on http://127.0.0.1:{PORT}", flush=True)
-    uvicorn.run(app, host="127.0.0.1", port=PORT)
+    print(f"API on http://127.0.0.1:{args.port}", flush=True)
+    uvicorn.run(app, host="127.0.0.1", port=args.port)
 
 
 if __name__ == "__main__":

@@ -74,6 +74,10 @@ class Understanding(BaseModel):
     asked_city: str | None = Field(
         None, description="A city the customer only asked about (not stated as theirs), as written"
     )
+    cities: list[str] = Field(
+        default_factory=list,
+        description="Every city or town named in the new message, as written (their own or only asked about)",
+    )
     callback_time: str | None = Field(
         None, description="When the customer wants to be called back, copied word for word"
     )
@@ -156,7 +160,7 @@ def build_prompt(hints: KbHints, message: str, history: list[BaseMessage]) -> st
 
 
 def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMessage]) -> dict:
-    """{intents, search_query, details (raw), asked_city, callback_time, issue, project_details, declines,
+    """{intents, search_query, details (raw), asked_city, cities, callback_time, issue, project_details, declines,
     provider, model, latency_ms, tokens}. Raises LLMError on any failure."""
     start = time.perf_counter()
     try:
@@ -177,6 +181,7 @@ def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMe
         "search_query": text(parsed.search_query),
         "details": parsed.details.model_dump(exclude_none=True),
         "asked_city": text(parsed.asked_city),
+        "cities": [name for name in (text(c) for c in parsed.cities) if name],
         "callback_time": text(parsed.callback_time),
         "issue": text(parsed.issue),
         "project_details": text(parsed.project_details),

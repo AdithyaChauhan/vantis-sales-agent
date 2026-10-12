@@ -195,3 +195,20 @@ def test_document_text_format():
     assert prose.embed_text() == "title: KB Section 5: Pricing | text: Prices vary."
     piped = Chunk("s15-q", 15, "FAQ", 5, "faq", "A", metadata={"label": "Cost | price?"})
     assert "|" not in piped.embed_title()
+
+
+# ---------- offline scripts (T12b): patient query embeddings ----------
+
+def test_embed_queries_batches_query_texts_with_the_patient_options():
+    embedder, client = make()
+    vectors = embedder.embed_queries([f"q{i}" for i in range(22)])
+    assert len(vectors) == 22
+    assert [len(c.contents) for c in client.calls] == [20, 2]
+    assert client.calls[0].contents[0].parts[0].text == query_text("q0")
+    assert client.calls[0].config.http_options is DOCUMENT_HTTP  # 30 s and 3 attempts on 429/5xx, like ingest
+
+
+def test_embed_queries_ignores_the_chat_skip_list(monkeypatch):
+    embedder, client = make()
+    monkeypatch.setattr(llm.SKIPS, "left", lambda key: 60.0)  # the chat path would refuse now
+    assert len(embedder.embed_queries(["q"])) == 1

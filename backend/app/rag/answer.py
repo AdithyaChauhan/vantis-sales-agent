@@ -35,6 +35,10 @@ _THANKS_RE = re.compile(r"^\W*(?:thanks|thank you)\b", re.IGNORECASE)
 _PROMISE_RE = re.compile(
     r"(\s+will|'ll|’ll)(\s+(?:follow up|call|contact|reach out|get in touch|get back))\b", re.IGNORECASE
 )
+# KB Section 10's own words ("Reference Locations", "Reference service area") are office terms; the customer reads
+# "service areas" (T12b). Only text outside [KB Section ...] tags is changed, so the label stays exact.
+_TAG_OR_TEXT_RE = re.compile(r"(\[KB Section \d+(?::[^\[\]]*)?\])|([^\[]+|\[)")
+_REFERENCE_AREA_RE = re.compile(r"\breference\s+(?:service\s+)?(?:locations?|areas?)\b", re.IGNORECASE)
 
 
 def citation_label(chunk: RetrievedChunk) -> str:
@@ -47,14 +51,18 @@ def format_context(chunks: list[RetrievedChunk]) -> str:
     return "\n\n".join(f"{citation_label(c)}\n{c.content}" for c in chunks)
 
 
-def rag_message(question: str, chunks: list[RetrievedChunk], lead_progress: str = "") -> HumanMessage:
-    """The customer's message wrapped in the RAG prompt with the context (empty when nothing was found)
-    and the lead progress block (what is known and still needed; "(not tracked)" without the lead tools).
+def rag_message(
+    question: str, chunks: list[RetrievedChunk], lead_progress: str = "", area_checks: str = ""
+) -> HumanMessage:
+    """The customer's message wrapped in the RAG prompt with the context (empty when nothing was found),
+    the lead progress block (what is known and still needed; "(not tracked)" without the lead tools) and
+    (T12b) the service-area checks the code made for the cities named ("(no city named)" when none).
 
     The customer's text is filled in last, so a "{context}" typed by the customer is left as it is.
     """
     text = load_prompt("rag_prompt").replace("{context}", format_context(chunks))
     text = text.replace("{lead_progress}", lead_progress or "(not tracked)")
+    text = text.replace("{service_area_check}", area_checks or "(no city named)")
     return HumanMessage(text.replace("{question}", question))
 
 
@@ -138,6 +146,28 @@ def soften_promises(reply: str) -> tuple[str, int]:
     changed, count = _PROMISE_RE.subn(lambda m: " can" + m.group(2), reply)
     if count:
         logger.warning("reply promised a human action; softened", extra={"changed": count})
+    return changed, count
+
+
+def plain_service_area_words(reply: str) -> tuple[str, int]:
+    """'reference locations' and 'reference service area(s)' become 'service area(s)' outside KB tags (T12b).
+    Returns (reply, changes). The system prompt asks for this; this is the net."""
+    count = 0
+
+    def plain(match: re.Match) -> str:
+        nonlocal count
+        count += 1
+        word = match.group(0)
+        plural = word.lower().endswith("s")
+        text = "service areas" if plural else "service area"
+        return text[0].upper() + text[1:] if word[0].isupper() else text
+
+    def part(match: re.Match) -> str:
+        return match.group(1) or _REFERENCE_AREA_RE.sub(plain, match.group(2))
+
+    changed = _TAG_OR_TEXT_RE.sub(part, reply)
+    if count:
+        logger.warning("reply used KB office words for service areas; replaced", extra={"changed": count})
     return changed, count
 
 

@@ -22,7 +22,7 @@ AREAS_SUMMARY = {
 HINTS = KbHints("KB Section 8: Catalog\nKB Section 10: Locations", {8: CATALOG_SUMMARY, 10: AREAS_SUMMARY})
 
 
-TOP_LEVEL = ("asked_city", "callback_time", "issue", "project_details", "declines")
+TOP_LEVEL = ("asked_city", "cities", "callback_time", "issue", "project_details", "declines")
 
 
 def understood(intents, search_query=None, provider="google_genai", **details) -> dict:

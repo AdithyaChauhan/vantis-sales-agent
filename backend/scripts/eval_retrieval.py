@@ -7,8 +7,15 @@ data/eval/offtopic_eval.jsonl (questions the KB cannot answer). Each question is
 (about 32 API calls) and that vector is reused for every mode. Prints the report and writes
 docs/EVAL.md; the hand-written "Tuning notes" section of that file is kept.
 
---rewrite also runs the agent's understand step on every question (one understand_llm call each: the main
-model, falling back to Groq and then the fast model after 4 s each; paced to stay under the free tier's 15 requests a minute), embeds the rewritten search_query and adds two modes:
+data/eval/holdout_eval.jsonl (T12b): 8 held-out questions written without the KB and labelled before any search;
+reported in their own section and never mixed into the 24-question numbers or used for tuning.
+
+Embedding and the understand step use the patient offline path (T12b; a Google 503 stopped a T12a run that used the
+chat's fail-fast path): batched query embeddings with HTTP retries, and offline_understand_llm.
+
+--rewrite also runs the agent's understand step on every question (one call each: the main model, falling back to
+Groq and then the fast model; paced to stay under the free tier's 15 requests a minute), embeds the rewritten
+search_query and adds two modes:
 "rewrite" (hybrid search on the rewritten query) and "fused" (RRF of the raw-question and rewritten
 hybrid rankings). It also reports where the small-to-big rule (app/agent/graph.py) would add a table
 summary chunk to the agent's 4-chunk context.
@@ -17,7 +24,7 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 
@@ -25,7 +32,7 @@ from sqlalchemy import Engine, text
 
 from app.core.config import REPO_ROOT, get_settings
 from app.core.db import check_db, get_engine
-from app.core.llm import EmbeddingError, LLMError, understand_llm
+from app.core.llm import EmbeddingError, LLMError, offline_understand_llm
 from app.core.llm import embedder as get_embedder
 from app.rag.retriever import (
     COMMON_WORD_RATIO,
@@ -38,6 +45,7 @@ from app.rag.retriever import (
 
 KB_QUESTIONS = REPO_ROOT / "data" / "eval" / "retrieval_eval.jsonl"
 OFFTOPIC_QUESTIONS = REPO_ROOT / "data" / "eval" / "offtopic_eval.jsonl"
+HOLDOUT_QUESTIONS = REPO_ROOT / "data" / "eval" / "holdout_eval.jsonl"
 REPORT_PATH = REPO_ROOT / "docs" / "EVAL.md"
 NOTES_HEADING = "## Tuning notes"
 NOTES_PLACEHOLDER = (
@@ -66,12 +74,14 @@ class EvalSetupError(RuntimeError):
 
 @dataclass
 class Question:
-    """One eval question. `expected` holds the KB section numbers that count as a hit (empty = off-topic)."""
+    """One eval question. `expected` holds the KB section numbers that count as a hit (empty = off-topic, or a
+    held-out question the KB doesn't cover); `best` the one best section (held-out questions only, T12b)."""
 
     id: str
     question: str
     expected: set[int]
     note: str = ""
+    best: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -81,10 +91,10 @@ class Evaluated:
     question: Question
     results: dict[str, SearchResult]
 
-    def first_hit(self, mode: str) -> int | None:
-        """Position of the first returned chunk from an expected section, or None."""
+    def first_hit(self, mode: str, expected: set[int] | None = None) -> int | None:
+        """Position of the first returned chunk from an expected section (or from `expected`), or None."""
         sections = [c.section_no for c in self.results[mode].chunks]
-        return first_hit_rank(sections, self.question.expected)
+        return first_hit_rank(sections, self.question.expected if expected is None else expected)
 
     @property
     def best_similarity(self) -> float | None:
@@ -150,6 +160,7 @@ def load_questions(path: Path) -> list[Question]:
                 question=" ".join(row["question"].split()),
                 expected={int(s) for s in row.get("expected_sections", [])},
                 note=row.get("note", ""),
+                best={int(row["best_section"])} if row.get("best_section") else set(),
             )
         )
     return questions
@@ -177,8 +188,9 @@ def read_kb_info(engine: Engine | None, embedding_model: str) -> dict:
 
 
 def embed_questions(questions: list[Question], embedder) -> FixedEmbedder:
-    """Embed every question once. Raises EmbeddingError if the API fails."""
-    return FixedEmbedder({q.question: embedder.embed_query(q.question) for q in questions})
+    """Embed every question once, in batches on the patient path. Raises EmbeddingError if the API still fails."""
+    texts = list(dict.fromkeys(q.question for q in questions))
+    return FixedEmbedder(dict(zip(texts, embedder.embed_queries(texts))))
 
 
 def evaluate(
@@ -392,6 +404,49 @@ def small_to_big_lines(kb_rows: list[Evaluated], summaries: dict[int, dict], row
     ]
 
 
+def holdout_lines(rows: list[Evaluated], rewrites: dict | None) -> list[str]:
+    """The held-out section (T12b): hit@1, hit@3 and MRR for the best section and for any listed section, side by
+    side, over the questions the KB covers; a table per question; and the questions it doesn't cover."""
+    covered = [row for row in rows if row.question.expected]
+    uncovered = [row for row in rows if not row.question.expected]
+    lines = [
+        f"{len(rows)} questions written by DeepSeek from a short brief, without seeing the KB "
+        "(`data/eval/holdout_questions.txt`), labelled by hand before any search ran "
+        "(`data/eval/holdout_eval.jsonl`) and never used for tuning. Metrics cover the "
+        f"{len(covered)} questions with a KB answer for their main part; \"best\" counts only the one best "
+        "section, \"any\" any listed section.",
+        "",
+        "| Mode | hit@1 best | hit@3 best | MRR best | hit@1 any | hit@3 any | MRR any |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for mode in report_modes(rows):
+        cells = []
+        for kind in ("best", "any"):
+            ranks = [row.first_hit(mode, row.question.best if kind == "best" else None) for row in covered]
+            cells += [f"{count_hits(ranks, k)}/{len(ranks)}" for k in (1, 3)] + [f"{mrr(ranks):.3f}"]
+        lines.append(f"| {mode} | " + " | ".join(cells) + " |")
+    modes = [m for m in ("hybrid", "rewrite") if m in report_modes(rows)]
+    lines += ["", "| Question | Best | Any listed | " + " | ".join(f"First hit {m} (best / any)" for m in modes)
+              + f" | Top 3 ({modes[-1]}) |", "|---|---|---|" + "---|" * (len(modes) + 1)]
+    for row in covered:
+        cells = [f"{row.first_hit(m, row.question.best) or '-'} / {row.first_hit(m) or '-'}" for m in modes]
+        top3 = ", ".join(c.chunk_id for c in row.results[modes[-1]].chunks[:3]) or "(nothing)"
+        best = ", ".join(map(str, sorted(row.question.best)))
+        listed = ", ".join(map(str, sorted(row.question.expected)))
+        lines.append(f"| {row.question.id}: {row.question.question} | {best} | {listed} | " + " | ".join(cells)
+                     + f" | {top3} |")
+    for row in uncovered:
+        top3 = ", ".join(c.chunk_id for c in row.results["hybrid"].chunks[:3]) or "(nothing)"
+        rewrite = f", no_context (rewrite) {row.results['rewrite'].no_context}" if "rewrite" in row.results else ""
+        lines += ["", f"Not covered by the KB: {row.question.id} \"{row.question.question}\": best similarity "
+                      f"{_fmt_similarity(row.best_similarity)}, no_context (hybrid) "
+                      f"{row.results['hybrid'].no_context}{rewrite}; hybrid top 3: {top3}."]
+    if rewrites is not None:
+        lines += ["", "| Held-out question | Rewritten search_query |", "|---|---|"]
+        lines += [f"| {row.question.id} | {rewrites.get(row.question.question) or '(none)'} |" for row in rows]
+    return lines
+
+
 def build_report(
     kb_rows: list[Evaluated],
     off_rows: list[Evaluated],
@@ -454,20 +509,22 @@ def main() -> int:
     try:
         kb_questions = load_questions(KB_QUESTIONS)
         off_questions = load_questions(OFFTOPIC_QUESTIONS)
-        questions = kb_questions + off_questions
+        held_out = load_questions(HOLDOUT_QUESTIONS) if HOLDOUT_QUESTIONS.exists() else []
+        questions = kb_questions + off_questions + held_out
         engine = get_engine()
         info = read_kb_info(engine, settings.embedding_model)
-        print(f"Embedding {len(questions)} questions (one API call each)...")
+        print(f"Embedding {len(questions)} questions (batches of 20 on the patient path)...")
         embedder = embed_questions(questions, get_embedder())
         if args.rewrite:
             from app.agent.understand import Understanding, load_kb_hints
 
             hints = load_kb_hints(engine)
-            print(f"Rewriting {len(questions)} questions with the understand step (paced, about 2.5 minutes)...")
-            rewrites = rewrite_questions(questions, understand_llm(Understanding), hints)
+            print(f"Rewriting {len(questions)} questions with the understand step (paced, about 4.5 s each)...")
+            rewrites = rewrite_questions(questions, offline_understand_llm(Understanding), hints)
             new = [q for q in dict.fromkeys(rewrites.values()) if q and q not in embedder.vectors]
             print(f"Embedding {len(new)} rewritten queries...")
-            embedder.vectors.update({q: get_embedder().embed_query(q) for q in new})
+            if new:
+                embedder.vectors.update(zip(new, get_embedder().embed_queries(new)))
         rows = evaluate(questions, engine, embedder, rewrites)
     except EmbeddingError as exc:
         print(f"Embedding failed, nothing was written.\n{exc}")
@@ -483,29 +540,33 @@ def main() -> int:
         ("Dimensions", str(settings.embedding_dim)),
         ("KB doc_version", info["doc_version"]),
         ("Chunks", f"{info['chunks']} ({info['searchable']} searchable, {policy_chunks} policy)"),
-        ("Questions", f"{len(kb_questions)} KB, {len(off_questions)} off-topic"),
+        ("Questions", f"{len(kb_questions)} KB, {len(off_questions)} off-topic, {len(held_out)} held-out"),
         ("Results per search", str(TOP_K)),
         ("RRF k", str(RRF_K)),
         ("Keyword weight in RRF", f"{KEYWORD_WEIGHT} (vector list = 1)"),
         ("Common-word cutoff", f"query words in more than {COMMON_WORD_RATIO:.0%} of chunks are dropped"),
         ("Relevance threshold", f"{settings.retrieval_min_similarity} (best cosine similarity)"),
     ]
-    split = len(kb_questions)
-    extra = None
+    split, held_from = len(kb_questions), len(kb_questions) + len(off_questions)
+    off_rows, held_rows = rows[split:held_from], rows[held_from:]
+    extra = []
+    if held_rows:
+        extra = ["", "## Held-out questions (T12b, not used for tuning)", "", *holdout_lines(held_rows, rewrites)]
     if rewrites is not None:
         with engine.connect() as conn:
             row_counts = dict(conn.execute(text(
                 "SELECT section_no, count(*) FROM kb_chunks WHERE chunk_type = 'table_row' GROUP BY section_no"
             )).all())
-        setup.append(("Rewrite", f"understand step ({settings.llm_model_main}; then Groq, then fast, 4 s each), "
-                                 "no history; fused = RRF of raw and rewritten hybrid rankings"))
-        extra = [
+        setup.append(("Rewrite", f"understand step ({settings.llm_model_main}; then Groq, then fast; offline "
+                                 "path, 30 s each with retries), no history; fused = RRF of raw and rewritten "
+                                 "hybrid rankings"))
+        extra += [
             "", "## Query rewrite (understand step)", "",
-            *rewrite_lines(rows[:split], rows[split:], rewrites),
+            *rewrite_lines(rows[:split], off_rows, rewrites),
             "", "## Small-to-big (rewrite mode, the agent's 4-chunk context)", "",
             *small_to_big_lines(rows[:split], hints.summaries, row_counts),
         ]
-    report = build_report(rows[:split], rows[split:], setup, settings.retrieval_min_similarity, extra)
+    report = build_report(rows[:split], off_rows, setup, settings.retrieval_min_similarity, extra)
     print(report)
     write_report(REPORT_PATH, report)
     print(f"\nWrote {REPORT_PATH}")

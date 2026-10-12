@@ -141,7 +141,8 @@ def test_listed_city_and_the_search_tool():
     state = run(graph, "Do you install in Kanpur?")
     details = [s["detail"] for s in state["steps"] if s["node"] == "tool"]
     assert details == ["kanpur: listed", "2 chunks: KB Sections 8, 15"]
-    assert search.queries == ["installation process"]
+    # T12b: a question always searches; with no query from the model, the message itself is the query
+    assert search.queries == ["Do you install in Kanpur?", "installation process"]
 
 
 def test_tool_rounds_are_limited():

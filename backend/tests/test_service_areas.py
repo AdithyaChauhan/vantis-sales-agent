@@ -90,3 +90,43 @@ def test_empty_and_punctuation_input():
     assert areas.lookup("").status == "unverified"
     assert areas.lookup("  ").status == "unverified"
     assert areas.lookup("  LUCKNOW! ").match == "exact"
+
+
+# ---------- T12b: one swapped pair of letters ----------
+
+from app.services.service_areas import one_swap_apart  # noqa: E402
+
+TYPO_AREAS = ServiceAreas({"Delhi": ["Delhi NCR"], "Lucknow": ["Uttar Pradesh"], "Jaipur": ["Rajasthan"],
+                           "Gurugram": ["Delhi NCR"], "Kota": ["Rajasthan"]})
+
+
+@pytest.mark.parametrize("typed, city", [("Dehli", "Delhi"), ("dlehi", "Delhi"), ("Jiapur", "Jaipur")])
+def test_one_swapped_pair_of_letters_matches(typed, city):
+    r = TYPO_AREAS.lookup(typed)
+    assert (r.status, r.matched_city, r.match) == ("listed", city, "typo")
+
+
+@pytest.mark.parametrize("typed", ["Raipur", "Pune", "Kanpur", "Kotb", "Ktoa x"])
+def test_one_other_change_is_not_a_typo_match(typed):
+    # Raipur is one letter from Jaipur, and a real city that is not on the list
+    assert TYPO_AREAS.lookup(typed).status == "unverified"
+
+
+def test_aliases_and_fuzzy_matches_come_first():
+    assert TYPO_AREAS.lookup("Gurgaon").match == "alias"
+    assert TYPO_AREAS.lookup("Lucknwo").match == "fuzzy"
+
+
+def test_one_swap_apart_rules():
+    assert one_swap_apart("dehli", "delhi")
+    assert not one_swap_apart("delhi", "delhi")
+    assert not one_swap_apart("kota", "ktoa x")
+    assert not one_swap_apart("ab", "ba")  # too short to trust
+    assert not one_swap_apart("raipur", "jaipur")
+
+
+@needs_pdf
+def test_dehli_is_delhi_with_the_real_kb(kb_areas):
+    r = kb_areas.lookup("Dehli")
+    assert (r.status, r.matched_city) == ("listed", "Delhi")
+    assert kb_areas.lookup("Raipur").status == "unverified"

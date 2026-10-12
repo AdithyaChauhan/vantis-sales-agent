@@ -321,3 +321,32 @@ def test_request_log_says_where_the_ip_came_from_but_never_the_ip(client, monkey
     logged = " ".join(f"{r.getMessage()} {r.__dict__}" for r in caplog.records)
     assert "testclient" not in logged and "203.0.113.7" not in logged
     assert any(r.getMessage() == "chat rate limit reached" and r.limit == "minute" for r in caplog.records)
+
+
+def test_a_failed_lead_write_is_a_friendly_503_and_the_chat_carries_on(client, use_agent, monkeypatch):
+    # T12b: the database fails while create_lead writes (a fake; the real database is never broken)
+    from app.agent.leads import LeadOps
+    from app.api.chat import DB_DOWN_DETAIL
+    from app.leads import service
+    from tests.agent_fakes import tool_call
+    from tests.leads_data import AREAS
+
+    def down(*args, **kwargs):
+        raise OperationalError("INSERT INTO leads", {}, Exception("down"))
+
+    monkeypatch.setattr(service, "create_lead", down)
+    details = {"name": "Rahul Sharma", "phone": "9876543210", "city": "Lucknow", "monthly_bill_inr": "4000"}
+    graph, _ = make_graph(
+        Scripted(understood(["gives_details"], None, **details), understood(["question"], "catalog")),
+        Scripted(tool_call("create_lead", {}), answer("We offer Plan A [KB Section 8: Catalog]."),
+                 answer("We offer Plan A [KB Section 8: Catalog].")),
+        ops=LeadOps(engine=None, areas_fn=lambda: AREAS),
+    )
+    use_agent(graph=graph)
+    session_id = str(uuid.uuid4())
+    failed = post(client, "Rahul Sharma, 9876543210, Lucknow, bill 4000", session_id=session_id)
+    assert failed.status_code == 503
+    assert failed.json()["detail"] == DB_DOWN_DETAIL and "Traceback" not in failed.text
+    assert "saved" not in failed.text.lower()  # never a claim that the lead was saved
+    later = post(client, "What do you offer?", session_id=session_id)
+    assert later.status_code == 200 and later.json()["degraded"] is False

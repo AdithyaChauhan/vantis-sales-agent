@@ -26,8 +26,20 @@ class ServiceAreaResult:
     status: str  # "listed" | "unverified"
     matched_city: str | None
     regions: list[str] = field(default_factory=list)
-    match: str = "none"  # "exact" | "alias" | "fuzzy" | "none"
+    match: str = "none"  # "exact" | "alias" | "fuzzy" | "typo" | "none"
     source: str = SOURCE
+
+
+def one_swap_apart(a: str, b: str) -> bool:
+    """True if b is a with two neighbouring letters swapped ("dehli" / "delhi"), for names of 4+ letters (T12b).
+
+    fuzz.ratio scores such a swap only 80, below the cutoff. Only a swap counts, never any one-letter change:
+    "Raipur" is one letter from "Jaipur", and Raipur is a real city that is not on the list.
+    """
+    if len(a) != len(b) or len(a) < 4 or a == b:
+        return False
+    diff = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+    return len(diff) == 2 and diff[1] == diff[0] + 1 and a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]]
 
 
 def _normalize(text: str) -> str:
@@ -88,7 +100,8 @@ class ServiceAreas:
         return list(self.city_regions)
 
     def lookup(self, city: str, state: str | None = None) -> ServiceAreaResult:
-        """Check a city: exact, then alias, then fuzzy (score >= 85), else unverified.
+        """Check a city: exact, then alias, then fuzzy (score >= 85), then one swapped pair of letters, else
+        unverified.
 
         `state` only narrows the returned regions; it never changes the status.
         """
@@ -106,6 +119,9 @@ class ServiceAreas:
                 target = self._by_key.get(name) or self._by_key.get(_normalize(ALIASES[name]))
                 if target:
                     return self._result(city, target, "fuzzy", state)
+            swapped = next((name for name in self._by_key if one_swap_apart(key, name)), None)
+            if swapped:
+                return self._result(city, self._by_key[swapped], "typo", state)
         return ServiceAreaResult(query=city, status="unverified", matched_city=None)
 
     def _result(self, query: str, city: str, match: str, state: str | None) -> ServiceAreaResult:
