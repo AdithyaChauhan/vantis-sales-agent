@@ -24,8 +24,8 @@ import {
 
 export const DEMO_NOTE = "What the sales team sees; hidden from customers in production.";
 
-/** The "Details collected" rows and the field names that tick each one. */
-const DETAILS = [
+/** The "Details collected" rows and the field names that tick each one (the dashboard reuses them). */
+export const DETAILS = [
   { key: "city", label: "City", Icon: MapPin, fields: ["city"] },
   { key: "need", label: "Need", Icon: House, fields: ["system_size_kw", "requirement"] },
   { key: "bill", label: "Bill", Icon: ReceiptText, fields: ["monthly_bill_inr", "monthly_units_kwh"] },
@@ -66,11 +66,16 @@ function subtitle(lead) {
   return [lead.city, capitalize(lead.customer_type ?? lead.property_type)].filter(Boolean).join(" · ");
 }
 
-function StatusBadge({ status }) {
+/**
+ * The status pill: HOT (flame), WARM (sun) or COLD (snowflake), each in its own colour and always
+ * with the word. `compact`: smaller and without the icon (the dashboard's table and count cards).
+ * The status always comes from the API; the page never works it out from the score.
+ */
+export function StatusBadge({ status, compact = false }) {
   const { Icon, className } = STATUS[status] ?? { Icon: null, className: "badge-other" };
   return (
-    <span className={`badge ${className}`}>
-      {Icon ? <Icon className="badge-icon" aria-hidden="true" /> : null}
+    <span className={`badge ${className}${compact ? " badge-compact" : ""}`}>
+      {Icon && !compact ? <Icon className="badge-icon" aria-hidden="true" /> : null}
       {status}
     </span>
   );

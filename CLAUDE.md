@@ -45,9 +45,10 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - Search the KB: `cd backend && python -m scripts.search_kb "question" [--mode keyword|vector|hybrid]`
 - Retrieval eval: `cd backend && python -m scripts.eval_retrieval`
 - Retrieval eval with the agent's query rewrite (about 32 fast-LLM calls, paced): `cd backend && python -m scripts.eval_retrieval --rewrite`
-- API for local page checks, leads on the Neon test branch (never main): `cd backend && python -m scripts.serve_test_branch`
+- API for local page checks, leads on the Neon test branch (never main): `cd backend && python -m scripts.serve_test_branch` (for the dashboard add a throwaway key: `SALES_API_KEY=any-local-key-of-16-chars python -m scripts.serve_test_branch`)
+- Demo leads on the test branch (8 leads, 2 callbacks, 1 support request; about 8 fast-LLM calls for the reasons; a second run adds nothing; pytest empties these tables, so re-run it after tests): `cd backend && python -m scripts.seed_demo_leads` (`--main` writes to main only after you type "main")
 - Frontend setup: `cd frontend && npm install`
-- Frontend: `cd frontend && npm run dev` (http://localhost:5173; calls the API at `VITE_API_URL`, default http://127.0.0.1:8000)
+- Frontend: `cd frontend && npm run dev` (http://localhost:5173; calls the API at `VITE_API_URL`, default http://127.0.0.1:8000; the sales dashboard is at /leads and /support and asks for the sales API key)
 - Frontend tests: `cd frontend && npm test`
 - Frontend build: `cd frontend && npm run build`
 - Docker image (repo root, Docker Desktop running): `docker build -t vantis-api .`

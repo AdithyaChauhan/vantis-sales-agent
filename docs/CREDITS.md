@@ -20,3 +20,4 @@ Third-party material used in the project, with its licence.
 ## Design reference
 
 - `docs/design/chat-design.png`, the visual reference for the chat page redesign (T10c), was made with Google Gemini.
+- `docs/design/dashboard-design.png`, the visual reference for the sales dashboard (T11), was made with ChatGPT. Its sample leads and numbers are illustrations only (some break the scoring rules, e.g. 76 shown as WARM); the dashboard always shows the API's real scores and statuses.

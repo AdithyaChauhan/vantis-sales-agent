@@ -17,7 +17,7 @@ TimelineBucket = Literal["lt_1m", "1_3m", "3_6m", "gt_6m"]
 IntentLevel = Literal["ready", "interested", "exploring"]
 LeadStatus = Literal["HOT", "WARM", "COLD"]
 LocationStatus = Literal["listed", "unverified", "unknown"]
-Channel = Literal["web", "whatsapp"]
+Channel = Literal["web", "whatsapp", "demo"]  # demo: rows from scripts/seed_demo_leads.py
 
 # KB Section 2: homes are residential; shops, offices, clinics and warehouses are small commercial.
 CUSTOMER_TYPE_OF = {

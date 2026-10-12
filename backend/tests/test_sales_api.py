@@ -17,8 +17,11 @@ from tests.test_answer import FakeLLM
 
 KEY = "test-sales-key-0123456789"
 REASON = "Ready buyer with a clear 5 kW requirement and full contact details."
-LIST_FIELDS = {"id", "name", "lead_score", "lead_status", "city", "location_status", "requirement",
-               "system_size_kw", "monthly_bill_inr", "recommended_action", "created_at"}
+LIST_FIELDS = {"id", "name", "customer_type", "property_type", "lead_score", "lead_status", "city",
+               "location_status", "requirement", "system_size_kw", "monthly_bill_inr", "recommended_action",
+               "source_channel", "created_at"}
+# Unlisted in AREAS, so the city check caps it: raw 82 -> 74 WARM
+SANA_PUNE = {**RAHUL, "name": "Sana Khan", "phone": "9000000005", "email": "sana.khan@example.com", "city": "Pune"}
 
 
 @pytest.fixture
@@ -65,6 +68,7 @@ def test_list_shows_the_dashboard_fields_newest_first(api, db, llm):
     assert set(body["items"][1]) == LIST_FIELDS  # no phone, email or session_id in the list
     item = body["items"][1]
     assert (item["name"], item["lead_score"], item["lead_status"], item["city"]) == ("Rahul Sharma", 97, "HOT", "Lucknow")
+    assert (item["customer_type"], item["property_type"], item["source_channel"]) == ("residential", "house", "web")
     assert item["recommended_action"] == rahul.recommended_action
 
 
@@ -73,7 +77,8 @@ def test_list_filters_sorts_and_pages(api, db, llm):
     explorer = add_lead(db, llm, EXPLORER)  # COLD 36
     hot = api.get("/api/leads", params={"status": "HOT"}).json()
     assert (hot["total"], [i["id"] for i in hot["items"]]) == (1, [rahul.id])
-    assert api.get("/api/leads", params={"status": "WARM"}).json() == {"items": [], "total": 0, "limit": 50, "offset": 0}
+    assert api.get("/api/leads", params={"status": "WARM"}).json() == {
+        "items": [], "total": 0, "limit": 50, "offset": 0, "counts": {"HOT": 1, "WARM": 0, "COLD": 1}}
     by_score = api.get("/api/leads", params={"sort": "score"}).json()
     assert [i["lead_score"] for i in by_score["items"]] == [97, 36]
     first = api.get("/api/leads", params={"limit": 1}).json()
@@ -82,10 +87,48 @@ def test_list_filters_sorts_and_pages(api, db, llm):
     assert first["total"] == second["total"] == 2
 
 
+def test_counts_cover_the_whole_table_whatever_the_filter_search_or_page(api, db, llm):
+    add_lead(db, llm, RAHUL)  # HOT 97
+    add_lead(db, llm, EXPLORER)  # COLD 36
+    add_lead(db, llm, SANA_PUNE)  # WARM 74 (capped)
+    everything = {"HOT": 1, "WARM": 1, "COLD": 1}
+    for params, total in (({"limit": 1}, 3), ({"status": "HOT"}, 1), ({"q": "nobody"}, 0), ({"offset": 2}, 3)):
+        body = api.get("/api/leads", params=params).json()
+        assert (body["counts"], body["total"]) == (everything, total), params
+
+
+def test_search_matches_a_name_or_city_in_any_case(api, db, llm):
+    rahul = add_lead(db, llm, RAHUL)
+    gurgaon = add_lead(db, llm, {**EXPLORER, "city": "Gurgaon"})  # stored as Gurugram; city_input keeps Gurgaon
+    assert gurgaon.city == "Gurugram"
+
+    def found(q):
+        return [item["id"] for item in api.get("/api/leads", params={"q": q}).json()["items"]]
+
+    assert found("rahul") == found("SHARMA") == found("luck") == [rahul.id]
+    assert found("gurgaon") == found("gurugram") == [gurgaon.id]
+    assert found("  ") == [gurgaon.id, rahul.id]  # blank: no search
+    assert found("%") == found("_") == found("\\") == []  # LIKE wildcards are plain text, not "anything"
+
+
+def test_search_status_sort_and_paging_work_together_on_the_server(api, db, llm):
+    add_lead(db, llm, RAHUL)  # HOT 97 in Lucknow: not a Kanpur match
+    arjun = add_lead(db, llm, {**RAHUL, "name": "Arjun Mehta", "phone": "9000000002", "city": "Kanpur",
+                                "timeline_bucket": "1_3m"})  # HOT 92
+    karan = add_lead(db, llm, {**RAHUL, "name": "Karan Malhotra", "phone": "9000000008", "city": "Kanpur",
+                                "intent_level": "interested"})  # HOT 87
+    add_lead(db, llm, EXPLORER)  # COLD in Kanpur: filtered out by status
+    params = {"q": "kanpur", "status": "HOT", "sort": "score", "limit": 1}
+    first = api.get("/api/leads", params=params).json()
+    second = api.get("/api/leads", params={**params, "offset": 1}).json()
+    assert [(i["id"], i["lead_score"]) for i in first["items"] + second["items"]] == [(arjun.id, 92), (karan.id, 87)]
+    assert first["total"] == second["total"] == 2
+
+
 @pytest.mark.parametrize(
     "params, field",
     [({"status": "LUKEWARM"}, "status"), ({"sort": "name"}, "sort"), ({"limit": 0}, "limit"),
-     ({"limit": 201}, "limit"), ({"offset": -1}, "offset")],
+     ({"limit": 201}, "limit"), ({"offset": -1}, "offset"), ({"q": "x" * 101}, "q")],
 )
 def test_bad_list_parameters_are_422_with_a_message(api, params, field):
     response = api.get("/api/leads", params=params)

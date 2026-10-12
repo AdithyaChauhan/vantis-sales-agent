@@ -43,6 +43,7 @@
   --nav-bg: #fff0e2;
   --nav-text: #101b3f;
   --nav-icon: #c2410c;
+  --nav-hover: #f7efe6;
   --score-bg: linear-gradient(135deg, #fff8ec, #fef2e4);
   --score-text: #101b3f;
   --bar-1: #fec259;
@@ -66,6 +67,14 @@
   --danger-bg: #fdecec;
   --danger-text: #b42318;
   --photo-filter: none;
+  --scroll-thumb: #8590a6; /* 3.06-3.21:1 on the page, card and panel */
+  /* Dashboard (T11): table rows, the selected row's outline (3.2:1 or more), the next-action box */
+  --row-hover: #fdfaf6;
+  --row-selected: #fff7ee;
+  --select-border: #dc6a1c;
+  --next-bg: #fff6ea;
+  --next-border: #f6dcbd;
+  --chip-on: #fde4c8; /* the active filter chip and the dashboard's current section */
 
   --sidebar-w: 7.25rem;
   --sales-w: 27.5rem;
@@ -111,6 +120,7 @@
     --nav-bg: #2a2117;
     --nav-text: #eef1f8;
     --nav-icon: #fb923c;
+    --nav-hover: #1e2537;
     --score-bg: #221c17;
     --score-text: #eef1f8;
     --bar-track: #3a2c20;
@@ -126,6 +136,13 @@
     --danger-bg: #3a1d1b;
     --danger-text: #f19189;
     --photo-filter: brightness(0.72) saturate(0.85);
+    --scroll-thumb: #66718c; /* 3.33-3.80:1 on the dark page, card and panel */
+    --row-hover: #1a2234;
+    --row-selected: #241d18;
+    --select-border: #fb923c;
+    --next-bg: #2a2117;
+    --next-border: #40301f;
+    --chip-on: #3a2a17;
   }
 
 
@@ -139,6 +156,16 @@
 
 html {
   font-size: clamp(1rem, 0.75rem + 0.3125vw, 1.125rem);
+}
+
+/* Desktop: the smaller of a width-based and a height-based size. Both give 16 px at 1280 wide or
+   720 tall and 18 px at 1920 wide or 1080 tall, so a short window (a laptop with the browser's bars,
+   e.g. 1366x650) scales the page down slightly instead of cutting off the sales card. Phones keep the
+   rule above. */
+@media (min-width: 900px) {
+  html {
+    font-size: clamp(0.875rem, min(0.75rem + 0.3125vw, 0.75rem + 0.5556vh), 1.125rem);
+  }
 }
 
 html,
@@ -201,6 +228,23 @@ textarea {
   display: flex;
   flex-direction: column;
   height: 100dvh;
+}
+
+/* Desktop is an app shell: only the chat and the sales card scroll. Below 560 px tall the page itself
+   scrolls rather than squeezing them to nothing (phones keep the plain 100dvh, so the composer stays
+   pinned). */
+@media (min-width: 900px) {
+  .app {
+    min-height: 560px;
+  }
+}
+
+/* Thin scrollbars in the theme's colours */
+.transcript,
+.sales-panel,
+.strip-body {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
 }
 
 .frame {
@@ -380,6 +424,41 @@ textarea {
   margin-top: 0.75rem;
 }
 
+/* ---------- Page not found (any unknown path) ---------- */
+
+.not-found {
+  display: grid;
+  place-items: center;
+  min-height: 100dvh;
+  padding: 1rem;
+}
+
+.not-found-card {
+  width: min(100%, 26rem);
+  padding: 1.6rem;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-card);
+  background: var(--card);
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+.not-found-card h1 {
+  font-size: 1.4rem;
+  font-weight: 800;
+}
+
+.not-found-card p {
+  margin: 0.4rem 0 1.1rem;
+  color: var(--text-2);
+}
+
+.btn-not-found {
+  min-height: 2.5rem;
+  padding: 0 1.2rem;
+  text-decoration: none;
+}
+
 /* ---------- Sidebar ---------- */
 
 .sidebar {
@@ -392,8 +471,10 @@ textarea {
 }
 
 .nav {
-  list-style: none;
+  display: grid;
+  gap: 0.35rem;
   padding: 0 0.6rem;
+  list-style: none;
 }
 
 .nav-item {
@@ -414,6 +495,26 @@ textarea {
   height: 1.2rem;
   color: var(--nav-icon);
   fill: var(--nav-icon);
+}
+
+/* Links to the other sections (the current one is the peach marker above): no pill, outline icon */
+.nav-link {
+  background: transparent;
+  color: var(--text);
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.25;
+  text-decoration: none;
+}
+
+.nav-link .nav-icon {
+  flex: none;
+  color: var(--text-2);
+  fill: none;
+}
+
+.nav-link:hover {
+  background: var(--nav-hover);
 }
 
 .sidebar-photo {
@@ -440,6 +541,9 @@ textarea {
 }
 
 .transcript {
+  /* relative: the screen-reader-only texts inside (position: absolute) then belong to this scroll box;
+     without it they stick out of it and make the whole page scroll */
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -846,6 +950,7 @@ textarea {
 /* ---------- Sales view (demo) ---------- */
 
 .sales-panel {
+  position: relative; /* keeps the checklist's screen-reader texts inside this scroll box */
   grid-area: sales;
   min-height: 0;
   margin-left: var(--gap);
@@ -1184,6 +1289,7 @@ textarea {
 }
 
 .strip-body {
+  position: relative; /* same reason as .transcript */
   max-height: 60dvh;
   overflow-y: auto;
   padding: 0 0.75rem 0.75rem;
@@ -1297,6 +1403,37 @@ textarea {
 
   .topbar {
     padding-left: 0.25rem;
+  }
+}
+
+/* ---------- Short desktop windows (below 720 px tall): a little less vertical space ----------
+   With the smaller root above, the sales card still needs about 3.5rem more than a 650 px tall window
+   has, so the header, the card's gaps and the checklist rows tighten slightly; nothing is hidden. */
+
+@media (min-width: 900px) and (max-height: 719px) {
+  .frame {
+    --frame-bottom: 0.7rem;
+  }
+
+  .topbar {
+    min-height: 3.85rem;
+  }
+
+  .lead-card {
+    gap: 0.45rem;
+    padding: 0.8rem 0.9rem;
+  }
+
+  .lead-panel {
+    padding-block: 0.65rem;
+  }
+
+  .score {
+    margin-top: 0.55rem;
+  }
+
+  .checklist li {
+    min-height: 1.75rem;
   }
 }
 

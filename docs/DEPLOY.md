@@ -167,6 +167,7 @@ For trying the page on your laptop. Leads, callbacks and support requests go to 
    cd frontend && npm install && npm run dev
    ```
    Then open <http://localhost:5173>. The page calls `http://127.0.0.1:8000` unless `VITE_API_URL` says otherwise (`cp .env.example .env.local`).
+   The sales dashboard (T11) is at <http://localhost:5173/leads>: enter the throwaway key from step 1. For demo data run `python -m scripts.seed_demo_leads` (test branch) once; the backend tests empty those tables, so run it again after them.
 3. Phone width: Edge or Chrome DevTools (F12) → device toolbar (Ctrl+Shift+M) → **Responsive**, width 400. Dark mode: DevTools → **⋮** → More tools → **Rendering** → "Emulate CSS media feature prefers-color-scheme: dark".
 
 Use `127.0.0.1`, not `localhost`, for the API. uvicorn listens on IPv4 only, and `localhost` can resolve to IPv6 `::1` first; on this laptop a Docker/WSL relay listens on port 8000 there and answers 404. The plain `uvicorn app.main:app --port 8000` writes chat leads to **main**: use it only when that is what you want.
@@ -175,4 +176,5 @@ Use `127.0.0.1`, not `localhost`, for the API. uvicorn listens on IPv4 only, and
 
 - Set `VITE_API_URL` to the Render URL. A trailing slash is fine (the page removes it). Vite reads it at build time, so a change needs a redeploy.
 - Add the Vercel URL to `CORS_ORIGINS` on Render (and in `render.yaml`), or the browser blocks every call.
+- Deep links (T11): the page routes `/leads`, `/leads/<id>` and `/support` in the browser, so Vercel must serve `index.html` for every path. Add `frontend/vercel.json` with `{"rewrites": [{"source": "/(.*)", "destination": "/index.html"}]}`; without it a reload or a shared link to `/leads/12` returns 404. Check: open `<vercel-url>/leads/1` directly.
 - The first visit after Render's service sleeps waits about 30 seconds. The page shows "Waking up the server" after 3 seconds, and the first chat answer can take about 20 seconds.

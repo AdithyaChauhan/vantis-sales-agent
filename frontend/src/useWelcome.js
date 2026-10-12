@@ -4,6 +4,7 @@ import { getWelcome } from "./api.js";
 
 // No welcome after this long: the server is probably asleep (Render's free plan), so say so.
 export const WAKE_NOTICE_AFTER_MS = 3000;
+export const WAKE_NOTICE = "Waking up the server. This can take up to a minute.";
 
 const LOADING = { status: "loading", slow: false, welcome: null };
 

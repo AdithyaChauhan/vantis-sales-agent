@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.runnables import Runnable
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 CALLBACK_MESSAGE = "Callback request logged; the team will confirm."
 STATUSES = ("HOT", "WARM", "COLD")
-CHANNELS = ("web", "whatsapp")
+CHANNELS = ("web", "whatsapp", "demo")  # demo: scripts/seed_demo_leads.py
 SORTS = ("newest", "score")
 MAX_LIMIT = 200
 PREFERRED_TIME_CHARS = 200
@@ -251,23 +251,38 @@ def get_lead(engine: Engine, lead_id: int) -> LeadView | None:
         return LeadView.model_validate(row) if row else None
 
 
+def _matches(search: str):
+    """Name, matched city or the customer's own city words containing `search`, in any case.
+
+    The text is matched as typed: % and _ (LIKE wildcards) and the escape character are escaped.
+    """
+    escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
+    return or_(*(column.ilike(pattern, escape="\\") for column in (Lead.name, Lead.city, Lead.city_input)))
+
+
 def list_leads(
     engine: Engine,
     status: str | None = None,
     sort: str = "newest",
     limit: int = 50,
     offset: int = 0,
+    search: str | None = None,
 ) -> tuple[list[LeadView], int]:
-    """(leads, total). Filter by status (HOT, WARM, COLD); sort by 'newest' or 'score' (highest first)."""
+    """(leads, total). Filter by status (HOT, WARM, COLD) and by `search` in the name or city (any
+    case); sort by 'newest' or 'score' (highest first). total counts every match, not just this page."""
     if status is not None and status not in STATUSES:
         raise ValueError(f"status must be one of {STATUSES}")
     if sort not in SORTS:
         raise ValueError(f"sort must be one of {SORTS}")
     limit, offset = max(1, min(limit, MAX_LIMIT)), max(0, offset)
-    query = select(Lead)
-    count = select(func.count()).select_from(Lead)
+    filters = []
     if status:
-        query, count = query.where(Lead.lead_status == status), count.where(Lead.lead_status == status)
+        filters.append(Lead.lead_status == status)
+    if search and search.strip():
+        filters.append(_matches(search.strip()))
+    query = select(Lead).where(*filters)
+    count = select(func.count()).select_from(Lead).where(*filters)
     if sort == "score":
         order = (Lead.lead_score.desc(), Lead.created_at.desc(), Lead.id.desc())
     else:
@@ -275,6 +290,18 @@ def list_leads(
     with Session(engine) as session:
         rows = session.scalars(query.order_by(*order).limit(limit).offset(offset)).all()
         return [LeadView.model_validate(r) for r in rows], int(session.scalar(count))
+
+
+def lead_counts(engine: Engine) -> dict[str, int]:
+    """Leads per status in the whole table, e.g. {"HOT": 4, "WARM": 5, "COLD": 3} (one GROUP BY).
+
+    The dashboard's count cards use it, so they stay right however many pages the list has.
+    """
+    with Session(engine) as session:
+        rows = session.execute(select(Lead.lead_status, func.count()).group_by(Lead.lead_status)).all()
+    counts = dict.fromkeys(STATUSES, 0)
+    counts.update({status: int(n) for status, n in rows if status in counts})
+    return counts
 
 
 def schedule_callback(

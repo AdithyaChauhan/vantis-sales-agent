@@ -2,14 +2,14 @@
 
 Short map of how the code is built. Updated at the end of each task. See `docs/PLAN.md` for the full design.
 
-## Backend modules (as of T10)
+## Backend modules (as of T11)
 | Module | Role |
 |---|---|
 | `app/main.py` | FastAPI app, startup hook (`init_db`), request-id + logging middleware (skips `QUIET_PATHS`: `/api/health/live`; adds `ip_source` for rate-limited requests, never the IP), error handlers (`ApiError`, 422 with one message per field, database down → 503), CORS (GET/POST; `Content-Type`, `X-API-Key`, `X-Request-ID`; exposes `Retry-After`), routers |
 | `app/core/config.py` | `Settings` (pydantic-settings, reads `backend/.env`), `get_settings()` |
 | `app/core/rate_limit.py` | `RateLimiter(limits)`: in-memory fixed windows per key, thread-safe; `hit()` counts or returns the seconds to wait (a refused request is not counted), `blocked()` only checks |
 | `app/api/security.py` | `client_ip` (the `CLIENT_IP_HEADER` value if it is one valid IP, else the connection address; never `X-Forwarded-For`), `limit_key` (IPv6 per /64), `chat_rate_limit` (10/min + 100/day per IP → 429 + Retry-After), `require_sales_key` (`X-API-Key`, constant-time, fails closed, 10 wrong keys per 15 min per IP → 429), `ApiError` + `error_response` (the JSON error shape) |
-| `app/api/sales.py` | Sales router (key required): `GET /api/leads`, `GET /api/leads/{id}`, `POST /api/leads`, `POST /api/callback`, `GET /api/support-requests`, all through `app/leads/service.py`; never returns `session_id` |
+| `app/api/sales.py` | Sales router (key required): `GET /api/leads`, `GET /api/leads/{id}`, `POST /api/leads`, `POST /api/callback`, `GET /api/support-requests`, all through `app/leads/service.py`; never returns `session_id`. T11: `GET /api/leads` also takes `q` (name or city) and returns `counts` (leads per status in the whole table); its items carry `customer_type`, `property_type` and `source_channel` |
 | `app/core/logging.py` | JSON log formatter, `request_id_var` |
 | `app/core/db.py` | `Base`, `get_engine()` (Neon, pre-ping), `check_db()`, `init_db(engine)` (pgvector + `create_all`) |
 | `app/core/llm.py` | `embedder()` and `query_embedder()` (google-genai, one Content per text, batches of 20, LRU cache for queries). `GeminiChat`: adds its `request_http` (default 15 s, 1 retry, none on 429) to every Gemini request. `chat_llm(model, tools=, schema=)`: Gemini with a Groq fallback, built separately for plain, tool-bound and structured-output use (Groq: `parallel_tool_calls=False`). `understand_llm(schema)` (T10b): main, then fast, then Groq, one attempt each, every one cut off after 5 s by `with_deadline` (8-worker thread pool; Gemini's HTTP timeout is 10 s, its minimum). `main_llm()`, `fast_llm()`, `invoke_llm()`, `provider_of()`, `reply_text()` |
@@ -36,11 +36,12 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/leads/scoring.py` | `score_lead` (rubric, caps at WARM and 74, breakdown JSON), `status_for`, `recommended_action`, `missing_for_creation` |
 | `app/leads/reason.py` | `write_reason`: one sentence from `fast_llm` (breakdown only, no personal details or money), template fallback |
 | `app/leads/models.py` | `Lead` (`leads`), `Callback` (`callbacks`, status `requested`), `SupportRequest` (`support_requests`) |
-| `app/leads/service.py` | `create_lead` (refuses until the minimum fields, one lead per session), `update_lead` (merge, re-locate, re-score), `get_lead`, `list_leads`, `schedule_callback`, `create_support_request`, `list_support_requests`; logs ids, status and score only |
+| `app/leads/service.py` | `create_lead` (refuses until the minimum fields, one lead per session; channel `web`, `whatsapp` or `demo`), `update_lead` (merge, re-locate, re-score), `get_lead`, `list_leads` (status, `search` in the name, city or the customer's city words with LIKE wildcards escaped, sort, paging), `lead_counts` (one GROUP BY), `schedule_callback`, `create_support_request`, `list_support_requests`; logs ids, status and score only |
 | `app/services/service_areas.py` | `ServiceAreas.lookup(city, state)`: alias map + rapidfuzz (score 85); loads from the `service_areas` table (`get_service_areas()`, cached) |
 | `scripts/list_models.py` | Lists Gemini chat and embedding models for the key |
 | `scripts/search_kb.py` | Prints the mode, `no_context` and the top chunks with scores and ranks |
 | `scripts/serve_test_branch.py` | Dev only: runs the API on 127.0.0.1:8000 with the chat agent's lead writes and the sales API (`leads_engine`) on `TEST_DATABASE_URL`; KB and service areas read from main; chat memory in the process (`InMemorySaver`). `engine_for_test_branch` refuses an empty or same-as-main URL |
+| `scripts/seed_demo_leads.py` | T11: 8 demo leads (source_channel `demo`) through `service.create_lead`, 2 callbacks and 1 support request, clearly fake contacts; skips what is already there; test branch by default (`engine_for_test_branch`), `--main` only after "main" is typed |
 | `scripts/eval_retrieval.py` | Embeds the 24 KB and 8 off-topic questions once, runs `search()` in all three modes (k = 10), prints hit@1, hit@3, MRR, the misses and the gate results, and writes `docs/EVAL.md` (its "Tuning notes" section is hand-written and kept). `--rewrite` adds the understand step's rewritten query (`rewrite` and `fused` modes) and the small-to-big report |
 
 ## Request flow
@@ -170,26 +171,39 @@ flowchart TD
   finalize -.-> memory
 ```
 
-## Chat page (T10, redesigned in T10c, `frontend/`)
-React 19 + Vite 8, plain JavaScript and CSS, lucide-react icons, Plus Jakarta Sans (self-hosted). Behaviour and design: PLAN.md part 3.14; credits: `docs/CREDITS.md`.
+## Frontend: chat page and sales dashboard (T10, T10c, T11, `frontend/`)
+React 19 + Vite 8, plain JavaScript and CSS, lucide-react icons, Plus Jakarta Sans (self-hosted), no router package. Behaviour and design: PLAN.md parts 3.14 (chat) and 3.15 (dashboard); credits: `docs/CREDITS.md`.
 
 | Module | Role |
 |---|---|
-| `src/api.js` | `apiUrl(path)` (VITE_API_URL, trailing slashes removed, default `http://127.0.0.1:8000`), `getWelcome()`, `postChat({message, sessionId})`, `ApiError` (`rate_limit` / `invalid` / `server` / `network`), `errorFrom` (429 → `detail` + `retry_after` or the `Retry-After` header; 422 → first field message; else a generic message); 90 s timeout |
-| `src/storage.js` | `loadChat` / `saveChat` / `clearChat`: session id, transcript and lead in sessionStorage; `loadSalesView` / `saveSalesView`: the Sales view switch in localStorage (on by default); never throws |
+| `src/main.jsx`, `src/App.jsx`, `src/router.jsx` | The entry (`styles.css` first, so a page's own CSS can adjust it); the router: `/` chat, `/leads`, `/leads/<id>`, `/support`, else "Page not found", and the tab's title; `usePath()` (`useSyncExternalStore`), `navigate()` (History API), `<Link>` (a real link; plain left clicks stay in the app) |
+| `src/api.js` | `apiUrl(path)` (VITE_API_URL, trailing slashes removed, default `http://127.0.0.1:8000`), `getWelcome()`, `postChat({message, sessionId})`, `ApiError` (`rate_limit` / `invalid` / `unauthorized` / `not_found` / `server` / `network`, plus the API's `detail`), `errorFrom` (429 → `detail` + `retry_after` or the `Retry-After` header; 422 → first field message; else a generic message); T11: `getLeads`, `getLead`, `getSupportRequests` (the sales key in `X-API-Key`, never in the URL; the answer's shape checked); 90 s timeout |
+| `src/storage.js` | `loadChat` / `saveChat` / `clearChat`: session id, transcript and lead in sessionStorage; `loadSalesView` / `saveSalesView`: the Sales view switch in localStorage (on by default); T11: `loadSalesKey` / `saveSalesKey` / `clearSalesKey`: the sales key in sessionStorage only; never throws |
 | `src/useChat.js` | The conversation hook: messages, lead, session id, draft, `pending` / `slow` (8 s), `notice`, `waitLeft` (429 countdown), `send(text)` (one at a time; on failure the text goes back into the draft; each new message gets an `at` time), `newChat()` |
 | `src/useWelcome.js` | `GET /api/welcome` once; `slow` after 3 s (the waking-up notice), `retry()` after an error |
-| `src/App.jsx` | The frame grid (header, sidebar, chat card, sales card; no sidebar below 1100 px; phone strip below 900 px), `useSalesView`, welcome + starters, typing indicator, screen-reader announcer |
-| `src/components/Header.jsx`, `Sidebar.jsx`, `Logo.jsx` | Brand, Sales view switch (`role="switch"`), New chat; the sections nav (only "Chat", the current page) and the rooftop photo (CSS background); the sun-and-horizon mark (`Logo`, and `SunMark` for the assistant avatar) |
+| `src/ChatPage.jsx`, `src/useWideScreen.js` | The chat page (was `App.jsx` until T11): the frame grid (header, sidebar, chat card, sales card; no sidebar below 1100 px; phone strip below 900 px), `useSalesView`, welcome + starters, typing indicator, screen-reader announcer; the 900 px media query as a hook |
+| `src/components/Header.jsx`, `Sidebar.jsx`, `Logo.jsx` | Brand, Sales view switch (`role="switch"`), New chat; `Sidebar` (`current`, `staff`, `brand`) and `SectionNav`: Chat, and Leads and Support requests only with `staff` (the chat page passes the Sales view switch), the current one a marker, the others links; the rooftop photo (CSS background); the sun-and-horizon mark (`Logo`, and `SunMark` for the assistant avatar) |
 | `src/components/ReplyText.jsx` | Reply text as React text nodes: paragraphs, lists (`<ol start>`), "# " headings, bold and italics with stray asterisks dropped (underscores kept), `[KB Section N: Title]` → a quiet "KB N" tag |
 | `src/components/SourceChips.jsx`, `StepsPanel.jsx`, `Message.jsx` | Source pills (`<details>`: book icon, "KB 8 · title", snippet on open); "How I answered · N steps · X s" (`<details>`, the bubble's footer: label, detail, time in seconds); one message with its avatar and `<time>` |
-| `src/components/LeadCard.jsx` | "Sales view (demo)": name, "City · type", status badge and score (only when sent), saved or not, "Details collected" (`checklist(lead)` from `known_fields`), still needed / would add points, callback; designed empty state |
+| `src/components/LeadCard.jsx` | "Sales view (demo)": name, "City · type", status badge and score (only when sent), saved or not, "Details collected" (`checklist(lead)` from `known_fields`), still needed / would add points, callback; designed empty state. Exports `StatusBadge` (`compact`: no icon) and `DETAILS` for the dashboard |
 | `src/components/Composer.jsx` | Textarea (Enter sends, Shift+Enter new line, 1,000 characters), Send / "Wait N s" |
-| `src/*.test.js(x)` | Vitest + Testing Library, `fetch` stubbed (`src/test-utils.js`) |
+| `src/dashboard/Dashboard.jsx`, `UnlockCard.jsx` | T11: the staff shell (wide sidebar, header with search, Refresh, Lock; tabs below 1280 px) and the unlock gate; Lock and any 401 forget the key; `unlockMessage` (401, 429 with the wait, 503 in the API's words) |
+| `src/dashboard/LeadsView.jsx`, `LeadTable.jsx`, `LeadDetail.jsx`, `SupportView.jsx` | Count cards (API `counts`), status chips, the table (desktop) or cards (phone), Load more, the selected lead (score breakdown and caps, reason, full action, contact, callbacks, details collected), support requests; loading, empty and error states |
+| `src/dashboard/useSalesData.js`, `format.js`, `dashboard.css` | Paged lists (stale answers dropped, 401 → unlock), the lead detail, `useSlow` (3 s waking notice), `useDebounced`; pure text helpers (one-line requirement, first sentence, "2 h ago", phone format); the dashboard's styles on the shared tokens |
+| `src/*.test.js(x)`, `src/contrast.test.js` | Vitest + Testing Library, `fetch` stubbed (`src/test-utils.js`: chat and sales routes, lead fixtures); the contrast of every colour pair in light and dark, read from `styles.css` |
 
 ```mermaid
 flowchart LR
-  page["App.jsx"] --> welcome["useWelcome"]
+  router["App.jsx: router"] -->|"/"| page["ChatPage.jsx"]
+  router -->|"/leads, /leads/id, /support"| dash["dashboard/Dashboard.jsx"]
+  dash -->|"no key"| unlock["UnlockCard: GET /api/leads?limit=1"]
+  dash --> leads["LeadsView: counts, chips, table, detail"]
+  dash --> support["SupportView"]
+  leads -->|"GET /api/leads?status, q, sort, offset + X-API-Key"| api
+  leads -->|"GET /api/leads/id"| api
+  support -->|"GET /api/support-requests"| api
+  keystore[("sessionStorage: sales key")] <--> dash
+  page --> welcome["useWelcome"]
   page --> chat["useChat"]
   welcome -->|"GET /api/welcome (3 s: waking-up notice)"| api["api.js: apiUrl, ApiError"]
   chat -->|"POST /api/chat {message, session_id}"| api

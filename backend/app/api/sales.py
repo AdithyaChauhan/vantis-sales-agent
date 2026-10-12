@@ -57,12 +57,14 @@ def get_lead_areas() -> ServiceAreas | None:
 
 
 class LeadListItem(BaseModel):
-    """One row of the dashboard's lead table."""
+    """One row of the dashboard's lead table (phone and email only in the detail)."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     name: str | None
+    customer_type: str | None
+    property_type: str | None
     lead_score: int
     lead_status: str
     city: str | None
@@ -71,7 +73,16 @@ class LeadListItem(BaseModel):
     system_size_kw: float | None
     monthly_bill_inr: int | None
     recommended_action: str
+    source_channel: str
     created_at: datetime
+
+
+class LeadCounts(BaseModel):
+    """Leads per status in the whole table (the dashboard's count cards); ignores status and q."""
+
+    HOT: int
+    WARM: int
+    COLD: int
 
 
 class LeadList(BaseModel):
@@ -79,6 +90,7 @@ class LeadList(BaseModel):
     total: int
     limit: int
     offset: int
+    counts: LeadCounts
 
 
 class LeadDetail(LeadView):
@@ -123,13 +135,17 @@ class SupportRequestList(BaseModel):
 def list_leads(
     status: Literal["HOT", "WARM", "COLD"] | None = None,
     sort: Literal["newest", "score"] = "newest",
+    q: str | None = Query(None, max_length=100, description="Part of a name or city, in any case"),
     limit: int = Query(50, ge=1, le=service.MAX_LIMIT),
     offset: int = Query(0, ge=0),
     engine: Engine = Depends(leads_engine),
 ):
-    """Leads for the dashboard, newest first (or highest score first), optionally one status."""
-    items, total = service.list_leads(engine, status=status, sort=sort, limit=limit, offset=offset)
-    return {"items": items, "total": total, "limit": limit, "offset": offset}
+    """Leads for the dashboard, newest first (or highest score first), optionally one status and a
+    search in the name or city. `total` counts every match; `counts` has the leads per status in the
+    whole table (for the count cards), whatever the filter, search or page."""
+    items, total = service.list_leads(engine, status=status, sort=sort, limit=limit, offset=offset, search=q)
+    counts = service.lead_counts(engine)
+    return {"items": items, "total": total, "limit": limit, "offset": offset, "counts": counts}
 
 
 @router.get("/leads/{lead_id}", response_model=LeadDetail)

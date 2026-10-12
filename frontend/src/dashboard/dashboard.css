@@ -1,0 +1,1160 @@
+/* Sales dashboard (T11), after docs/design/dashboard-design.png (a reference made with ChatGPT).
+   Reuses styles.css: the colour tokens (light and dark), the font and rem scale, buttons, badges, the
+   sidebar and its nav, the score bar, the checklist rows, the skeleton and the waking-up notice.
+   Desktop is an app shell: only the leads table and the detail panel scroll. Phones scroll the page. */
+
+/* ---------- Shell: the wide sidebar (brand, sections, photo) | main ---------- */
+
+.dash {
+  --dash-sidebar-w: 14rem;
+  --detail-w: 22rem;
+  display: grid;
+  grid-template-columns: var(--dash-sidebar-w) minmax(0, 1fr);
+  grid-template-areas: "side main";
+  width: 100%;
+  max-width: 88rem;
+  height: 100dvh;
+  margin: 0 auto;
+}
+
+@media (min-width: 900px) {
+  .dash {
+    min-height: 560px; /* below this the page scrolls instead of squeezing the table to nothing */
+  }
+}
+
+.sidebar-wide {
+  margin-bottom: 0;
+  padding-top: 1.15rem;
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 1.35rem;
+  padding: 0 0.4rem 0 0.8rem;
+}
+
+.sidebar-logo {
+  flex: none;
+  width: 2rem;
+  height: auto;
+  color: var(--text);
+}
+
+.sidebar-brand-name {
+  font-size: 0.875rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.sidebar-wide .brand-sub {
+  font-size: 0.78rem;
+}
+
+.sidebar-wide .nav {
+  padding: 0 0.8rem;
+}
+
+.sidebar-wide .nav-item {
+  min-height: 2.75rem;
+}
+
+.sidebar-wide .nav-link {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+/* The current section stands out more here than on the chat page: the page's peach glow is
+   lighter at this height, so the usual pill would almost vanish */
+.sidebar-wide .nav-item[aria-current="page"],
+.tabs .nav-item[aria-current="page"] {
+  background: var(--chip-on);
+}
+
+.dash-main {
+  grid-area: main;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--detail-w);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+  grid-template-areas:
+    "head head"
+    "tabs tabs"
+    "counts detail"
+    "chips detail"
+    "list detail";
+  column-gap: 0.75rem;
+  min-width: 0;
+  min-height: 0;
+  padding: 1.15rem 1.05rem 1.05rem 1.1rem;
+}
+
+.dash-support {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-areas:
+    "head"
+    "tabs"
+    "list";
+}
+
+.dash-locked {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: "list";
+  place-items: center;
+}
+
+/* The sections as tabs, only where the sidebar is hidden (below 1280 px) */
+.dash-main > nav {
+  display: none;
+  grid-area: tabs;
+}
+
+.dash-card {
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-card);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.dash input {
+  font: inherit;
+  color: var(--text);
+  word-spacing: inherit;
+}
+
+/* ---------- Header: title, search, Refresh, Lock ---------- */
+
+.dash-head {
+  grid-area: head;
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin-bottom: 1.05rem;
+}
+
+.dash-titles {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.dash-logo {
+  display: none; /* phones: the sidebar with the brand is hidden there */
+  flex: none;
+  width: 2.2rem;
+  height: auto;
+  color: var(--text);
+}
+
+.dash-title {
+  font-size: 1.55rem;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+}
+
+.dash-sub {
+  color: var(--text-2);
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+.dash-search {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 14.5rem;
+  min-height: 2.35rem;
+  padding: 0 0.85rem;
+  border: 1px solid var(--field-border);
+  border-radius: 0.6rem;
+  background: var(--panel);
+}
+
+.dash-search:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.dash-search-icon {
+  flex: none;
+  width: 1.1rem;
+  height: 1.1rem;
+  color: var(--muted);
+}
+
+.dash-search input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.3rem 0;
+  border: 0;
+  background: transparent;
+  font-size: 0.9rem;
+}
+
+.dash-search input:focus-visible {
+  outline: none; /* the box shows the focus */
+}
+
+.dash-search input::placeholder {
+  color: var(--muted);
+}
+
+.dash-buttons {
+  display: flex;
+  gap: 0.7rem;
+}
+
+.btn-refresh,
+.btn-lock {
+  min-height: 2.35rem;
+  padding: 0 1.15rem;
+}
+
+/* ---------- Count cards and the status filter ---------- */
+
+.counts {
+  grid-area: counts;
+  display: grid;
+  grid-template-columns: 1.45fr 1fr 1fr 1fr;
+  gap: 0.6rem;
+  margin: 0 0 0.95rem;
+  padding: 0;
+  list-style: none;
+}
+
+.count-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.4rem;
+  min-height: 5rem;
+  padding: 0.8rem 1.1rem 0.75rem;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-panel);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.count-label {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.count-number {
+  font-size: 1.95rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge-compact {
+  padding: 0.18rem 0.6rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.03em;
+}
+
+.filter-chips {
+  grid-area: chips;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.filter-chip {
+  min-height: 1.95rem;
+  padding: 0.15rem 1rem;
+  border: 1px solid var(--field-border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.filter-chip:hover {
+  border-color: var(--accent);
+}
+
+.filter-chip[aria-pressed="true"] {
+  border-color: var(--chip-on);
+  background: var(--chip-on);
+  color: var(--nav-text);
+  font-size: 0.85rem;
+}
+
+/* ---------- The leads table (and the support table) ---------- */
+
+.leads-card,
+.support-card {
+  grid-area: list;
+  position: relative; /* keeps the screen-reader texts inside this scroll box */
+  min-height: 0;
+  overflow: auto;
+  padding: 0 0.4rem 0.4rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
+}
+
+.lead-table,
+.support-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.lead-table th,
+.support-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 0.9rem 0.5rem 0.65rem;
+  background: var(--card);
+  color: var(--text-2);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+.lead-table td,
+.support-table td {
+  padding: 0.5rem;
+  vertical-align: middle;
+  border-bottom: 1px solid var(--divider);
+}
+
+.lead-table tbody tr:last-child td,
+.support-table tbody tr:last-child td {
+  border-bottom-color: transparent;
+}
+
+.lead-table :is(th, td):first-child,
+.support-table :is(th, td):first-child {
+  padding-left: 1rem;
+}
+
+.lead-table :is(th, td):last-child,
+.support-table :is(th, td):last-child {
+  padding-right: 1rem;
+}
+
+.col-name {
+  width: 22.5%;
+}
+
+.col-city {
+  width: 12%;
+}
+
+.col-need {
+  width: 15%;
+}
+
+.col-score {
+  width: 11.5%;
+}
+
+.col-status {
+  width: 10%;
+}
+
+.col-action {
+  width: 16.5%;
+}
+
+.col-created {
+  width: 12.5%;
+}
+
+.lead-table tbody tr {
+  cursor: pointer;
+}
+
+.lead-table tbody tr:hover td {
+  background: var(--row-hover);
+}
+
+/* The selected lead: a peach fill with one rounded orange outline over the whole row (::after), so
+   nothing moves. At 1.25x or 1.5x zoom cell edges fall between screen pixels, so each cell spreads
+   its fill 1px to the right (an outer shadow the next cell paints over) and no seam shows. */
+.lead-table tbody tr.is-selected {
+  position: relative;
+}
+
+.lead-table tbody tr.is-selected td {
+  border-bottom-color: transparent;
+  background: var(--row-selected);
+  box-shadow: 1px 0 var(--row-selected);
+}
+
+.lead-table tbody tr.is-selected td:first-child {
+  border-radius: 0.7rem 0 0 0.7rem;
+}
+
+.lead-table tbody tr.is-selected td:last-child {
+  border-radius: 0 0.7rem 0.7rem 0;
+  box-shadow: none;
+}
+
+.lead-table tbody tr.is-selected::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--select-border);
+  border-radius: 0.7rem;
+  pointer-events: none;
+}
+
+.lead-link {
+  display: block;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lead-link:hover {
+  text-decoration: underline;
+}
+
+.cell-strong {
+  display: block;
+  font-weight: 700;
+}
+
+.cell-sub {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-sub-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.cell-line {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-two-lines {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  line-height: 1.35;
+}
+
+.cell-created {
+  white-space: nowrap;
+}
+
+.demo-tag {
+  flex: none;
+  padding: 0 0.36rem;
+  border-radius: 999px;
+  background: var(--unsaved-bg);
+  color: var(--unsaved-text);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.score-cell {
+  display: grid;
+  gap: 0.3rem;
+  max-width: 6.5rem;
+}
+
+.score-cell-number {
+  font-weight: 600;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.mini-bar {
+  display: block;
+  height: 0.3rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bar-track);
+}
+
+.mini-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--bar-1), var(--bar-2));
+}
+
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: inherit;
+  font-weight: inherit;
+  cursor: pointer;
+}
+
+.th-sort:hover,
+.th-sort.is-active {
+  color: var(--text);
+}
+
+.th-sort-icon {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+
+.support-issue {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- States: loading, empty, error, Load more ---------- */
+
+.dash-state {
+  padding: 1.75rem 1rem;
+  color: var(--text-2);
+}
+
+.dash-empty {
+  text-align: center;
+}
+
+.skeleton-rows {
+  width: 100%;
+}
+
+.skeleton-rows span {
+  height: 0.85rem;
+}
+
+.load-more {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.9rem;
+  color: var(--danger-text);
+  font-size: 0.875rem;
+}
+
+/* ---------- The selected lead ---------- */
+
+.detail {
+  grid-area: detail;
+  position: relative;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 1rem 1.15rem 1.2rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
+}
+
+.detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.detail-who {
+  min-width: 0;
+}
+
+.detail-name {
+  font-size: 1.45rem;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.detail-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.15rem;
+  color: var(--text-2);
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+.detail-score {
+  margin-top: 0.8rem;
+}
+
+.detail-score .score-number {
+  font-size: 1.75rem;
+}
+
+.detail-score .score-bar {
+  height: 0.55rem;
+  margin-top: 0.45rem;
+}
+
+.detail-section {
+  margin-top: 1rem;
+}
+
+.detail-heading {
+  margin-bottom: 0.3rem;
+  font-size: 1.02rem;
+  font-weight: 700;
+}
+
+.detail-text {
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.detail-muted {
+  color: var(--muted);
+}
+
+.why {
+  padding: 0;
+  list-style: none;
+}
+
+.why li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.36rem 0;
+  border-bottom: 1px solid var(--divider);
+  font-size: 0.9rem;
+}
+
+.why-points {
+  flex: none;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.why li.why-cap {
+  justify-content: flex-start;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+  padding: 0.45rem 0.65rem;
+  border: 0;
+  border-radius: 0.5rem;
+  background: var(--notice-bg);
+  color: var(--notice-text);
+}
+
+.why-cap-icon {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  margin-top: 0.2rem;
+  color: var(--accent);
+}
+
+.why-cap-lines {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.why-cap-before {
+  color: var(--text-2);
+  font-size: 0.85rem;
+}
+
+.next-action {
+  display: flex;
+  gap: 0.65rem;
+  margin-top: 1rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--next-border);
+  border-radius: 0.7rem;
+  background: var(--next-bg);
+}
+
+.next-action-icon {
+  flex: none;
+  width: 1.2rem;
+  height: 1.2rem;
+  margin-top: 0.15rem;
+  color: var(--accent);
+}
+
+.next-action .detail-heading {
+  margin-bottom: 0.15rem;
+}
+
+.contact {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0;
+  list-style: none;
+}
+
+.contact li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.contact-icon {
+  flex: none;
+  width: 1.15rem;
+  height: 1.15rem;
+  color: var(--accent);
+}
+
+.contact a {
+  color: var(--text);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.contact a:hover {
+  text-decoration: underline;
+}
+
+.detail-callback {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--card-border);
+  border-radius: 0.7rem;
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 0.875rem;
+}
+
+.detail-callback strong {
+  color: var(--text);
+}
+
+.detail-callback-when {
+  color: var(--muted);
+}
+
+.detail-checklist li {
+  padding: 0.3rem 0;
+}
+
+.row-text {
+  display: grid;
+  min-width: 0;
+}
+
+.row-value {
+  color: var(--text-2);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.row-words {
+  white-space: pre-wrap;
+}
+
+.other-details {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0.7rem 0 0;
+  font-size: 0.85rem;
+}
+
+.other-details div {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  gap: 0.6rem;
+}
+
+.other-details dt {
+  color: var(--muted);
+}
+
+.other-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.detail-loading {
+  padding: 0.5rem 0;
+}
+
+/* ---------- Unlock ---------- */
+
+.unlock-card {
+  grid-area: list;
+  width: min(100%, 27rem);
+  padding: 1.6rem 1.6rem 1.4rem;
+}
+
+.unlock-icon {
+  display: grid;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  background: var(--sun-avatar-bg);
+  color: var(--accent);
+}
+
+.unlock-icon svg {
+  width: 1.4rem;
+  height: 1.4rem;
+}
+
+.unlock-title {
+  margin-top: 0.9rem;
+  font-size: 1.45rem;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+}
+
+.unlock-text {
+  margin-top: 0.4rem;
+  color: var(--text-2);
+  font-size: 0.92rem;
+}
+
+.unlock-note {
+  margin-top: 0.9rem;
+  padding: 0.6rem 0.8rem;
+  border-radius: 0.6rem;
+  background: var(--notice-bg);
+  color: var(--notice-text);
+  font-size: 0.875rem;
+}
+
+.unlock-form {
+  margin-top: 1.1rem;
+}
+
+.unlock-label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.unlock-row {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.unlock-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0 0.9rem;
+  border: 1px solid var(--field-border);
+  border-radius: 0.65rem;
+  background: var(--field-bg);
+}
+
+.unlock-input:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.btn-unlock {
+  min-height: 2.75rem;
+  padding: 0 1.1rem;
+}
+
+.unlock-error {
+  margin-top: 0.75rem;
+  padding: 0.6rem 0.8rem;
+  border-radius: 0.6rem;
+  background: var(--danger-bg);
+  color: var(--danger-text);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.unlock-back {
+  display: inline-block;
+  margin-top: 1.1rem;
+  color: var(--text-2);
+  font-size: 0.875rem;
+}
+
+/* ---------- Medium screens (900-1279 px): no sidebar, the sections as tabs ----------
+   The dashboard needs more width than the chat page (a 7-column table next to the detail panel),
+   so its sidebar goes at 1280 px rather than 1100 px. */
+
+@media (max-width: 1279px) {
+  .dash {
+    --detail-w: 19rem;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "main";
+  }
+
+  .dash .sidebar {
+    display: none;
+  }
+
+  .dash-main > nav {
+    display: block;
+    margin: -0.4rem 0 0.9rem;
+  }
+
+  .tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0;
+  }
+
+  .tabs .nav-item {
+    min-height: 2.2rem;
+    padding: 0 0.85rem;
+    font-size: 0.85rem;
+  }
+
+  .tabs .nav-icon {
+    width: 1.05rem;
+    height: 1.05rem;
+  }
+}
+
+/* ---------- Phones (below 900 px, as useWideScreen) ---------- */
+
+@media (max-width: 899px) {
+  .dash {
+    display: block;
+    height: auto;
+    min-height: 100dvh;
+  }
+
+  .dash-main {
+    display: block;
+    padding: 0 0 1.5rem;
+  }
+
+  .dash-locked {
+    display: grid;
+    min-height: 100dvh;
+    padding: 1rem 0.75rem;
+  }
+
+  .dash-head {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "titles buttons"
+      "search search";
+    gap: 0.6rem 0.5rem;
+    margin: 0;
+    padding: 0.55rem 0.75rem 0.65rem 0.9rem;
+    border-bottom: 1px solid var(--card-border);
+    background: var(--card);
+  }
+
+  .dash-titles {
+    grid-area: titles;
+  }
+
+  .dash-logo {
+    display: block;
+  }
+
+  .dash-title {
+    font-size: 1.1rem;
+    white-space: nowrap;
+  }
+
+  .dash-sub {
+    display: none;
+  }
+
+  .dash-search {
+    grid-area: search;
+    width: auto;
+  }
+
+  .dash-buttons {
+    grid-area: buttons;
+    gap: 0.4rem;
+  }
+
+  /* Icons only; the names stay for screen readers */
+  .btn-refresh,
+  .btn-lock {
+    width: 2.5rem;
+    height: 2.5rem;
+    min-height: 0;
+    padding: 0;
+  }
+
+  .dash-button-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .dash-main > nav {
+    margin: 0.75rem 0.75rem 0;
+  }
+
+  /* One row of tabs; on very narrow screens it scrolls sideways rather than wrapping */
+  .tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .tabs .nav-item {
+    gap: 0.4rem;
+    padding: 0 0.65rem;
+    font-size: 0.8rem;
+    white-space: nowrap;
+  }
+
+  .counts {
+    grid-template-columns: 1fr 1fr;
+    margin: 0.75rem;
+  }
+
+  .count-card {
+    min-height: 4.4rem;
+  }
+
+  .count-number {
+    font-size: 1.6rem;
+  }
+
+  .filter-chips {
+    margin: 0 0.75rem 0.65rem;
+  }
+
+  .leads-card,
+  .support-card {
+    margin: 0 0.75rem;
+    padding: 0;
+    overflow: visible;
+  }
+
+  .lead-tiles,
+  .support-tiles {
+    padding: 0;
+    list-style: none;
+  }
+
+  .lead-tiles li + li,
+  .support-tiles li + li {
+    border-top: 1px solid var(--divider);
+  }
+
+  .lead-tile,
+  .support-tile {
+    display: grid;
+    gap: 0.3rem;
+    padding: 0.85rem 1rem;
+    color: var(--text);
+    text-decoration: none;
+  }
+
+  .tile-top {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+
+  .tile-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tile-sub,
+  .tile-created {
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+
+  .tile-line {
+    overflow: hidden;
+    font-size: 0.875rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tile-action {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    color: var(--text-2);
+    white-space: normal;
+  }
+
+  .lead-tile .score-cell {
+    grid-template-columns: auto minmax(0, 8rem);
+    align-items: center;
+    gap: 0.6rem;
+    max-width: none;
+  }
+
+  /* The selected lead covers the screen; the list stays underneath, where it was */
+  .detail-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    padding: 0.75rem 0.9rem 1.75rem;
+    border: 0;
+    border-radius: 0;
+    background: var(--card);
+    box-shadow: none;
+    overscroll-behavior: contain;
+  }
+
+  .btn-back {
+    min-height: 2.4rem;
+    margin-bottom: 0.9rem;
+    padding: 0 0.9rem;
+  }
+}

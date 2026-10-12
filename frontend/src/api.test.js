@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { apiUrl, errorFrom, GENERIC_ERROR, postChat } from "./api.js";
-import { fakeApi, jsonResponse } from "./test-utils.js";
+import { apiUrl, errorFrom, GENERIC_ERROR, getLead, getLeads, getSupportRequests, postChat } from "./api.js";
+import { fakeApi, jsonResponse, SALES_KEY } from "./test-utils.js";
 
 describe("apiUrl", () => {
   it.each([
@@ -40,6 +40,58 @@ describe("errorFrom", () => {
   it("other statuses get the short generic message, not the server's text", () => {
     const error = errorFrom(new Response(null, { status: 503 }), { detail: "database down" });
     expect(error).toMatchObject({ kind: "server", status: 503, message: GENERIC_ERROR });
+  });
+
+  it("keeps the API's detail for the dashboard (the chat still shows its short message)", () => {
+    const error = errorFrom(new Response(null, { status: 503 }), { detail: "The sales API is not configured on this server." });
+    expect(error).toMatchObject({ message: GENERIC_ERROR, detail: "The sales API is not configured on this server." });
+  });
+
+  it("401 and 404 get their own kinds", () => {
+    expect(errorFrom(new Response(null, { status: 401 }), { detail: "Missing or invalid API key." })).toMatchObject({
+      kind: "unauthorized",
+      status: 401,
+      message: GENERIC_ERROR,
+    });
+    expect(errorFrom(new Response(null, { status: 404 }), { detail: "No lead with id 9." })).toMatchObject({
+      kind: "not_found",
+      status: 404,
+    });
+  });
+});
+
+describe("sales calls", () => {
+  it("send the key in the X-API-Key header, never in the URL, with only the parameters that are set", async () => {
+    vi.stubEnv("VITE_API_URL", "");
+    const fetchMock = fakeApi();
+    await getLeads({ status: "HOT", q: "", sort: "score", limit: 50, offset: 0 }, SALES_KEY);
+    await getLead(7, SALES_KEY);
+    await getSupportRequests({ limit: 50, offset: 50 }, SALES_KEY);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:8000/api/leads?status=HOT&sort=score&limit=50&offset=0",
+      "http://127.0.0.1:8000/api/leads/7",
+      "http://127.0.0.1:8000/api/support-requests?limit=50&offset=50",
+    ]);
+    for (const [url, init] of fetchMock.mock.calls) {
+      expect(init.headers).toEqual({ "X-API-Key": SALES_KEY });
+      expect(url).not.toContain(SALES_KEY);
+    }
+  });
+
+  it("treat an answer without the expected shape as a server error", async () => {
+    fakeApi({
+      leads: () => jsonResponse(200, { items: [], total: 0 }), // no counts
+      lead: () => jsonResponse(200, { id: 7 }), // no score breakdown
+      support: () => jsonResponse(200, { total: 0 }), // no items
+    });
+    await expect(getLeads({}, SALES_KEY)).rejects.toMatchObject({ kind: "server" });
+    await expect(getLead(7, SALES_KEY)).rejects.toMatchObject({ kind: "server" });
+    await expect(getSupportRequests({}, SALES_KEY)).rejects.toMatchObject({ kind: "server" });
+  });
+
+  it("a wrong key is an unauthorized error", async () => {
+    fakeApi();
+    await expect(getLeads({}, "not-the-key")).rejects.toMatchObject({ kind: "unauthorized", status: 401 });
   });
 });
 

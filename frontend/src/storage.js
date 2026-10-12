@@ -60,3 +60,34 @@ export function saveSalesView(on) {
     // Blocked storage: the switch still works for this visit.
   }
 }
+
+// The sales API key for the dashboard: sessionStorage only, so it is gone when the tab closes and a
+// shared computer doesn't keep it. Never localStorage, the URL, the logs or the build. Lock removes it.
+const SALES_KEY = "vantis-sales-key";
+
+/** The saved sales key, or null. */
+export function loadSalesKey() {
+  try {
+    return sessionStorage.getItem(SALES_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Keep the sales key for this tab. */
+export function saveSalesKey(key) {
+  try {
+    sessionStorage.setItem(SALES_KEY, key);
+  } catch {
+    // Blocked storage: the key lasts until the page is reloaded.
+  }
+}
+
+/** Forget the sales key (Lock, or a key the server no longer accepts). */
+export function clearSalesKey() {
+  try {
+    sessionStorage.removeItem(SALES_KEY);
+  } catch {
+    // Nothing to do.
+  }
+}
