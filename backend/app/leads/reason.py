@@ -1,7 +1,9 @@
-"""The one-sentence reason for a lead's status, written by the fast LLM from the score breakdown.
+"""The one-sentence reason for a lead's status, written by the LLM (app: reason_llm, the main model) from the
+score breakdown.
 
-The LLM sees only the status, score, rule labels, caps and city: no name, phone, email or money amount.
-Any doubtful reply is replaced by a template sentence built from the same breakdown.
+The LLM sees only the status, score, rule labels, caps, city and what keeps the lead from the next status:
+no name, phone, email or money amount. Any doubtful reply is replaced by a template sentence built from the
+same breakdown.
 """
 import logging
 import re
@@ -11,10 +13,11 @@ from langchain_core.runnables import Runnable
 
 from app.core.llm import LLMError, invoke_llm
 from app.core.prompts import load_prompt
+from app.leads.scoring import next_status_gap
 
 logger = logging.getLogger(__name__)
 
-MAX_REASON_CHARS = 200
+MAX_REASON_CHARS = 240  # about 30 words, with the "not HOT yet: ..." ending (T12a)
 STATUSES = ("HOT", "WARM", "COLD")
 # KB Section 16 topics a reason must never touch. Whole words or word starts, so "premium" is not "EMI".
 FORBIDDEN_RE = re.compile(
@@ -23,8 +26,17 @@ FORBIDDEN_RE = re.compile(
 _SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 
 
+def gap_phrase(breakdown: dict) -> str | None:
+    """'not HOT yet: no timeline' for a WARM lead (T12a), or None for a HOT lead."""
+    gap = next_status_gap(breakdown)
+    if gap is None:
+        return None
+    next_status, gaps = gap
+    return f"not {next_status} yet: " + (", ".join(gaps) or "more details needed")
+
+
 def build_prompt(breakdown: dict, city: str | None) -> str:
-    """The prompt text: status, score, city and the breakdown labels only."""
+    """The prompt text: status, score, city, the breakdown labels and the next-status gap only."""
     factors = "\n".join(f"- {r['label']}: {r['points']} of {r['max']}" for r in breakdown["rules"])
     caps = "\n".join(f"- {c['label']}" for c in breakdown["caps"]) or "- none"
     filled = {
@@ -33,6 +45,7 @@ def build_prompt(breakdown: dict, city: str | None) -> str:
         "{city}": city or "not given",
         "{factors}": factors,
         "{caps}": caps,
+        "{next_status}": gap_phrase(breakdown) or "none: it is already HOT",
     }
     text = load_prompt("lead_qualification_prompt")
     for placeholder, value in filled.items():
@@ -41,11 +54,15 @@ def build_prompt(breakdown: dict, city: str | None) -> str:
 
 
 def template_reason(breakdown: dict) -> str:
-    """Fallback reason from the breakdown, e.g. 'HOT: ready to buy, clear requirement: 5 kW system, ...'."""
+    """Fallback reason from the breakdown, e.g. 'WARM: interested in options, ...; not HOT yet: no timeline.'
+
+    The gap names a cap's cause too, so a capped lead's reason says why it is not HOT.
+    """
     earned = [r["label"] for r in breakdown["rules"] if r["points"] > 0]
     text = f"{breakdown['lead_status']}: " + (", ".join(_lower_first(x) for x in earned) or "few details so far")
-    if breakdown["caps"]:
-        text += "; " + "; ".join(_lower_first(c["label"]) for c in breakdown["caps"])
+    gap = gap_phrase(breakdown)
+    if gap:
+        text += "; " + gap
     return text + "."
 
 
@@ -53,16 +70,26 @@ def _lower_first(text: str) -> str:
     return text[:1].lower() + text[1:]
 
 
-def problem_with(reply: str, status: str) -> str | None:
-    """Why an LLM reply can't be used as the reason, or None if it is fine."""
+def problem_with(reply: str, status: str, next_status: str | None = None) -> str | None:
+    """Why an LLM reply can't be used as the reason, or None if it is fine.
+
+    next_status (T12a): for a lead that is not HOT, the reply must say "not <next_status> yet"; that phrase is
+    the only place another status may appear.
+    """
     if not reply:
         return "empty"
     if len(reply) > MAX_REASON_CHARS or "\n" in reply:
         return "too long"
     if len(_SENTENCE_END_RE.findall(reply)) > 1:
         return "more than one sentence"
+    checked = reply
+    if next_status:
+        phrase = re.compile(rf"\bnot {next_status} yet\b", re.IGNORECASE)
+        if not phrase.search(reply):
+            return "does not say what is missing for the next status"
+        checked = phrase.sub("", reply)
     others = [s for s in STATUSES if s != status]
-    if re.search(rf"\b({'|'.join(others)})\b", reply, re.IGNORECASE):
+    if re.search(rf"\b({'|'.join(others)})\b", checked, re.IGNORECASE):
         return "names another status"
     if FORBIDDEN_RE.search(reply):
         return "forbidden topic"
@@ -76,7 +103,8 @@ def write_reason(breakdown: dict, city: str | None, llm: Runnable) -> tuple[str,
     except LLMError:
         reply = ""
     reply = reply.strip().strip('"').strip()
-    problem = problem_with(reply, breakdown["lead_status"])
+    gap = next_status_gap(breakdown)
+    problem = problem_with(reply, breakdown["lead_status"], gap[0] if gap else None)
     if problem:
         logger.info("lead reason: template used (%s)", problem)
         return template_reason(breakdown), "template"

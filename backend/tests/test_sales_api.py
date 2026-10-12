@@ -2,12 +2,11 @@
 import uuid
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api import sales
 from app.core.config import get_settings
-from app.core.db import init_db
 from app.leads import service
 from app.leads.models import Callback, Lead
 from app.leads.schemas import LeadData
@@ -30,11 +29,8 @@ def llm():
 
 
 @pytest.fixture
-def db(test_engine):
-    init_db(test_engine)
-    with test_engine.begin() as conn:
-        conn.execute(text("TRUNCATE leads, callbacks, support_requests RESTART IDENTITY CASCADE"))
-    return test_engine
+def db(leads_db):
+    return leads_db
 
 
 @pytest.fixture
@@ -149,7 +145,7 @@ def test_detail_has_every_field_breakdown_and_callbacks_but_no_session_id(api, d
     assert [r["rule"] for r in body["score_breakdown"]["rules"]] == [
         "intent", "requirement", "location", "timeline", "contact", "property"]
     assert body["reason"] == REASON and body["reason_source"] == "llm"
-    assert body["recommended_action"].endswith("Customer asked for a callback: tomorrow evening.")
+    assert body["recommended_action"] == "Call tomorrow evening, as requested, and offer a site assessment."
     assert [(c["preferred_time"], c["status"]) for c in body["callbacks"]] == [("tomorrow evening", "requested")]
     assert body["created_at"] and body["updated_at"]
 
@@ -214,7 +210,19 @@ def test_callback_is_logged_as_requested(api, db, llm):
         lead.id, "requested", "tomorrow evening", "after 6 pm")
     assert body["message"] == service.CALLBACK_MESSAGE
     detail = api.get(f"/api/leads/{lead.id}").json()
-    assert detail["recommended_action"].endswith("Customer asked for a callback: tomorrow evening.")
+    assert detail["recommended_action"] == "Call tomorrow evening, as requested, and offer a site assessment."
+
+
+def test_a_new_time_updates_the_leads_callback_request_with_200(api, db, llm):
+    lead = add_lead(db, llm, RAHUL)
+    first = api.post("/api/callback", json={"lead_id": lead.id, "preferred_time": "4pm"})
+    second = api.post("/api/callback", json={"lead_id": lead.id, "preferred_time": "day after tomorrow, 4pm"})
+    assert (first.status_code, second.status_code) == (201, 200)
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["message"] == service.CALLBACK_UPDATED_MESSAGE
+    assert count(db, Callback) == 1
+    detail = api.get(f"/api/leads/{lead.id}").json()
+    assert [(c["preferred_time"], c["status"]) for c in detail["callbacks"]] == [("day after tomorrow, 4pm", "requested")]
 
 
 def test_callback_for_an_unknown_lead_is_404_and_saves_nothing(api, db):

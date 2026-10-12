@@ -12,7 +12,7 @@ from sqlalchemy import Engine, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.llm import fast_llm
+from app.core.llm import reason_llm
 from app.leads import validators as v
 from app.leads.models import Callback, Lead, SupportRequest
 from app.leads.reason import template_reason, write_reason
@@ -32,6 +32,7 @@ from app.services.service_areas import ServiceAreas, get_service_areas
 logger = logging.getLogger(__name__)
 
 CALLBACK_MESSAGE = "Callback request logged; the team will confirm."
+CALLBACK_UPDATED_MESSAGE = "Callback request updated; the team will confirm."
 STATUSES = ("HOT", "WARM", "COLD")
 CHANNELS = ("web", "whatsapp", "demo")  # demo: scripts/seed_demo_leads.py
 SORTS = ("newest", "score")
@@ -122,7 +123,7 @@ def create_lead(
     data = data.model_copy(update={"city": location.city})
     breakdown = score_lead(data, location.status)
     if reason_now:
-        reason, reason_source = write_reason(breakdown, data.city, llm or fast_llm())  # before the DB write
+        reason, reason_source = write_reason(breakdown, data.city, llm or reason_llm())  # before the DB write
     else:
         reason, reason_source = template_reason(breakdown), "template"
 
@@ -192,7 +193,7 @@ def update_lead(
     breakdown = score_lead(data, location_status)
     if (breakdown["lead_score"], breakdown["lead_status"]) != (old_score, old_status):
         if reason_now:
-            reason, reason_source = write_reason(breakdown, data.city, llm or fast_llm())
+            reason, reason_source = write_reason(breakdown, data.city, llm or reason_llm())
         else:
             reason, reason_source = template_reason(breakdown), "template"
 
@@ -228,7 +229,7 @@ def refresh_reason(engine: Engine, lead_id: int, llm: Runnable | None = None) ->
             if row is None or row.reason_source != "template":
                 return False
             breakdown, city = row.score_breakdown, row.city
-        reason, source = write_reason(breakdown, city, llm or fast_llm())
+        reason, source = write_reason(breakdown, city, llm or reason_llm())
         if source != "llm":
             return False
         with Session(engine) as session, session.begin():
@@ -309,7 +310,9 @@ def schedule_callback(
 ) -> CallbackResult:
     """Log a callback request for an existing lead (status 'requested'; the team confirms it).
 
-    Raises LeadNotFound without a lead, and InvalidValue for an empty or very long time.
+    A lead keeps one requested callback (T12a): a new time updates it (and new notes replace the old ones)
+    instead of adding a second request. The recommended action follows the time. Raises LeadNotFound without
+    a lead, and InvalidValue for an empty or very long time.
     """
     preferred_time = v.clean_text(preferred_time or "", what="preferred time", max_chars=PREFERRED_TIME_CHARS)
     notes = v.clean_text(notes, what="notes", max_chars=v.LONG_TEXT_CHARS) if notes and notes.strip() else None
@@ -317,14 +320,23 @@ def schedule_callback(
         row = session.get(Lead, lead_id)
         if row is None:
             raise LeadNotFound(lead_id)
-        callback = Callback(lead_id=row.id, preferred_time=preferred_time, notes=notes, status="requested")
-        session.add(callback)
+        callback = next((c for c in row.callbacks if c.status == "requested"), None)
+        updated = callback is not None
+        if updated:
+            callback.preferred_time = preferred_time
+            if notes:
+                callback.notes = notes
+        else:
+            callback = Callback(lead_id=row.id, preferred_time=preferred_time, notes=notes, status="requested")
+            session.add(callback)
         session.flush()
         session.refresh(callback)
         row.recommended_action = recommended_action(row.score_breakdown, _lead_data(row), preferred_time)
         view = CallbackView.model_validate(callback)
-    logger.info("callback requested", extra={"lead_id": lead_id, "callback_id": view.id})
-    return CallbackResult(callback=view, message=CALLBACK_MESSAGE)
+    logger.info("callback updated" if updated else "callback requested",
+                extra={"lead_id": lead_id, "callback_id": view.id})
+    message = CALLBACK_UPDATED_MESSAGE if updated else CALLBACK_MESSAGE
+    return CallbackResult(callback=view, message=message, updated=updated)
 
 
 def create_support_request(

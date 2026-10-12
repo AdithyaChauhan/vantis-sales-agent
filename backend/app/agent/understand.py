@@ -1,4 +1,4 @@
-"""The understand step: an LLM (app: understand_llm, i.e. main, then fast, then Groq, 5 s each) reads the new
+"""The understand step: an LLM (app: understand_llm, i.e. main, then Groq, then fast, 4 s each) reads the new
 message (with recent history) and returns intents, a standalone search query in the KB's own words, and the
 lead details the customer stated.
 
@@ -15,7 +15,7 @@ from langchain_core.runnables import Runnable
 from pydantic import BaseModel, Field, create_model
 from sqlalchemy import Engine, text
 
-from app.core.llm import LLMError, provider_of
+from app.core.llm import LLMError, provider_of, tokens_of
 from app.core.prompts import load_prompt
 from app.leads.schemas import LeadData
 from app.rag.chunker import CATALOG_SECTION
@@ -32,6 +32,7 @@ Intent = Literal[
     "reply_to_assistant",
     "contact_request",
     "gives_details",
+    "asks_what_is_needed",
     "thanks_or_bye",
     "existing_customer_issue",
     "off_topic",
@@ -58,7 +59,7 @@ ExtractedDetails = create_model(
 
 
 class Understanding(BaseModel):
-    """What the fast LLM returns for one customer message."""
+    """What the understand model returns for one customer message."""
 
     intents: list[Intent] = Field(description="Every intent present in the new message")
     search_query: str | None = Field(
@@ -156,7 +157,7 @@ def build_prompt(hints: KbHints, message: str, history: list[BaseMessage]) -> st
 
 def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMessage]) -> dict:
     """{intents, search_query, details (raw), asked_city, callback_time, issue, project_details, declines,
-    provider, model, latency_ms}. Raises LLMError on any failure."""
+    provider, model, latency_ms, tokens}. Raises LLMError on any failure."""
     start = time.perf_counter()
     try:
         result = llm.invoke([HumanMessage(build_prompt(hints, message, history))])
@@ -183,4 +184,5 @@ def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMe
         "provider": provider_of(raw) if raw is not None else "unknown",
         "model": raw.response_metadata.get("model_name") if raw is not None else None,
         "latency_ms": latency_ms,
+        "tokens": tokens_of(result),
     }

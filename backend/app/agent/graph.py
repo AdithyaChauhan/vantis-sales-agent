@@ -24,19 +24,22 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from app.agent import welcome
-from app.agent.leads import LeadOps, confirmed_city, lead_summary, pending_changes, status_block
+from app.agent.leads import (
+    LeadOps, changed_fields, confirmed_city, fix_callback_claims, is_clock_time, lead_summary, merge_callback_time,
+    pending_changes, remove_false_claims, ruled_out_details, short_answer_details, status_block,
+)
 from app.agent.state import AgentState
 from app.agent.tools import make_tools, tool_step
 from app.agent.understand import KbHints, Understanding, load_kb_hints, understand
 from app.core.config import get_settings
 from app.core.db import get_engine
-from app.core.llm import LLMError, chat_llm, provider_of, query_embedder, reply_text, understand_llm
+from app.core.llm import LLMError, chat_llm, provider_of, query_embedder, reply_text, tokens_of, understand_llm
 from app.leads import service
 from app.core.prompts import load_prompt
 from app.leads.schemas import LeadData
 from app.rag.answer import (
-    LLM_DOWN_REPLY, normalize_citations, pick_sources, rag_message, retrieve_step, strip_tool_citations,
-    tidy_citations,
+    LLM_DOWN_REPLY, normalize_citations, pick_sources, rag_message, retrieve_step, soften_promises,
+    strip_tool_citations, strip_unsourced_citations, tidy_citations,
 )
 from app.rag.chunker import SUMMARY_SECTIONS
 from app.rag.retriever import RetrievedChunk, SearchResult, search
@@ -47,10 +50,11 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 4
 AGENT_HISTORY = 12  # persisted messages the agent sees, including the current one
 CONTEXT_CHUNKS = 4
-# No KB search for a message that only gives details or asks to be contacted (a short "yes please" may
-# come with it); a short reply alone that accepts an info offer still searches.
-NO_SEARCH_INTENTS = {"gives_details", "contact_request", "reply_to_assistant"}
-NO_SEARCH_TRIGGERS = {"gives_details", "contact_request"}
+# No KB search for a message that only gives details, asks to be contacted or asks what details are still
+# needed (a short "yes please" may come with it); a short reply alone that accepts an info offer still
+# searches. T12a: with no KB context, "is rooftop info not needed?" can't be answered with a KB quote.
+NO_SEARCH_INTENTS = {"gives_details", "contact_request", "asks_what_is_needed", "reply_to_assistant"}
+NO_SEARCH_TRIGGERS = {"gives_details", "contact_request", "asks_what_is_needed"}
 MAX_ASKED_CITIES = 3
 
 
@@ -107,6 +111,7 @@ def build_graph(deps: AgentDeps):
     def understand_node(state: AgentState) -> dict:
         message = state["messages"][-1].content
         history = state["messages"][:-1]
+        previous = state["messages"][-2] if len(state["messages"]) > 1 else None
         try:
             out = understand(deps.understand_llm, deps.hints_fn(), message, history)
             degraded = False
@@ -114,13 +119,20 @@ def build_graph(deps: AgentDeps):
             logger.warning("understand failed, using the raw message: %s", type(exc).__name__)
             out = {"intents": ["question"], "search_query": message, "details": {}, "asked_city": None,
                    "callback_time": None, "issue": None, "project_details": None, "declines": False,
-                   "provider": None, "model": None, "latency_ms": None}
+                   "provider": None, "model": None, "latency_ms": None, "tokens": None}
             degraded = True
-        data, errors = LeadData.from_raw(out["details"])
+        short = short_answer_details(previous, str(message), out["details"])  # a bare "3500" or "yes" (T12a)
+        data, errors = LeadData.from_raw({**out["details"], **short})
         clean = data.model_dump(exclude_none=True)
+        # "4pm" is a time to call, never an installation timeline (T12a replay: the callback time was lost)
+        callback_time = merge_callback_time(state.get("callback_time"), out["callback_time"])
+        if clean.get("timeline") and is_clock_time(clean["timeline"]):
+            callback_time = merge_callback_time(callback_time, clean.pop("timeline"))
+            clean.pop("timeline_bucket", None)
+        if not out["callback_time"] and is_clock_time(str(message)):  # a message that is only "4pm"
+            callback_time = merge_callback_time(callback_time, str(message).strip().rstrip(".!"))
         intents = set(out["intents"])
         asked = list(state.get("asked_cities", []))
-        previous = state["messages"][-2] if len(state["messages"]) > 1 else None
         city = confirmed_city(asked, previous, out)
         if city:  # the customer confirmed the city the assistant's question named
             clean["city"] = city
@@ -144,18 +156,26 @@ def build_graph(deps: AgentDeps):
                 "details": sorted(clean),
                 "invalid": sorted(errors),
                 "city_confirmed": bool(city),
+                "short_answer": sorted(short),
                 "provider": out["provider"],
                 "model": out["model"],
                 "latency_ms": out["latency_ms"],
+                "tokens": out["tokens"],
             },
         }
+        before = state.get("lead", {})
+        lead = {**before, **clean}
         return {
             "intents": out["intents"],
             "search_query": out["search_query"],
-            "lead": {**state.get("lead", {}), **clean},
+            "lead": lead,
+            "new_details": changed_fields(before, lead),
+            "declines": bool(out["declines"]),
+            "ruled_out": sorted(set(state.get("ruled_out", [])) | set(ruled_out_details(str(message)))),
             "validation_errors": errors,
             "asked_cities": asked,
-            "callback_time": out["callback_time"] or state.get("callback_time"),
+            # "4pm" then "day after tomorrow" -> "day after tomorrow, 4pm" (T12a)
+            "callback_time": callback_time,
             "support": support,
             "support_case": support_case,
             "contact_request": "contact_request" in intents,
@@ -220,7 +240,8 @@ def build_graph(deps: AgentDeps):
         calls = [c["name"] for c in getattr(message, "tool_calls", [])]
         detail = f"{provider}, {latency_ms} ms" + (f", calls {', '.join(calls)}" if calls else "")
         step = {"node": "agent", "detail": detail,
-                "data": {"provider": provider, "latency_ms": latency_ms, "tool_calls": calls}}
+                "data": {"provider": provider, "model": message.response_metadata.get("model_name"),
+                         "latency_ms": latency_ms, "tokens": tokens_of(message), "tool_calls": calls}}
         return {
             "scratch": [message],
             "tool_rounds": rounds + (1 if calls else 0),
@@ -245,9 +266,12 @@ def build_graph(deps: AgentDeps):
                 update["lead_saved"] = artifact["saved_fields"]
                 if artifact.get("reason_pending"):
                     update["reason_pending"] = artifact["lead_id"]
+                if artifact.get("created"):
+                    update["lead_created_now"] = True
             elif artifact.get("kind") == "callback":
                 update["callback_status"] = artifact["status"]
                 update["callback_logged"] = artifact["time"]
+                update["callback_now"] = "updated" if artifact.get("updated") else "requested"
             elif artifact.get("kind") == "support":
                 update["support_request_id"] = artifact["id"]
         steps = [tool_step(m) for m in results]
@@ -279,6 +303,24 @@ def build_graph(deps: AgentDeps):
                 found = (_tool_chunks(scratch, "check_service_area") + state["chunks"]
                          + _tool_chunks(scratch, "search_knowledge_base"))
                 chunks = [RetrievedChunk(**c) for c in _dedupe(found)]
+                # The safety nets (T12a): KB tags only on facts from this turn's sources, and no "saved"
+                # claim while no lead exists. Each one that fires is a step, so a slipping prompt shows.
+                reply, removed = strip_unsourced_citations(reply, chunks)
+                if removed:
+                    steps.append({"node": "guard", "detail": f"removed {removed} KB tag(s) not backed by this "
+                                                             "turn's sources", "data": {"removed": removed}})
+                reply, fixed = remove_false_claims(reply, state) if deps.ops is not None else (reply, False)
+                if fixed:
+                    steps.append({"node": "guard", "detail": "removed a claim that details were saved (no lead "
+                                                             "yet)", "data": {}})
+                reply, matched = fix_callback_claims(reply, state) if deps.ops is not None else (reply, False)
+                if matched:
+                    steps.append({"node": "guard", "detail": "the callback sentence now says what was logged",
+                                  "data": {}})
+                reply, softened = soften_promises(reply)
+                if softened:
+                    steps.append({"node": "guard", "detail": "a promise that the team will act became 'can'",
+                                  "data": {}})
                 reply = tidy_citations(reply, chunks)
                 sources = pick_sources(reply, chunks) if chunks else []
         if deps.ops is not None:

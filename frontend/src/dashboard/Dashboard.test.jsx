@@ -200,6 +200,21 @@ describe("leads", () => {
     expect(within(await leadsTable()).getByRole("link", { name: "Rohit Patel" }).getAttribute("aria-current")).toBe("true");
   });
 
+  it("shows what to do first: next action, callback and contact, then why this score, reason and details", async () => {
+    fakeApi();
+    openAt("/leads/1");
+    const panel = await detailPanel();
+    const headings = within(panel).getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent);
+    expect(headings).toEqual(["Next action", "Contact", "Why this score", "Reason", "Details collected"]);
+    // The callback row sits between the next action and the contact details
+    const nextAction = within(panel).getByRole("heading", { name: "Next action" });
+    const callback = within(panel).getByText("Callback:").closest(".detail-callback");
+    const contact = within(panel).getByRole("heading", { name: "Contact" });
+    const FOLLOWS = Node.DOCUMENT_POSITION_FOLLOWING;
+    expect(nextAction.compareDocumentPosition(callback) & FOLLOWS).toBeTruthy();
+    expect(callback.compareDocumentPosition(contact) & FOLLOWS).toBeTruthy();
+  });
+
   it("explains the score: every rule's points out of its maximum, and a cap with the score before it", async () => {
     const breakdown = {
       rules: [

@@ -38,6 +38,27 @@ CAP_LABELS = {
 HOT_ACTION = "Contact the lead within 1 hour and offer a site assessment."
 WARM_ACTION = "Follow up within 24 hours."
 COLD_ACTION = "Add to the nurture list, share product information and follow up in 30 days."
+COLD_AFTER_CALLBACK = "Add to the nurture list and share product information."
+
+# What keeps a lead from the next status, in a few words for the reason (T12a). Labels only: never a name,
+# contact detail or amount. Signals that more details can't change (a city not on the KB list, renting or
+# no rooftop) have no label, so they are never named as a gap.
+NEXT_STATUS = {"WARM": ("HOT", HOT_MIN), "COLD": ("WARM", WARM_MIN)}
+GAP_LABELS = {
+    "intent": {None: "intent not clear", "exploring": "only exploring", "interested": "interested but not ready to buy"},
+    "requirement": {"none": "no requirement", "vague": "no size, bill or usage"},
+    "location": {"unknown": "city not known"},
+    "timeline": {None: "no timeline", "gt_6m": "timeline over 6 months", "3_6m": "timeline 3-6 months",
+                 "1_3m": "timeline 1-3 months"},
+    "contact": {"none": "no contact details"},
+    "property": {"unknown": "property not known", "partly_known": "ownership and rooftop not confirmed"},
+}
+CONTACT_GAPS = {"Phone given": "no email", "Email given": "no phone number"}  # by the contact rule's label
+CAP_CAUSES = {
+    "unverified_location": "city not in the listed service areas",
+    "outside_catalog": "requirement outside the reference packages",
+}
+GAP_ORDER = ["timeline", "requirement", "intent", "location", "contact", "property"]  # ties: timeline first
 
 
 def _rule(rule: str, value, points: int, max_points: int, label: str) -> dict:
@@ -109,10 +130,11 @@ def score_lead(lead: LeadData, location_status: str) -> dict:
     ]
     raw_score = sum(r["points"] for r in rules)
     caps = []
-    if location_status == "unverified":
-        caps.append({"rule": "unverified_location", "label": CAP_LABELS["unverified_location"]})
-    if lead.requirement_outside_catalog:
-        caps.append({"rule": "outside_catalog", "label": CAP_LABELS["outside_catalog"]})
+    if raw_score > CAPPED_MAX:  # a cap that would change nothing is not recorded (T12a)
+        if location_status == "unverified":
+            caps.append({"rule": "unverified_location", "label": CAP_LABELS["unverified_location"]})
+        if lead.requirement_outside_catalog:
+            caps.append({"rule": "outside_catalog", "label": CAP_LABELS["outside_catalog"]})
     lead_score = min(raw_score, CAPPED_MAX) if caps else raw_score
     return {
         "rules": rules,
@@ -124,46 +146,86 @@ def score_lead(lead: LeadData, location_status: str) -> dict:
 
 
 def missing_details(lead: LeadData, breakdown: dict) -> list[str]:
-    """Details worth collecting for a WARM lead (each would add points)."""
+    """Details that would still add points, most useful first (T12a): the timeline (up to 20), a size, bill or
+    usage figure when the need is only in words (+10), rooftop and ownership (+3 to +5 together), then email
+    or phone (+4). A detail that is known never appears."""
     rules = {r["rule"]: r for r in breakdown["rules"]}
     missing = []
     if lead.timeline_bucket is None:
         missing.append("timeline")
     if rules["requirement"]["value"] != "clear":
         missing.append("monthly bill or usage")
-    if not lead.phone:
-        missing.append("phone number")
-    if not lead.email:
-        missing.append("email")
     if rules["property"]["value"] in ("partly_known", "unknown"):
-        if lead.ownership is None:
-            missing.append("ownership")
         if lead.rooftop_available is None:
             missing.append("rooftop availability")
+        if lead.ownership is None:
+            missing.append("ownership")
+    if not lead.email:
+        missing.append("email")
+    if not lead.phone:
+        missing.append("phone number")
     return missing
 
 
-def recommended_action(breakdown: dict, lead: LeadData, callback_time: str | None = None) -> str:
-    """Fixed next step for the sales team, from the status (plus the gaps for a WARM lead)."""
+def _gap_label(rule: dict) -> str | None:
+    """The few words for a rule that is short of its maximum, or None when more details can't change it."""
+    if rule["points"] >= rule["max"]:
+        return None
+    if rule["rule"] == "contact" and rule["value"] == "one":
+        return CONTACT_GAPS.get(rule["label"])
+    return GAP_LABELS.get(rule["rule"], {}).get(rule["value"])
+
+
+def next_status_gap(breakdown: dict) -> tuple[str, list[str]] | None:
+    """What keeps a lead from the next status (T12a): ("HOT", ["no timeline"]), or None for a HOT lead.
+
+    A capped lead: the cap's cause (without it the lead would be HOT). Otherwise the missing signals worth the
+    most points, most first (timeline first on a tie), until they would reach the next status's score.
+    """
     status = breakdown["lead_status"]
+    if status not in NEXT_STATUS:
+        return None
+    next_status, threshold = NEXT_STATUS[status]
+    if breakdown["caps"]:
+        return next_status, [CAP_CAUSES[c["rule"]] for c in breakdown["caps"]]
+    gaps = []
+    for rule in breakdown["rules"]:
+        label = _gap_label(rule)
+        if label:
+            gaps.append((rule["max"] - rule["points"], GAP_ORDER.index(rule["rule"]), label))
+    gaps.sort(key=lambda gap: (-gap[0], gap[1]))
+    needed, gained, named = threshold - breakdown["lead_score"], 0, []
+    for gain, _, label in gaps:
+        if gained >= needed:
+            break
+        named.append(label)
+        gained += gain
+    return next_status, named
+
+
+def recommended_action(breakdown: dict, lead: LeadData, callback_time: str | None = None) -> str:
+    """Fixed next step for the sales team, from the status (plus the gaps for a WARM lead).
+
+    A callback time the customer asked for replaces the status's own timing (T12a), so the action never says
+    "within 24 hours" next to "the day after tomorrow".
+    """
+    status = breakdown["lead_status"]
+    call = f"Call {callback_time.strip().rstrip('.!?')}, as requested" if callback_time else None
     if status == "HOT":
-        parts = [HOT_ACTION]
-    elif status == "COLD":
-        parts = [COLD_ACTION]
-    else:
-        parts = [WARM_ACTION]
-        caps = {c["rule"] for c in breakdown["caps"]}
-        if "unverified_location" in caps:
-            parts.append(f"Verify service availability for {lead.city}.")
-        if "outside_catalog" in caps:
-            parts.append("Check whether the requirement fits the reference packages.")
-        if lead.ownership == "rent":
-            parts.append("Confirm the owner's permission for a rooftop installation.")
-        missing = missing_details(lead, breakdown)
-        if missing:
-            parts.append("Collect: " + ", ".join(missing) + ".")
-    if callback_time:
-        parts.append(f"Customer asked for a callback: {callback_time}.")
+        return f"{call}, and offer a site assessment." if call else HOT_ACTION
+    if status == "COLD":
+        return f"{call}. {COLD_AFTER_CALLBACK}" if call else COLD_ACTION
+    parts = [f"{call}." if call else WARM_ACTION]
+    rules = {r["rule"]: r for r in breakdown["rules"]}
+    if rules["location"]["value"] == "unverified":
+        parts.append(f"Verify service availability for {lead.city}.")
+    if lead.requirement_outside_catalog:
+        parts.append("Check whether the requirement fits the reference packages.")
+    if lead.ownership == "rent":
+        parts.append("Confirm the owner's permission for a rooftop installation.")
+    missing = missing_details(lead, breakdown)
+    if missing:
+        parts.append("Collect: " + ", ".join(missing) + ".")
     return " ".join(parts)
 
 

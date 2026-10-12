@@ -6,7 +6,9 @@ from app.leads.scoring import (
     COLD_ACTION,
     HOT_ACTION,
     WARM_ACTION,
+    missing_details,
     missing_for_creation,
+    next_status_gap,
     recommended_action,
     score_lead,
     status_for,
@@ -55,6 +57,20 @@ def test_a_cap_never_raises_a_low_score():
     _, b = scored({**EXPLORER, "city": "Pune"})
     assert b["lead_score"] == b["raw_score"] < 45
     assert b["lead_status"] == "COLD"
+
+
+def test_a_cap_that_changes_nothing_is_not_recorded():
+    # T12a: a COLD lead in an unlisted city (the seed's Rohit Patel, 31) carried "capped at WARM" for nothing
+    _, cold = scored({**EXPLORER, "city": "Pune"})
+    assert cold["caps"] == []
+    # A WARM lead under 74 in an unlisted city: no cap, but the action still asks to verify the city
+    data, warm = scored({**RAHUL, "city": "Pune", "timeline_bucket": None, "email": None})
+    assert (warm["raw_score"], warm["lead_status"], warm["caps"]) == (58, "WARM", [])
+    assert "Verify service availability for Pune." in recommended_action(warm, data)
+    # Outside the catalog under 74: no cap either, and the action still asks to check the requirement
+    data, outside = scored({**RAHUL, "requirement_outside_catalog": True, "timeline_bucket": None, "email": None})
+    assert (outside["raw_score"], outside["lead_status"], outside["caps"]) == (73, "WARM", [])
+    assert "Check whether the requirement fits the reference packages." in recommended_action(outside, data)
 
 
 def test_explorer_is_cold():
@@ -152,7 +168,47 @@ def test_warm_action_names_the_gaps():
     action = recommended_action(b, data)
     assert action.startswith(WARM_ACTION)
     assert "Verify service availability for Pune." in action
-    assert "Collect: ownership, rooftop availability." in action
+    assert "Collect: rooftop availability, ownership." in action
+
+
+def test_missing_details_most_useful_first_and_never_a_known_one():
+    # T12a order: timeline (up to 20), a size/bill/usage figure (+10), rooftop and ownership, then email or phone
+    words_only = {"name": "Asha Rao", "phone": "9876543210", "city": "Noida", "requirement": "solar for my office",
+                  "property_type": "office"}
+    data, b = scored(words_only, "listed")
+    assert missing_details(data, b) == ["timeline", "monthly bill or usage", "rooftop availability", "ownership",
+                                        "email"]
+    data, b = scored({**words_only, "monthly_bill_inr": "2000", "rooftop_available": True}, "listed")
+    assert missing_details(data, b) == ["timeline", "ownership", "email"]  # the bill and the roof were given
+    data, b = scored({**RAHUL, "ownership": "own", "rooftop_available": True})
+    assert missing_details(data, b) == []
+
+
+@pytest.mark.parametrize("raw, location, expected", [
+    # The replay's lead (T12a): Noida, a ₹2,000 bill, words only for the need, phone only, no timeline
+    ({"name": "Asha Rao", "phone": "9876543210", "city": "Noida", "monthly_bill_inr": "2000",
+      "requirement": "solar for my office", "property_type": "office", "intent_level": "interested"},
+     "listed", ("HOT", ["no timeline"])),
+    ({**RAHUL, "city": "Pune"}, None, ("HOT", ["city not in the listed service areas"])),  # capped: the cap's cause
+    # COLD 36, 9 short: no requirement and only exploring are worth 20 each; on a tie the requirement goes first
+    (EXPLORER, None, ("WARM", ["no requirement"])),
+    # COLD 21 in an unlisted city, 24 short: two signals; the city is not named (more details can't change it)
+    ({**EXPLORER, "city": "Pune"}, None, ("WARM", ["no requirement", "only exploring"])),
+    (RAHUL, None, None),  # HOT: nothing above it
+])
+def test_next_status_gap(raw, location, expected):
+    _, b = scored(raw, location)
+    assert next_status_gap(b) == expected
+
+
+def test_next_status_gap_names_more_than_one_signal_when_one_is_not_enough():
+    _, b = scored({"name": "Asha Rao", "phone": "9876543210", "city": "Kanpur", "property_type": "house",
+                   "intent_level": "exploring"})  # 5 + 0 + 20 + 0 + 6 + 2 = 33, COLD; 12 short of WARM
+    assert b["lead_score"] == 33
+    assert next_status_gap(b) == ("WARM", ["no timeline"])  # +20 is enough on its own; the timeline goes first
+    _, warm = scored({"name": "Asha Rao", "phone": "9876543210", "city": "Kanpur", "property_type": "house",
+                      "intent_level": "interested", "requirement": "solar for the house"})  # 15+10+20+0+6+2 = 53
+    assert next_status_gap(warm) == ("HOT", ["no timeline", "no size, bill or usage"])  # 22 short: 20 + 10
 
 
 def test_warm_action_for_a_renter_outside_the_catalog():
@@ -165,10 +221,20 @@ def test_warm_action_for_a_renter_outside_the_catalog():
     assert "Collect: timeline, email." in action
 
 
-def test_callback_time_is_added_to_any_action():
-    data, b = scored(RAHUL)
-    action = recommended_action(b, data, callback_time="tomorrow evening")
-    assert action == HOT_ACTION + " Customer asked for a callback: tomorrow evening."
+def test_a_callback_time_replaces_the_status_timing_in_every_action():
+    # T12a: "Follow up within 24 hours" clashed with "callback day after tomorrow"
+    data, hot = scored(RAHUL)
+    assert recommended_action(hot, data, callback_time="tomorrow evening") == (
+        "Call tomorrow evening, as requested, and offer a site assessment.")
+    data, warm = scored({**RAHUL, "city": "Pune"})
+    action = recommended_action(warm, data, callback_time="day after tomorrow, 4pm")
+    assert action.startswith("Call day after tomorrow, 4pm, as requested. Verify service availability for Pune.")
+    data, cold = scored(EXPLORER)
+    assert recommended_action(cold, data, callback_time="Friday.") == (
+        "Call Friday, as requested. Add to the nurture list and share product information.")
+    for action in (recommended_action(hot, data, "x"), recommended_action(warm, data, "x"),
+                   recommended_action(cold, data, "x")):
+        assert "within" not in action and "30 days" not in action
 
 
 def test_minimum_fields_for_a_lead():

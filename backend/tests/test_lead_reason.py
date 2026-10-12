@@ -84,12 +84,61 @@ def test_the_prompt_holds_no_personal_details_or_money(hot):
 def test_prompt_file_has_the_kb_section_16_rule():
     text = load_prompt("lead_qualification_prompt")
     assert "Never mention prices, costs, savings, subsidies, financing, EMIs, guarantees or dates." in text
-    for placeholder in ("{status}", "{score}", "{city}", "{factors}", "{caps}"):
+    for placeholder in ("{status}", "{score}", "{city}", "{factors}", "{caps}", "{next_status}"):
         assert placeholder in text
 
 
-def test_template_for_a_capped_lead():
+def test_template_for_a_capped_lead_names_the_cap_as_what_keeps_it_from_hot():
     _, warm = scored({**RAHUL, "city": "Pune"})
     reason = template_reason(warm)
     assert reason.startswith("WARM: ready to buy")
-    assert "capped at WARM" in reason
+    assert reason.endswith("; not HOT yet: city not in the listed service areas.")
+
+
+# ---------- T12a: what keeps a lead from the next status ----------
+
+REPLAY_LEAD = {"name": "Asha Rao", "phone": "9876543210", "city": "Lucknow", "monthly_bill_inr": "2000",
+               "requirement": "solar for my office", "property_type": "office", "intent_level": "interested"}
+
+
+def test_a_warm_reason_says_what_it_still_needs_for_hot():
+    _, warm = scored(REPLAY_LEAD)
+    assert warm["lead_status"] == "WARM"
+    assert template_reason(warm).endswith("; not HOT yet: no timeline.")
+    llm = FakeLLM("Interested office lead in Lucknow with a clear bill and a phone, not HOT yet: no timeline.")
+    reason, source = write_reason(warm, "Lucknow", llm)
+    assert source == "llm" and reason.endswith("not HOT yet: no timeline.")
+    prompt = llm.calls[0][0].content
+    assert "Missing for the next status: not HOT yet: no timeline" in prompt
+    for secret in ("Asha", "9876543210", "2000", "₹"):  # still no personal details or money
+        assert secret not in prompt
+
+
+def test_a_reason_that_does_not_say_what_is_missing_gets_the_template():
+    _, warm = scored(REPLAY_LEAD)
+    reason, source = write_reason(warm, "Lucknow", FakeLLM("Interested office lead with a clear bill."))
+    assert (reason, source) == (template_reason(warm), "template")
+
+
+def test_the_not_yet_part_is_the_only_place_another_status_may_appear():
+    _, warm = scored(REPLAY_LEAD)
+    bad = "A HOT prospect soon, not HOT yet: no timeline."
+    assert write_reason(warm, "Lucknow", FakeLLM(bad))[1] == "template"
+
+
+def test_a_cold_lead_in_an_unlisted_city_never_mentions_a_cap():
+    # T12 note 8: Rohit Patel (COLD 31, Mumbai) had "...: capped at WARM." in his reason
+    _, cold = scored({"name": "Rohit Patel", "email": "rohit@example.com", "city": "Mumbai", "property_type": "office",
+                      "requirement": "solar for the office", "timeline_bucket": "gt_6m", "intent_level": "exploring"})
+    assert (cold["lead_status"], cold["caps"]) == ("COLD", [])
+    reason = template_reason(cold)
+    assert "capped" not in reason and "WARM:" not in reason
+    assert reason.endswith("; not WARM yet: only exploring.")
+
+
+def test_a_hot_lead_needs_no_not_yet_part():
+    _, hot = scored(RAHUL)
+    llm = FakeLLM(GOOD)
+    assert write_reason(hot, "Lucknow", llm) == (GOOD, "llm")
+    assert "Missing for the next status: none: it is already HOT" in llm.calls[0][0].content
+    assert " yet" not in template_reason(hot)

@@ -1,23 +1,31 @@
-"""LLM access: the embedder, plus main_llm() and fast_llm() chat models. Everything else uses these.
+"""LLM access: the embedder and the chat models. Everything else uses these.
 
 Embedder: google-genai directly. gemini-embedding-2 has no task_type, so the task goes in the text:
 documents are "title: ... | text: ...", queries are "task: question answering | query: ...".
 
-Chat models: Gemini (langchain-google-genai) with an automatic fallback to Groq (langchain-groq).
-The understand step uses understand_llm(): several models in turn, each cut off after 5 s.
+Chat models: Gemini (langchain-google-genai) and Groq (langchain-groq). Every chat call goes through
+model_chain (T12a): it tries its models in order, one attempt each with a wall-clock deadline, and passes
+over a model that failed recently (SKIPS), so a slow Google day costs seconds, not half a minute.
+- understand_llm(): main, Groq, fast; 4 s each
+- chat_llm(): the answer step; Gemini 8 s, then Groq 10 s, then the fast model 8 s (last resort)
+- reason_llm(): the lead reason; the main model only, 4 s (the caller falls back to a template)
 """
 import contextvars
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, Callable
 
+import groq
+import httpx
 from google import genai
 from google.genai import types
+from langchain_core.exceptions import ModelTimeoutError
 from langchain_core.messages import BaseMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -37,18 +45,141 @@ DOCUMENT_HTTP = types.HttpOptions(
         attempts=3, initial_delay=2, max_delay=20, http_status_codes=RETRY_STATUS_CODES
     ),
 )
-# Chat path: fail fast so search can fall back to keyword (worst case about 22 s).
-QUERY_HTTP = types.HttpOptions(
-    timeout=10_000,
-    retry_options=types.HttpRetryOptions(
-        attempts=2, initial_delay=1, max_delay=2, http_status_codes=RETRY_STATUS_CODES
-    ),
-)
+# Chat path (T12a): one attempt, cut off after QUERY_TIMEOUT_S by the deadline pool, so a slow query falls
+# back to keyword search within 3 s (it was 10 s + one retry, about 22 s). Gemini refuses deadlines under
+# 10 s, so the HTTP timeout stays at 10 s and only ends the late call.
+QUERY_HTTP = types.HttpOptions(timeout=10_000, retry_options=types.HttpRetryOptions(attempts=1))
+QUERY_TIMEOUT_S = 3
 
 
 class EmbeddingError(RuntimeError):
     """Embedding failed after retries, or the response had the wrong shape."""
 
+
+class LLMError(RuntimeError):
+    """The chat model failed (every model in the chain failed or was skipped), or gave an empty reply."""
+
+
+class DeadlineExceeded(LLMError):
+    """A call did not answer within its wall-clock deadline."""
+
+
+# ---------- deadlines and the skip list (T12a) ----------
+
+# A late call keeps its worker busy until its own HTTP timeout (Gemini 10 s, Groq 4-10 s). A normal turn
+# holds one worker at a time for about 2 s; a slow-Google turn holds one hung worker for 10 s and then
+# skips Gemini. 8 workers keep calls out of the queue (the deadline counts from submit).
+DEADLINE_WORKERS = 8
+QUEUE_WARN_S = 0.5
+# How long a model is skipped once its window opens: a timeout or a 429 (a per-minute quota, Groq's
+# tokens too) for 60 s, a server error for 120 s.
+SKIP_SECONDS = {"timeout": 60, "429": 60, "5xx": 120}
+_TIMEOUT_ERRORS = (TimeoutError, httpx.TimeoutException, groq.APITimeoutError, ModelTimeoutError)
+
+_deadline_pool = ThreadPoolExecutor(max_workers=DEADLINE_WORKERS, thread_name_prefix="llm-deadline")
+
+
+def call_with_deadline(fn: Callable[[], Any], seconds: float) -> Any:
+    """fn() on a small thread pool, raising DeadlineExceeded if it has not returned within `seconds`
+    (wall clock). A late call is left to finish there; its own HTTP timeout ends it.
+
+    The HTTP timeout cannot do this: Gemini refuses deadlines under 10 s, and httpx times each network
+    phase, not the whole call. This guard can also be tested with a fake slow model.
+    """
+    queued = time.perf_counter()
+
+    def run():
+        waited = time.perf_counter() - queued
+        if waited > QUEUE_WARN_S:  # the deadline counts from here too: the pool is too small
+            logger.warning("llm call waited for a worker", extra={"latency_ms": round(waited * 1000)})
+        return fn()
+
+    future = _deadline_pool.submit(contextvars.copy_context().run, run)  # keeps tracing context
+    try:
+        return future.result(timeout=seconds)
+    except FutureTimeout:  # the deadline passed (or the call itself timed out)
+        raise DeadlineExceeded(f"no answer within {seconds} s") from None
+
+
+def failure_kind(exc: BaseException) -> str | None:
+    """'timeout', '429' or '5xx' when the error (or one it was raised from) is one of those; None for
+    anything else (a 400, a missing model, unparsable output), which never opens a skip window."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (DeadlineExceeded, *_TIMEOUT_ERRORS)):
+            return "timeout"
+        code = getattr(exc, "status_code", None)  # Groq (and httpx)
+        if not isinstance(code, int):
+            code = getattr(exc, "code", None)  # google-genai
+        if isinstance(code, int) and code == 429:
+            return "429"
+        if isinstance(code, int) and 500 <= code <= 599:
+            return "5xx"
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def failures_before_skip(use: str, kind: str) -> int:
+    """How many failures in a row of one model and use open its skip window.
+
+    An understand timeout opens it at once: its 4 s deadline is twice the main model's worst normal time.
+    One slow answer or reason does not (that call just goes to the next model): Groq carries only about one
+    turn a minute, so a false trip on a normal day would turn the next turns into "try again". The query
+    embedder needs 2 of anything, because keyword-only search finds worse answers.
+    """
+    if use == "embed":
+        return 2
+    if kind == "timeout" and use in ("answer", "reason"):
+        return 2
+    return 1
+
+
+class SkipList:
+    """Models that failed recently and are skipped until their window ends (in memory, one process, like
+    the rate limiter). The window is per model, for every use; the count of failures in a row is per model
+    and use, and a success of that use resets it."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
+        self._until: dict[str, float] = {}  # model key -> clock time the skip ends
+        self._streak: dict[tuple[str, str], int] = {}  # (model key, use) -> failures in a row
+        self._lock = threading.Lock()
+
+    def left(self, key: str) -> float:
+        """Seconds until the model may be tried again (0: try it now)."""
+        with self._lock:
+            return max(0.0, self._until.get(key, 0.0) - self._clock())
+
+    def failed(self, key: str, use: str, kind: str) -> bool:
+        """Count a timeout, 429 or 5xx; open the model's window once enough happened in a row. True if it opened."""
+        with self._lock:
+            streak = self._streak.get((key, use), 0) + 1
+            if streak < failures_before_skip(use, kind):
+                self._streak[(key, use)] = streak
+                return False
+            self._streak[(key, use)] = 0
+            self._until[key] = self._clock() + SKIP_SECONDS[kind]
+        logger.warning("llm marked down", extra={"model": key, "use": use, "skip_reason": kind,
+                                                 "skip_s": SKIP_SECONDS[kind]})
+        return True
+
+    def succeeded(self, key: str, use: str) -> None:
+        """A call of this use answered: its count of failures in a row starts again."""
+        with self._lock:
+            self._streak.pop((key, use), None)
+
+    def clear(self) -> None:
+        """Forget every failure (tests)."""
+        with self._lock:
+            self._until.clear()
+            self._streak.clear()
+
+
+SKIPS = SkipList()
+
+
+# ---------- embeddings ----------
 
 def query_text(query: str) -> str:
     """Wrap a user question in the query format gemini-embedding-2 expects."""
@@ -77,7 +208,23 @@ class Embedder:
         return list(self._query_cache(text))
 
     def _embed_query_uncached(self, text: str) -> tuple[float, ...]:
-        return tuple(self._embed([query_text(text)], QUERY_HTTP)[0])
+        """One attempt, cut off after QUERY_TIMEOUT_S; skipped after 2 failures in a row (T12a)."""
+        key = f"gemini-embed:{self.model}"
+        left = SKIPS.left(key)
+        if left:
+            logger.info("llm skipped", extra={"model": key, "use": "embed", "skip_left_s": round(left)})
+            raise EmbeddingError(f"query embedding skipped for {round(left)} s")
+        try:
+            vector = call_with_deadline(lambda: self._embed([query_text(text)], QUERY_HTTP)[0], QUERY_TIMEOUT_S)
+        except Exception as exc:
+            kind = failure_kind(exc)
+            if kind:
+                SKIPS.failed(key, "embed", kind)
+            if isinstance(exc, EmbeddingError):
+                raise
+            raise EmbeddingError(f"query embedding failed: {type(exc).__name__}") from exc
+        SKIPS.succeeded(key, "embed")
+        return tuple(vector)
 
     def _embed(self, texts: list[str], http_options: types.HttpOptions) -> list[list[float]]:
         """One API call. Each text gets its own Content, otherwise the API merges them into one vector."""
@@ -123,40 +270,24 @@ def query_embedder() -> Embedder | None:
 
 # ---------- chat models ----------
 
-LLM_TIMEOUT_S = 15
-# Gemini: 15 s per attempt, 2 attempts (one retry) on timeouts, 408 and 5xx. 429 is left out on
-# purpose: a quota error will not clear in a second, so it goes straight to Groq.
-# Worst case for one reply: 15 s + ~1 s + 15 s on Gemini, then 15 s on Groq (about 46 s).
-GEMINI_CHAT_HTTP = types.HttpOptions(
-    timeout=LLM_TIMEOUT_S * 1000,
-    retry_options=types.HttpRetryOptions(
-        attempts=2, initial_delay=1, max_delay=2, http_status_codes=[408, 500, 502, 503, 504]
-    ),
-)
-# The understand step (T10b): one attempt per model, cut off after 5 s, then the next model answers.
-# Measured on the same understand input (3 calls each): main 1.7 s median (worst 1.9 s), Groq 1.0 s (but
-# about 2,300 tokens a call against its 8K tokens a minute), fast 17.4 s (worst 18.5 s). So main goes first.
-UNDERSTAND_TIMEOUT_S = 5
-# The Gemini API refuses a deadline under 10 s (400 "Minimum allowed deadline is 10s"), so the HTTP timeout
-# is 10 s with no retry, and with_deadline cuts the call off at 5 s.
+# The Gemini API refuses a deadline under 10 s (400 "Minimum allowed deadline is 10s"), so every Gemini chat
+# request gets a 10 s HTTP timeout and no retry; call_with_deadline cuts the call off sooner (T12a).
 GEMINI_MIN_TIMEOUT_S = 10
-UNDERSTAND_HTTP = types.HttpOptions(
+GEMINI_CHAT_HTTP = types.HttpOptions(
     timeout=GEMINI_MIN_TIMEOUT_S * 1000, retry_options=types.HttpRetryOptions(attempts=1)
 )
-# A late call keeps its worker busy until its own HTTP timeout (Gemini 10 s, Groq 5 s), so a worst-case
-# turn holds up to 3 workers for up to 10 s. 8 workers keep calls out of the queue (the deadline counts
-# from submit) at our traffic: about 5 turns a minute, the main model's limit.
-DEADLINE_WORKERS = 8
-QUEUE_WARN_S = 0.5
+# Wall-clock deadlines per use (T12a). Understand and the reason are small calls (the main model answered
+# understand in at most 1.9 s in T10b, so 4 s is twice that); an answer is longer and may call tools. Groq is
+# the answer's last resort, so it gets more room.
+UNDERSTAND_TIMEOUT_S = 4
+ANSWER_TIMEOUT_S = 8
+GROQ_ANSWER_TIMEOUT_S = 10
+REASON_TIMEOUT_S = 4
 THINKING_LEVEL = "minimal"  # Gemini 3.x thinks by default; minimal is the lowest level (fastest)
 GROQ_MAX_RETRIES = 0
 GROQ_REASONING_EFFORT = "low"  # keeps the fallback fast and under Groq's 8K tokens/min
 PROVIDERS = {"google_genai": "gemini", "groq": "groq"}  # response_metadata["model_provider"] -> name
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-
-
-class LLMError(RuntimeError):
-    """The chat model failed (after retries and the fallback), or gave an empty reply."""
 
 
 @dataclass
@@ -184,14 +315,12 @@ class GeminiChat(ChatGoogleGenerativeAI):
         return super()._prepare_request(messages, **kwargs)
 
 
-def gemini_chat(model: str, settings: Settings, http: types.HttpOptions = GEMINI_CHAT_HTTP) -> GeminiChat:
-    """Gemini chat model: minimal thinking, our timeout and retry rules (or `http`)."""
-    return GeminiChat(
-        model=model, google_api_key=settings.google_api_key, thinking_level=THINKING_LEVEL, request_http=http
-    )
+def gemini_chat(model: str, settings: Settings) -> GeminiChat:
+    """Gemini chat model: minimal thinking, a 10 s HTTP timeout and no retry."""
+    return GeminiChat(model=model, google_api_key=settings.google_api_key, thinking_level=THINKING_LEVEL)
 
 
-def groq_chat(settings: Settings, timeout_s: float = LLM_TIMEOUT_S) -> ChatGroq:
+def groq_chat(settings: Settings, timeout_s: float) -> ChatGroq:
     """Groq fallback model (FALLBACK_MODEL). One attempt; its reasoning never reaches the reply."""
     return ChatGroq(
         model=settings.fallback_model,
@@ -200,10 +329,6 @@ def groq_chat(settings: Settings, timeout_s: float = LLM_TIMEOUT_S) -> ChatGroq:
         max_retries=GROQ_MAX_RETRIES,
         reasoning_effort=GROQ_REASONING_EFFORT,
     )
-
-
-def _not_configured(_messages) -> None:
-    raise LLMError("no LLM configured: set GOOGLE_API_KEY and/or GROQ_API_KEY + FALLBACK_MODEL")
 
 
 def _shape(model: Runnable, provider: str, tools: list | None, schema: type | None) -> Runnable:
@@ -217,6 +342,114 @@ def _shape(model: Runnable, provider: str, tools: list | None, schema: type | No
     return model
 
 
+@dataclass(frozen=True)
+class Candidate:
+    """One model to try: its key in the skip list ('gemini:<model>' or 'groq:<model>'), the model (plain,
+    tools bound or structured output), its use (understand, answer or reason) and its wall-clock deadline."""
+
+    key: str
+    model: Runnable
+    use: str
+    seconds: float
+
+
+def tokens_of(result: Any) -> int | None:
+    """Total tokens of a call (input and output) from the reply's usage metadata, if the provider sent it."""
+    message = result.get("raw") if isinstance(result, dict) else result
+    usage = getattr(message, "usage_metadata", None) or {}
+    return usage.get("total_tokens")
+
+
+def model_chain(candidates: list[Candidate], skips: SkipList | None = None) -> Runnable:
+    """Try the candidates in order, one attempt each with its own deadline, and return the first answer.
+
+    A model inside its skip window is passed over at once; a timeout, 429 or 5xx counts towards opening its
+    window (failures_before_skip). Unparsable structured output goes to the next model without counting.
+    Raises LLMError when every candidate failed or was skipped (with none configured, when called).
+    """
+
+    def call(messages, config: RunnableConfig) -> Any:
+        skip_list = skips or SKIPS
+        if not candidates:
+            raise LLMError("no LLM configured: set GOOGLE_API_KEY and/or GROQ_API_KEY + FALLBACK_MODEL")
+        first_error: Exception | None = None
+        for c in candidates:
+            left = skip_list.left(c.key)
+            if left:
+                logger.info("llm skipped", extra={"model": c.key, "use": c.use, "skip_left_s": round(left)})
+                first_error = first_error or LLMError(f"{c.key} skipped for {round(left)} s")
+                continue
+            start = time.perf_counter()
+            try:
+                result = call_with_deadline(lambda c=c: c.model.invoke(messages, config), c.seconds)
+                if isinstance(result, dict) and "parsed" in result and result["parsed"] is None:
+                    raise LLMError("structured output could not be parsed")
+            except Exception as exc:
+                kind = failure_kind(exc)
+                logger.warning("llm call failed", extra={
+                    "model": c.key, "use": c.use, "failure": kind or type(exc).__name__,
+                    "latency_ms": round((time.perf_counter() - start) * 1000),
+                })
+                if kind:
+                    skip_list.failed(c.key, c.use, kind)
+                first_error = first_error or exc
+                continue
+            skip_list.succeeded(c.key, c.use)
+            logger.info("llm call", extra={
+                "model": c.key, "use": c.use, "latency_ms": round((time.perf_counter() - start) * 1000),
+                "tokens": tokens_of(result),
+            })
+            return result
+        raise LLMError(f"every model failed or was skipped ({type(first_error).__name__})") from first_error
+
+    return RunnableLambda(call, name="model_chain")
+
+
+def _gemini(model: str, settings: Settings, use: str, seconds: float, tools=None, schema=None) -> Candidate:
+    return Candidate(f"gemini:{model}", _shape(gemini_chat(model, settings), "gemini", tools, schema), use, seconds)
+
+
+def _groq(settings: Settings, use: str, seconds: float, tools=None, schema=None) -> Candidate:
+    model = _shape(groq_chat(settings, seconds), "groq", tools, schema)
+    return Candidate(f"groq:{settings.fallback_model}", model, use, seconds)
+
+
+def _build(make: Callable[[], list[Candidate]], what: str) -> list[Candidate]:
+    """The candidates, or none if building them fails (the chain then raises LLMError when called)."""
+    try:
+        return make()
+    except Exception as exc:
+        logger.error("building the %s models failed: %s", what, type(exc).__name__)
+        return []
+
+
+def answer_candidates(
+    model: str, settings: Settings | None = None, *, tools: list | None = None, schema: type | None = None
+) -> list[Candidate]:
+    """The answer step's models: Gemini `model` (8 s, one attempt), then Groq (10 s), then the fast Gemini model
+    (8 s) as the last resort. Unconfigured ones are left out. tools: all get them bound (Groq without parallel
+    calls); schema: all return {"raw", "parsed", "parsing_error"}.
+
+    Why the fast model last (T12a live run): with the main model timing out and Groq out of tokens for the
+    minute (its 8K tokens a minute carry about one turn), every turn ended in "try again"; the fast model, on
+    its own quota, was answering in about 2 s. It is reached only when both others fail or are skipped.
+    """
+    settings = settings or get_settings()
+
+    def make() -> list[Candidate]:
+        candidates = []
+        if settings.google_api_key and model:
+            candidates.append(_gemini(model, settings, "answer", ANSWER_TIMEOUT_S, tools, schema))
+        if settings.groq_api_key and settings.fallback_model:
+            candidates.append(_groq(settings, "answer", GROQ_ANSWER_TIMEOUT_S, tools, schema))
+        fast = settings.llm_model_fast
+        if settings.google_api_key and fast and fast != model:
+            candidates.append(_gemini(fast, settings, "answer", ANSWER_TIMEOUT_S, tools, schema))
+        return candidates
+
+    return _build(make, "answer")
+
+
 def chat_llm(
     model: str,
     settings: Settings | None = None,
@@ -224,108 +457,63 @@ def chat_llm(
     tools: list | None = None,
     schema: type | None = None,
 ) -> Runnable:
-    """Gemini `model`, falling back to Groq on any error. Never raises.
-
-    tools: both models get the tools bound (each built separately, as fallbacks need).
-    schema: both return {"raw": AIMessage, "parsed": schema | None, "parsing_error": ...}.
-    With only one provider configured, that one is used alone. With none (or if building fails),
-    the result raises LLMError when called, so the chat replies "degraded" instead of crashing.
-    """
-    settings = settings or get_settings()
-    try:
-        gemini = gemini_chat(model, settings) if settings.google_api_key and model else None
-        groq = groq_chat(settings) if settings.groq_api_key and settings.fallback_model else None
-        gemini = _shape(gemini, "gemini", tools, schema) if gemini else None
-        groq = _shape(groq, "groq", tools, schema) if groq else None
-    except Exception as exc:
-        logger.error("building the chat model failed: %s", type(exc).__name__)
-        gemini = groq = None
-    if gemini and groq:
-        return gemini.with_fallbacks([groq])
-    return gemini or groq or RunnableLambda(_not_configured)
+    """Gemini `model`, then Groq, then the fast model (answer_candidates), through model_chain. Never raises when
+    built; with no provider configured, it raises LLMError when called, so the chat replies "degraded" instead of
+    crashing. Worst case, when all three hang before any skip window is open: 8 + 10 + 8 = 26 s (it was about
+    46 s before T12a for two models); once a window is open, a skipped model costs nothing."""
+    return model_chain(answer_candidates(model, settings, tools=tools, schema=schema))
 
 
 @lru_cache
 def main_llm() -> Runnable:
-    """The model that writes answers (LLM_MODEL_MAIN). Also the FastAPI dependency tests override."""
+    """The model that writes answers (LLM_MODEL_MAIN), without tools."""
     return chat_llm(get_settings().llm_model_main)
 
 
-@lru_cache
-def fast_llm() -> Runnable:
-    """The model for small steps (LLM_MODEL_FAST), e.g. the lead reason."""
-    return chat_llm(get_settings().llm_model_fast)
-
-
-# ---------- the understand step: short deadlines, then the next model ----------
-
-_deadline_pool = ThreadPoolExecutor(max_workers=DEADLINE_WORKERS, thread_name_prefix="llm-deadline")
-
-
-def with_deadline(model: Runnable, seconds: float = UNDERSTAND_TIMEOUT_S) -> Runnable:
-    """`model`, but raising LLMError if it has not answered within `seconds` (wall clock) or its structured
-    output could not be parsed, so a fallback answers instead.
-
-    The HTTP timeout cannot do this: Gemini refuses deadlines under 10 s, and httpx times each network
-    phase, not the whole call. This guard can also be tested with a fake slow model. The call runs on a
-    small thread pool; a late call is left to finish there and its own HTTP timeout ends it.
-    """
-
-    def call(messages, config: RunnableConfig) -> Any:
-        queued = time.perf_counter()
-
-        def run():
-            waited = time.perf_counter() - queued
-            if waited > QUEUE_WARN_S:  # the deadline counts from here too: the pool is too small
-                logger.warning("llm call waited for a worker", extra={"latency_ms": round(waited * 1000)})
-            return model.invoke(messages, config)
-
-        future = _deadline_pool.submit(contextvars.copy_context().run, run)  # keeps tracing context
-        try:
-            result = future.result(timeout=seconds)
-        except FutureTimeout:
-            logger.warning("llm call cut off", extra={"latency_ms": round(seconds * 1000)})
-            raise LLMError(f"no answer within {seconds} s") from None
-        if isinstance(result, dict) and "parsed" in result and result["parsed"] is None:
-            raise LLMError("structured output could not be parsed")
-        return result
-
-    return RunnableLambda(call, name="with_deadline")
-
-
-def deadline_chain(models: list[Runnable], seconds: float = UNDERSTAND_TIMEOUT_S) -> Runnable:
-    """Every model gets its own `seconds`; on a timeout or error the next one answers. When all fail it raises
-    the first one's error (with no models, LLMError when called); understand() turns that into LLMError."""
-    wrapped = [with_deadline(m, seconds) for m in models]
-    if not wrapped:
-        return RunnableLambda(_not_configured)
-    return wrapped[0].with_fallbacks(wrapped[1:]) if len(wrapped) > 1 else wrapped[0]
-
-
-def understand_candidates(schema: type, settings: Settings | None = None) -> list[Runnable]:
-    """The understand step's models in order (T10b measurement): main Gemini, fast Gemini, then Groq.
-    One attempt each (HTTP timeout: Gemini 10 s, its minimum; Groq 5 s), structured output with the raw
-    message kept; understand_llm cuts each off after 5 s. Groq is last: its 8K tokens a minute is shared
-    with the agent's own fallback. Unconfigured ones are left out."""
+def reason_candidates(settings: Settings | None = None) -> list[Candidate]:
+    """The lead reason's model (T12a): the main model only, 4 s. It was the fast model, which took 14-30 s
+    and returned 504s in T11; Groq is left out to keep its tokens for customers."""
     settings = settings or get_settings()
-    candidates = []
-    try:
-        if settings.google_api_key:
-            for model in (settings.llm_model_main, settings.llm_model_fast):
-                if model:
-                    candidates.append(_shape(gemini_chat(model, settings, UNDERSTAND_HTTP), "gemini", None, schema))
+
+    def make() -> list[Candidate]:
+        if not (settings.google_api_key and settings.llm_model_main):
+            return []
+        return [_gemini(settings.llm_model_main, settings, "reason", REASON_TIMEOUT_S)]
+
+    return _build(make, "reason")
+
+
+@lru_cache
+def reason_llm() -> Runnable:
+    """The model for the lead reason; write_reason uses the template sentence when it fails or is skipped."""
+    return model_chain(reason_candidates())
+
+
+def understand_candidates(schema: type, settings: Settings | None = None) -> list[Candidate]:
+    """The understand step's models in order (T12a): main Gemini, Groq, then fast Gemini, each one attempt cut
+    off after 4 s, with structured output and the raw message kept. Groq is second because the fast model
+    took 17 s in T10b and returned 504s in T11, while Groq answered in about 1 s. Unconfigured ones are left out."""
+    settings = settings or get_settings()
+
+    def make() -> list[Candidate]:
+        candidates = []
+        if settings.google_api_key and settings.llm_model_main:
+            candidates.append(_gemini(settings.llm_model_main, settings, "understand", UNDERSTAND_TIMEOUT_S,
+                                      schema=schema))
         if settings.groq_api_key and settings.fallback_model:
-            candidates.append(_shape(groq_chat(settings, UNDERSTAND_TIMEOUT_S), "groq", None, schema))
-    except Exception as exc:
-        logger.error("building the understand models failed: %s", type(exc).__name__)
-        return []
-    return candidates
+            candidates.append(_groq(settings, "understand", UNDERSTAND_TIMEOUT_S, schema=schema))
+        if settings.google_api_key and settings.llm_model_fast:
+            candidates.append(_gemini(settings.llm_model_fast, settings, "understand", UNDERSTAND_TIMEOUT_S,
+                                      schema=schema))
+        return candidates
+
+    return _build(make, "understand")
 
 
 def understand_llm(schema: type, settings: Settings | None = None) -> Runnable:
-    """The understand step's model: understand_candidates, each cut off after UNDERSTAND_TIMEOUT_S.
-    Raises when every one fails; the understand node then searches with the raw message."""
-    return deadline_chain(understand_candidates(schema, settings), UNDERSTAND_TIMEOUT_S)
+    """The understand step's model: understand_candidates through model_chain. Raises when every one fails
+    or is skipped; the understand node then searches with the raw message."""
+    return model_chain(understand_candidates(schema, settings))
 
 
 def provider_of(message: BaseMessage) -> str:

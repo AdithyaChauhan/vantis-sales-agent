@@ -1,4 +1,5 @@
 """Embedder tests with a fake Gemini client. No network."""
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -103,10 +104,73 @@ def test_query_fails_fast_and_documents_are_patient():
     embedder.embed_documents(["d"])
     query_options = client.calls[0].config.http_options
     document_options = client.calls[1].config.http_options
-    assert (query_options.timeout, query_options.retry_options.attempts) == (10_000, 2)
+    # T12a: one query attempt; the 3 s wall-clock deadline ends it (Gemini refuses HTTP deadlines under 10 s)
+    assert (query_options.timeout, query_options.retry_options.attempts) == (10_000, 1)
     assert (document_options.timeout, document_options.retry_options.attempts) == (30_000, 3)
     assert query_options is QUERY_HTTP and document_options is DOCUMENT_HTTP
-    assert 429 in query_options.retry_options.http_status_codes
+    assert llm.QUERY_TIMEOUT_S == 3
+
+
+class SlowClient(FakeClient):
+    """Answers each call after `delay` seconds."""
+
+    def __init__(self, delay):
+        super().__init__()
+        self.delay = delay
+
+    def embed_content(self, **kwargs):
+        time.sleep(self.delay)
+        return super().embed_content(**kwargs)
+
+
+class ScriptedClient(FakeClient):
+    """Fails ("fail": a 503) or answers ("ok"), call by call."""
+
+    def __init__(self, *steps):
+        super().__init__()
+        self.steps = list(steps)
+
+    def embed_content(self, **kwargs):
+        step = self.steps[min(len(self.calls), len(self.steps) - 1)]
+        if step == "fail":
+            self.calls.append(None)
+            error = RuntimeError("503 UNAVAILABLE")
+            error.code = 503
+            raise error
+        return super().embed_content(**kwargs)
+
+
+def test_a_slow_query_embedding_is_cut_off(monkeypatch):
+    monkeypatch.setattr(llm, "QUERY_TIMEOUT_S", 0.2)  # the real value is 3 s (checked above)
+    embedder, _ = make(SlowClient(delay=1))
+    start = time.perf_counter()
+    with pytest.raises(EmbeddingError):  # search() then falls back to keyword-only
+        embedder.embed_query("slow question")
+    assert time.perf_counter() - start < 0.6
+
+
+def test_one_failure_does_not_skip_the_embedder_but_two_in_a_row_do():
+    embedder, client = make(ScriptedClient("fail", "fail", "ok"))
+    key = "gemini-embed:fake-model"
+    with pytest.raises(EmbeddingError):
+        embedder.embed_query("first")
+    assert llm.SKIPS.left(key) == 0  # one blip costs one fallback, not the whole window
+    with pytest.raises(EmbeddingError):
+        embedder.embed_query("second")
+    assert llm.SKIPS.left(key) > 0  # two in a row: skipped for a while
+    with pytest.raises(EmbeddingError, match="skipped"):
+        embedder.embed_query("third")
+    assert len(client.calls) == 2  # the skipped query never reached the API
+
+
+def test_a_success_resets_the_embedders_count():
+    embedder, _ = make(ScriptedClient("fail", "ok", "fail"))
+    for text in ("one", "two", "three"):
+        try:
+            embedder.embed_query(text)
+        except EmbeddingError:
+            pass
+    assert llm.SKIPS.left("gemini-embed:fake-model") == 0
 
 
 def test_embedder_without_key_raises(monkeypatch):

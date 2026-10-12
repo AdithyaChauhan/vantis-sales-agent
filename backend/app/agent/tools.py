@@ -103,7 +103,7 @@ def make_tools(
         content = {"saved": True, "lead_id": result.lead.id, "fields_saved": sorted(lead)}
         pending = result.lead.reason_source == "template" and not ops.reason_now
         return _json(content), {"kind": "lead", "lead_id": result.lead.id, "saved_fields": dict(lead),
-                                "reason_pending": pending}
+                                "reason_pending": pending, "created": True}
 
     @tool(response_format="content_and_artifact")
     def update_lead(state: Annotated[dict, InjectedState]) -> tuple[str, dict]:
@@ -129,19 +129,21 @@ def make_tools(
     @tool(response_format="content_and_artifact")
     def schedule_callback(state: Annotated[dict, InjectedState]) -> tuple[str, dict]:
         """Log the customer's request to be called back, at the time they gave (takes no arguments).
-        Needs a saved lead. It is logged as a request: the team confirms it; it is never booked."""
+        Needs a saved lead. It is logged as a request: the team confirms it; it is never booked. A lead has
+        one callback request: a new time updates it."""
         lead_id, preferred = state.get("lead_id"), state.get("callback_time")
         if not lead_id:
             missing = ordered_missing(state.get("lead", {}), True)
             return _json({"logged": False, "reason": "save the lead first", "missing": missing}), {}
         if not preferred:
             return _json({"logged": False, "missing": ["preferred time"]}), {}
-        if state.get("callback_logged") != preferred:  # never log the same request twice
-            service.schedule_callback(ops.engine, lead_id, preferred)
+        updated = False
+        if state.get("callback_logged") != preferred:  # never log the same time twice
+            updated = service.schedule_callback(ops.engine, lead_id, preferred).updated
             ops.calls.append("callback")
-        content = {"logged": True, "status": "requested", "preferred_time": preferred,
+        content = {"logged": True, "updated": updated, "status": "requested", "preferred_time": preferred,
                    "note": "the team will confirm it"}
-        return _json(content), {"kind": "callback", "status": "requested", "time": preferred}
+        return _json(content), {"kind": "callback", "status": "requested", "time": preferred, "updated": updated}
 
     @tool(response_format="content_and_artifact")
     def create_support_request(state: Annotated[dict, InjectedState]) -> tuple[str, dict]:
@@ -191,6 +193,8 @@ def _lead_tool_detail(content: str) -> str:
         data = json.loads(content)
     except ValueError:
         return "error"
+    if data.get("updated"):
+        return "updated"
     if data.get("logged"):
         return "requested"
     if data.get("saved"):

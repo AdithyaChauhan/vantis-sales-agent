@@ -223,10 +223,12 @@ class UpdateLeadResult(BaseModel):
 
 
 class CallbackResult(BaseModel):
-    """schedule_callback's answer. The callback is a request; the team confirms it."""
+    """schedule_callback's answer. The callback is a request; the team confirms it. updated: the lead's
+    requested callback got a new time instead of a second request being added (T12a)."""
 
     callback: CallbackView
     message: str
+    updated: bool = False
 
 
 class SupportRequestView(BaseModel):

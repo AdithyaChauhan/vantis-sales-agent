@@ -1,14 +1,14 @@
 """Lead service against the Neon test branch (TEST_DATABASE_URL). Fake LLM; no real LLM calls."""
 import pytest
-from sqlalchemy import func, inspect, select, text
+from sqlalchemy import func, inspect, select
 from sqlalchemy.orm import Session
 
-from app.core.db import init_db
 from app.leads import validators as v
 from app.leads.models import Callback, Lead, SupportRequest
 from app.leads.scoring import HOT_ACTION
 from app.leads.service import (
     CALLBACK_MESSAGE,
+    CALLBACK_UPDATED_MESSAGE,
     LeadNotFound,
     create_lead,
     create_support_request,
@@ -18,23 +18,20 @@ from app.leads.service import (
     update_lead,
 )
 from tests.leads_data import AREAS, EXPLORER, RAHUL
-from tests.test_answer import FakeLLM
+from tests.test_answer import FakeLLM, ReasonLLM
 
 REASON = "Ready buyer with a clear 5 kW requirement and full contact details."
 
 
 @pytest.fixture
-def db(test_engine):
-    """The test database with empty lead tables."""
-    init_db(test_engine)
-    with test_engine.begin() as conn:
-        conn.execute(text("TRUNCATE leads, callbacks, support_requests RESTART IDENTITY CASCADE"))
-    return test_engine
+def db(leads_db):
+    """The test database with empty lead tables (emptied again after the test)."""
+    return leads_db
 
 
 @pytest.fixture
 def llm():
-    return FakeLLM(REASON)
+    return ReasonLLM(REASON)
 
 
 def count(engine, model) -> int:
@@ -54,7 +51,10 @@ def test_round_trip_create_update_rescore_read(db, llm):
     assert created.missing_fields == [] and created.errors == {}
     assert (lead.lead_score, lead.lead_status, lead.location_status) == (74, "WARM", "unverified")
     assert lead.score_breakdown["raw_score"] == 82
-    assert (lead.reason, lead.reason_source) == (REASON, "llm")
+    # A WARM reason ends with what keeps it from HOT; for a capped lead, the cap's cause (T12a)
+    expected = "Ready buyer with a clear 5 kW requirement and full contact details, not HOT yet: " \
+               "city not in the listed service areas."
+    assert (lead.reason, lead.reason_source) == (expected, "llm")
     assert "Verify service availability for Pune." in lead.recommended_action
     assert (lead.phone, lead.monthly_bill_inr, lead.system_size_kw) == ("+919876543210", 4000, 5.0)
     assert lead.customer_type == "residential" and lead.session_id == "s-1"
@@ -144,12 +144,27 @@ def test_callback_is_requested_never_booked(db, llm):
     assert "booked" not in result.message.lower() and "confirmed" not in result.message.lower()
     read = get_lead(db, lead.id)
     assert [c.preferred_time for c in read.callbacks] == ["tomorrow evening"]
-    assert read.recommended_action == HOT_ACTION + " Customer asked for a callback: tomorrow evening."
+    # The time the customer asked for replaces "within 1 hour" (T12a)
+    assert read.recommended_action == "Call tomorrow evening, as requested, and offer a site assessment."
     # The callback stays in the action after the lead is re-scored
     updated = update_lead(db, lead.id, {"ownership": "own"}, llm=llm, areas=AREAS).lead
-    assert updated.recommended_action.endswith("Customer asked for a callback: tomorrow evening.")
+    assert updated.recommended_action == "Call tomorrow evening, as requested, and offer a site assessment."
+    assert HOT_ACTION not in updated.recommended_action
     with pytest.raises(v.InvalidValue):
         schedule_callback(db, lead.id, "   ")
+
+
+def test_a_lead_keeps_one_callback_request_and_a_new_time_updates_it(db, llm):
+    lead = create_lead(db, RAHUL, llm=llm, areas=AREAS).lead
+    first = schedule_callback(db, lead.id, "4pm")
+    second = schedule_callback(db, lead.id, "day after tomorrow, 4pm")
+    assert (first.updated, first.message) == (False, CALLBACK_MESSAGE)
+    assert (second.updated, second.message) == (True, CALLBACK_UPDATED_MESSAGE)
+    assert second.callback.id == first.callback.id and second.callback.status == "requested"
+    read = get_lead(db, lead.id)
+    assert [(c.preferred_time, c.status) for c in read.callbacks] == [("day after tomorrow, 4pm", "requested")]
+    assert read.recommended_action == "Call day after tomorrow, 4pm, as requested, and offer a site assessment."
+    assert count(db, Callback) == 1
 
 
 def test_support_requests_are_not_leads(db):

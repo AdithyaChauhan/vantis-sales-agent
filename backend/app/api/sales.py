@@ -7,7 +7,7 @@ Errors are JSON: 401/429 (key), 404 (unknown id), 422 (field messages), 503 (dat
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Query, Response
 from langchain_core.runnables import Runnable
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.json_schema import SkipJsonSchema
@@ -45,8 +45,8 @@ def leads_engine(engine: Engine | None = Depends(get_engine)) -> Engine:
 
 
 def get_reason_llm() -> Runnable | None:
-    """The model that rewrites a new lead's reason after the response. None: the service uses fast_llm().
-    Tests override this with a fake."""
+    """The model that rewrites a new lead's reason after the response. None: the service uses reason_llm()
+    (the main model, 4 s). Tests override this with a fake."""
     return None
 
 
@@ -177,13 +177,19 @@ def create_lead(
     return result.lead
 
 
-@router.post("/callback", status_code=201, response_model=CallbackCreated)
-def schedule_callback(request: CallbackRequest, engine: Engine = Depends(leads_engine)):
-    """Log a callback request for a lead (status 'requested', never booked). 404 if the lead doesn't exist."""
+@router.post(
+    "/callback", status_code=201, response_model=CallbackCreated,
+    responses={200: {"description": "The lead's requested callback was updated to the new time"}},
+)
+def schedule_callback(request: CallbackRequest, response: Response, engine: Engine = Depends(leads_engine)):
+    """Log a callback request for a lead (status 'requested', never booked). A lead keeps one requested
+    callback: 201 for a new request, 200 when the existing one gets the new time. 404 if the lead doesn't exist."""
     try:
         result = service.schedule_callback(engine, request.lead_id, request.preferred_time, request.notes)
     except service.LeadNotFound:
         raise ApiError(404, f"No lead with id {request.lead_id}.") from None
+    if result.updated:
+        response.status_code = 200
     return {**result.callback.model_dump(), "message": result.message}
 
 

@@ -260,6 +260,45 @@ def test_logs_hold_no_message_text(caplog):
     assert "9876543210" not in logged and "secret question" not in logged
 
 
+def test_a_kb_tag_outside_this_turns_sources_is_removed():
+    # Problem 4 (T12a): KB tags only on facts from this turn's sources (here KB Sections 8 and 15)
+    reply = "We offer Plan A [KB Section 8: Catalog]. Panels follow the maker's warranty [KB Section 11: Warranty]."
+    graph, _ = make_graph(Scripted(understood(["question"], "Catalog")), Scripted(answer(reply)))
+    state = run(graph, "What do you offer?")
+    assert state["reply"] == "We offer Plan A [KB Section 8: Catalog]. Panels follow the maker's warranty."
+    assert [s["section"] for s in state["sources"]] == ["8"]
+    assert any(s["node"] == "guard" and s["data"]["removed"] == 1 for s in state["steps"])
+
+
+def test_a_turn_with_no_sources_has_no_kb_tags():
+    # Problem 4: "KB 10" on the phone check, "KB 1" on a callback question
+    reply = ("Thanks! That number looks short [KB Section 10: Locations]. "
+             "Could you share your 10-digit mobile number? [KB Section 1: Overview]")
+    graph, search = make_graph(Scripted(understood(["gives_details"], None, name="Asha Rao", phone="329939")),
+                               Scripted(answer(reply)))
+    state = run(graph, "asha, 329939")
+    assert search.queries == []  # details only: no KB search, so no sources this turn
+    assert state["reply"] == "Thanks! That number looks short. Could you share your 10-digit mobile number?"
+    assert state["sources"] == []
+
+
+def test_a_kb_tag_on_a_question_is_removed_even_when_the_section_was_found():
+    reply = "We offer Plan A [KB Section 8: Catalog]. Would you like a quote [KB Section 15: FAQ]?"
+    graph, _ = make_graph(Scripted(understood(["question"], "Catalog")), Scripted(answer(reply)))
+    state = run(graph, "What do you offer?")
+    assert state["reply"] == "We offer Plan A [KB Section 8: Catalog]. Would you like a quote?"
+
+
+def test_steps_carry_the_model_and_tokens_of_each_call():
+    message = AIMessage(content=CITED, response_metadata={"model_provider": "groq", "model_name": "gpt-oss"},
+                        usage_metadata={"input_tokens": 2000, "output_tokens": 300, "total_tokens": 2300})
+    graph, _ = make_graph(Scripted(understood(["question"], "Catalog")), Scripted(message))
+    state = run(graph, "What do you offer?")
+    agent_step = next(s for s in state["steps"] if s["node"] == "agent")
+    assert (agent_step["data"]["provider"], agent_step["data"]["model"], agent_step["data"]["tokens"]) == (
+        "groq", "gpt-oss", 2300)
+
+
 def test_previous_turn_messages_are_plain_human_and_ai():
     graph, _ = make_graph(Scripted(understood(["question"], "q")), Scripted(answer("A1"), answer("A2")))
     run(graph, "Q1")

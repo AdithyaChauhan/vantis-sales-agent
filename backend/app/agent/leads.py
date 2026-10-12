@@ -1,5 +1,6 @@
-"""Lead state for the agent: the status block the model reads, city confirmation, the write-once sync rule
-and the lead summary for the API. Calls the T7 leads service; never decides scores itself.
+"""Lead state for the agent: the status block the model reads, city confirmation, short answers, the callback
+time, the write-once sync rule, the guard against false "saved" claims and the lead summary for the API.
+Calls the T7 leads service; never decides scores itself.
 
 The model never sees a score, a status, a reason or any personal value: the status block lists field
 names and plain messages only.
@@ -12,19 +13,74 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
 from sqlalchemy import Engine
 
+from app.agent import welcome
 from app.leads import service
 from app.leads.schemas import LeadData
 from app.leads.scoring import missing_details, missing_for_creation, score_lead
+from app.rag.answer import is_claim, split_sentences, without_tags
 from app.services.service_areas import ServiceAreas
 
 # The order F2 asks for what is missing; a contact request puts name and phone first
 NEED_ORDER = ["city", "requirement, monthly bill, usage, system size or property type", "name", "phone or email"]
 CONTACT_ORDER = ["name", "phone or email", "city", "requirement, monthly bill, usage, system size or property type"]
 SUPPORT_NEEDS = ("name", "phone or email", "issue", "project details")
-BUYING_INTENTS = {"buying_interest", "contact_request"}
+BUYING_INTENTS = {"buying_interest", "contact_request", "asks_what_is_needed"}
+DETAIL_INTENTS = {"buying_interest", "contact_request", "gives_details"}  # interest shown after the lead is saved
 INFO_ONLY_LINE = ("Lead saved: no. The customer has only asked for information so far: do not ask for their "
-                  "details; after answering, offer one next step.")
+                  "details, and never say they are saved; after answering, offer one next step related to what "
+                  "they asked.")
+SAVED_NOW_LINE = ("Next: say the details are saved and the sales team can follow up, then offer a callback (ask "
+                  "what time suits them). Do not ask for more details in this reply.")
+SAVED_WITH_TIME_LINE = ("Next: call schedule_callback for the time they gave, then say the details are saved and the "
+                        "callback request is logged; the team will confirm it. Do not ask for more details.")
+CALLBACK_NOW_LINE = ("Next: confirm what the tools did in this turn (the callback request logged or updated for "
+                     "their time, the team will confirm it; and the details saved, if create_lead ran). Do not ask "
+                     "for more details in this reply.")
+ASKED_WHAT_LINE = "The customer asked what else you need: ask now for {detail}, in everyday words. One question."
+INTEREST_LINE = "Next: after answering anything they asked, ask gently for {detail}. One question."
+NOTHING_LEFT_LINE = ("The customer asked what else you need: nothing else is needed for now (they ruled out the rest); "
+                     "say so and offer one next step.")
+SAVED_INFO_LINE = ("The customer only asked for information or said no: answer and offer one next step related to "
+                   "it; do not ask for these details.")
+NOTHING_MORE_LINE = "Nothing more is needed for the lead: answer and offer one next step."
 _QUESTION_RE = re.compile(r"[^.!?]*\?")
+# Short answers (T12a): a bare amount, or a bare yes or no
+_BARE_AMOUNT_RE = re.compile(r"^\s*(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?\s*(?:k|rs\.?|rupees|/-)?[\s.!]*$", re.I)
+_YES_RE = re.compile(r"^\s*(?:yes|yeah|yep|yup|sure|of course|it does|we do|yes,? it does|yes,? we do)[\s.!]*$", re.I)
+_NO_RE = re.compile(r"^\s*(?:no|nope|nah|naah|it doesn't|we don't|no,? it doesn't|no,? we don't)[\s.!]*$", re.I)
+# The detail a question asks about, by its words (only a question about one detail is read)
+_TOPIC_OF = {
+    "bill": "bill", "roof": "roof", "rooftop": "roof", "kw": "size", "size": "size", "units": "usage",
+    "kwh": "usage", "usage": "usage", "consumption": "usage", "name": "name", "phone": "phone", "number": "phone",
+    "email": "email", "city": "city", "when": "timeline", "timeline": "timeline", "own": "ownership",
+    "rent": "ownership", "renting": "ownership",
+}
+_TOPIC_RE = re.compile(r"\b(" + "|".join(_TOPIC_OF) + r")\b", re.I)
+# Callback times (T12a): a day, and an hour or part of the day
+_DAY_RE = re.compile(r"\b(?:day after tomorrow|today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|"
+                     r"saturday|sunday|this week|next week|weekend|\d{1,2}(?:st|nd|rd|th))\b", re.I)
+_CLOCK_RE = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)|\b\d{1,2}:\d{2}\b|\b(?:noon|midday|"
+                       r"morning|afternoon|evening|night)\b", re.I)
+# A time of day alone ("4pm", "around 6 pm"): a time to call, never an installation timeline (T12a replay)
+_CLOCK_ONLY_RE = re.compile(r"^\s*(?:at|around|about|by|after|before)?\s*(?:\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|"
+                            r"p\.m\.)|\d{1,2}:\d{2}|noon|midday|morning|afternoon|evening|night)[\s.!]*$", re.I)
+# What a reply may say about a callback (T12a): only what schedule_callback did
+_CALLBACK_WORD_RE = re.compile(r"\bcall[\s-]?backs?\b|\bcall request\b", re.I)
+_CALLBACK_DONE_RE = re.compile(r"\b(?:logged|booked|scheduled|arranged|set up|updated|confirmed|registered|saved|"
+                               r"noted)\b", re.I)
+_CALLBACK_FIRM_RE = re.compile(r"\b(?:booked|scheduled|arranged|set up|confirmed|updated)\b", re.I)
+# Details the customer names or rules out ("apart from timing"), by their words (T12a)
+_EXCEPT_RE = re.compile(r"\b(?:apart from|except(?: for)?|other than|besides|aside from|excluding)\s+"
+                        r"(?:the\s+|my\s+|your\s+)?([a-z]+)", re.I)
+_DETAIL_WORDS = {
+    "timeline": ("timing", "timeline", "time", "when", "date"),
+    "monthly bill or usage": ("bill", "usage", "units", "consumption"),
+    "rooftop availability": ("roof", "rooftop", "terrace"),
+    "ownership": ("ownership", "own", "owner", "rent", "renting", "rented"),
+    "email": ("email", "mail"),
+    "phone number": ("phone", "mobile", "number"),
+}
+_DETAIL_OF_WORD = {word: detail for detail, words in _DETAIL_WORDS.items() for word in words}
 
 
 @dataclass
@@ -36,7 +92,7 @@ class LeadOps:
 
     engine: Engine
     areas_fn: Callable[[], ServiceAreas]
-    reason_llm: Runnable | None = None  # None: the service uses fast_llm()
+    reason_llm: Runnable | None = None  # None: the service uses reason_llm() (the main model, 4 s)
     reason_now: bool = True  # False: save the template reason, the API refreshes it after replying
     calls: list[str] = field(default_factory=list)  # every write, for tests ("create", "update", ...)
 
@@ -60,8 +116,9 @@ def support_missing(lead: dict, support: dict) -> list[str]:
 
 
 def shows_interest(state: dict) -> bool:
-    """The customer wants solar for their own place: a buying or contact intent this turn, a city they asked
-    about, or any detail about themselves in the draft (intent_level alone is the extractor's guess)."""
+    """The customer wants solar for their own place: a buying or contact intent (or asking what else is needed)
+    this turn, a city they asked about, or any detail about themselves in the draft (intent_level alone is the
+    extractor's guess)."""
     if set(state.get("intents", [])) & BUYING_INTENTS or state.get("asked_cities"):
         return True
     return any(name != "intent_level" for name in state.get("lead", {}))
@@ -70,6 +127,11 @@ def shows_interest(state: dict) -> bool:
 def pending_changes(lead: dict, saved: dict) -> dict:
     """Draft fields that differ from what was last written to the database."""
     return {k: v for k, v in lead.items() if saved.get(k) != v}
+
+
+def changed_fields(before: dict, after: dict) -> list[str]:
+    """The lead fields this turn stated or changed (intent_level, the extractor's guess, does not count)."""
+    return sorted(k for k, v in after.items() if before.get(k) != v and k != "intent_level")
 
 
 def final_question(message) -> str:
@@ -94,6 +156,175 @@ def confirmed_city(asked_cities: list[str], previous: object, out: dict) -> str 
     return None
 
 
+def short_answer_details(previous: object, message: str, details: dict) -> dict:
+    """A detail the customer gave as a bare answer to the assistant's last question, when the extractor missed
+    it (T12a): an amount after a question only about the monthly bill, yes or no after a question only about
+    roof space. So a detail that was given is never asked for again. Values are validated later as usual."""
+    topics = {_TOPIC_OF[word.lower()] for word in _TOPIC_RE.findall(final_question(previous))}
+    if topics == {"bill"} and "monthly_bill_inr" not in details and _BARE_AMOUNT_RE.match(message):
+        return {"monthly_bill_inr": message.strip().rstrip(".!")}
+    if topics == {"roof"} and "rooftop_available" not in details:
+        if _YES_RE.match(message):
+            return {"rooftop_available": True}
+        if _NO_RE.match(message):
+            return {"rooftop_available": False}
+    return {}
+
+
+def merge_callback_time(old: str | None, new: str | None) -> str | None:
+    """The customer's preferred callback time after this message (T12a). A new time replaces the old one,
+    except that a day alone keeps the earlier hour and an hour alone keeps the earlier day:
+    "4pm" then "day after tomorrow" gives "day after tomorrow, 4pm"."""
+    if not old or not new:
+        return new or old
+    day, clock = _DAY_RE.search(new), _CLOCK_RE.search(new)
+    old_day, old_clock = _DAY_RE.search(old), _CLOCK_RE.search(old)
+    if day and not clock and old_clock:
+        return f"{new}, {old_clock.group(0)}"
+    if clock and not day and old_day:
+        return f"{old_day.group(0)}, {new}"
+    return new
+
+
+def is_clock_time(text: str) -> bool:
+    """True for a time of day alone ("4pm", "around 6 pm", "evening"): a time to call, never an installation
+    timeline. In the T12a replay "4pm" (meant for the callback) was saved as the timeline and the callback was lost."""
+    return bool(_CLOCK_ONLY_RE.match(text))
+
+
+def details_named(text: str) -> list[str]:
+    """The lead details a text names, in order: "is rooftop availability info needed?" -> ["rooftop availability"]."""
+    found: list[str] = []
+    for word in re.findall(r"[a-z]+", text.lower()):
+        detail = _DETAIL_OF_WORD.get(word)
+        if detail and detail not in found:
+            found.append(detail)
+    return found
+
+
+def ruled_out_details(message: str) -> list[str]:
+    """Details the customer rules out in a message: "anything else apart from timing?" -> ["timeline"]."""
+    return [_DETAIL_OF_WORD[word.lower()] for word in _EXCEPT_RE.findall(message) if word.lower() in _DETAIL_OF_WORD]
+
+
+def next_detail(state: dict, useful: list[str]) -> str | None:
+    """The one detail to ask for next (T12a): the one the customer just asked about, else the most useful one they
+    have not ruled out in this conversation. Chosen in code, so the reply never asks for something already given
+    or ruled out ("apart from timing" got a timeline question in the replay)."""
+    messages = state.get("messages") or []
+    message = str(messages[-1].content) if messages else ""
+    asked = [d for d in details_named(_EXCEPT_RE.sub(" ", message)) if d in useful]
+    if asked:
+        return asked[0]
+    ruled_out = set(state.get("ruled_out", []))
+    return next((d for d in useful if d not in ruled_out), None)
+
+
+def fix_callback_claims(reply: str, state: dict) -> tuple[str, bool]:
+    """Keep what a reply says about a callback true (T12a). For a sentence saying a callback was logged, updated,
+    booked or confirmed:
+    - schedule_callback wrote this turn: it becomes the true sentence ("I've logged a callback request for 4pm; the
+      team will confirm it", or "updated ... to ...");
+    - an earlier request exists: kept, but "booked", "confirmed" or "updated" becomes "is logged";
+    - no callback exists: removed, and if no question is left the reply asks what time suits them.
+    In the replay the reply said "I have logged a callback request for 4 PM" after schedule_callback refused.
+    Returns (reply, changed)."""
+    status, now, logged = state.get("callback_status"), state.get("callback_now"), state.get("callback_logged")
+    lines, changed, confirmed = [], False, False
+    for line in reply.split("\n"):
+        kept = []
+        for piece in split_sentences(line):
+            text = without_tags(piece)
+            if not (text and not text.endswith("?") and _CALLBACK_WORD_RE.search(text)
+                    and _CALLBACK_DONE_RE.search(text)):
+                if piece.strip():
+                    kept.append(piece.strip())
+                continue
+            if status and now:  # written this turn: say exactly what was done, once
+                truth = (welcome.CALLBACK_UPDATED_TEXT if now == "updated" else welcome.CALLBACK_LOGGED_TEXT)
+                truth = truth.format(time=logged)
+                if not confirmed:
+                    kept.append(truth)
+                    confirmed = True
+                changed = changed or piece.strip() != truth
+            elif status and _CALLBACK_FIRM_RE.search(text):
+                kept.append(welcome.CALLBACK_EXISTS_TEXT.format(time=logged))
+                changed = True
+            elif status:
+                kept.append(piece.strip())
+            else:
+                changed = True
+        indent = re.match(r"[ \t]*", line).group(0)
+        lines.append(indent + " ".join(kept) if kept else "")
+    if not changed:
+        return reply, False
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    if not status and "?" not in text:
+        text = f"{text} {welcome.CALLBACK_TIME_ASK}".strip()
+    return text, True
+
+
+def _still_needed_ask(state: dict) -> str:
+    """The honest question that replaces a false "saved" claim: what the lead (or support request) still needs."""
+    lead = state.get("lead", {})
+    if state.get("support_case"):
+        missing = support_missing(lead, state.get("support", {}))
+        template = welcome.SUPPORT_STILL_NEEDED_ASK
+    else:
+        missing = ordered_missing(lead, state.get("contact_request", False))
+        template = welcome.STILL_NEEDED_ASK
+    if not missing:
+        return welcome.READY_TO_PASS_ASK
+    return template.format(items=" and ".join(welcome.CUSTOMER_WORDS[item] for item in missing[:2]))
+
+
+def remove_false_claims(reply: str, state: dict) -> tuple[str, bool]:
+    """Remove every sentence that says details were saved, recorded, logged or passed to the team when the
+    turn ended with no lead and no support request (T12a), and say honestly what is still needed instead
+    (only if no question is left, so the reply still asks one question at most). Returns (reply, changed).
+
+    The prompts forbid these claims; this is the safety net for when the wording slips.
+    """
+    if state.get("lead_id") or state.get("support_request_id"):
+        return reply, False
+    lines, changed = [], False
+    for line in reply.split("\n"):
+        kept = []
+        for piece in split_sentences(line):
+            if without_tags(piece) and is_claim(piece):
+                changed = True
+                continue
+            if piece.strip():
+                kept.append(piece.strip())
+        indent = re.match(r"[ \t]*", line).group(0)
+        lines.append(indent + " ".join(kept) if kept else "")
+    if not changed:
+        return reply, False
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    if "?" not in text:
+        text = f"{text} {_still_needed_ask(state)}".strip()
+    return text, True
+
+
+def _saved_lead_next(state: dict, useful: list[str]) -> str:
+    """What the agent should do next once the lead is saved (T12a)."""
+    intents = set(state.get("intents", []))
+    if state.get("callback_now"):
+        return CALLBACK_NOW_LINE
+    if state.get("lead_created_now"):
+        return SAVED_WITH_TIME_LINE if state.get("callback_time") else SAVED_NOW_LINE
+    if not useful:
+        return NOTHING_MORE_LINE
+    if state.get("declines"):
+        return SAVED_INFO_LINE
+    detail = next_detail(state, useful)
+    if "asks_what_is_needed" in intents:
+        return ASKED_WHAT_LINE.format(detail=detail) if detail else NOTHING_LEFT_LINE
+    if (intents & DETAIL_INTENTS or state.get("new_details")) and detail:
+        return INTEREST_LINE.format(detail=detail)
+    return SAVED_INFO_LINE
+
+
 def status_block(state: dict) -> str:
     """The lead status the agent reads each turn: field names and plain messages, never values,
     never a score or a status."""
@@ -113,23 +344,24 @@ def status_block(state: dict) -> str:
         lines.append("Details known: " + (", ".join(known) if known else "none yet") + ".")
         if state.get("lead_id"):
             lines.append("Lead saved: yes.")
-            if not state.get("callback_status"):
-                lines.append("Next: say the sales team can follow up and offer a callback (ask what time suits "
-                             "them). Do not ask for more details in the same turn.")
-            else:
-                useful = missing_details(LeadData.model_validate(lead), _breakdown_stub(lead))
-                if useful:
-                    lines.append("Still useful, ask gently only if it fits: " + ", ".join(useful) + ".")
+            ruled_out = set(state.get("ruled_out", []))  # "apart from timing": not asked in this conversation
+            useful = [d for d in missing_details(LeadData.model_validate(lead), _breakdown_stub(lead))
+                      if d not in ruled_out]
+            if useful:
+                lines.append("Would still add points, most useful first: " + ", ".join(useful)
+                             + ". Never ask again for anything under Details known.")
+            lines.append(_saved_lead_next(state, useful))
         else:
             missing = ordered_missing(lead, state.get("contact_request", False))
             if missing and not shows_interest(state):  # a pure information question: no details asked (T10b)
                 lines.append(INFO_ONLY_LINE)
             elif missing:
-                lines.append("Lead saved: no. Still needed before it can be saved: " + ", ".join(missing) + ".")
+                lines.append("Lead saved: no, so never say the details are saved, recorded or passed to the team. "
+                             "Still needed before it can be saved: " + ", ".join(missing) + ".")
             else:
                 lines.append("Lead saved: no. Ready to save: call create_lead now (sharing a phone number "
                              "or email counts as wanting follow-up).")
-    if state.get("contact_request"):
+    if state.get("contact_request") and not state.get("lead_id"):
         lines.append("The customer asked to be contacted: ask for what is still needed (name and phone first); "
                      "do not answer earlier questions again.")
     for name, message in sorted(state.get("validation_errors", {}).items()):
@@ -141,11 +373,25 @@ def status_block(state: dict) -> str:
                          "question.")
         else:
             lines.append("Cities asked about: " + ", ".join(cities) + ". Ask which one the property is in.")
-    if state.get("callback_status"):
-        lines.append(f"Callback request logged ({state['callback_status']}); the team will confirm it.")
-    elif state.get("callback_time"):
-        lines.append("The customer gave a preferred callback time.")
+    lines.extend(_callback_lines(state))
     return "\n".join(lines)
+
+
+def _callback_lines(state: dict) -> list[str]:
+    """The callback part of the status block. A lead keeps one requested callback, so a new time updates it."""
+    time_given, logged = state.get("callback_time"), state.get("callback_logged")
+    if state.get("lead_id") and time_given and time_given != logged:
+        if state.get("callback_status"):
+            return ["The customer gave a new callback time: call schedule_callback to update the request."]
+        return ["The customer gave a preferred callback time: call schedule_callback."]
+    if state.get("callback_status"):
+        return [f"Callback request logged ({state['callback_status']}); the team will confirm it. If the "
+                "customer gives a new time, call schedule_callback again: it updates the request."]
+    if time_given:
+        return ["The customer gave a preferred callback time."]
+    if state.get("lead_id") and state.get("contact_request"):
+        return ["The customer asked to be contacted: ask what time suits them for a call."]
+    return []
 
 
 def _breakdown_stub(lead: dict) -> dict:

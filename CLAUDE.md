@@ -46,7 +46,9 @@ docs/               PLAN.md, PROGRESS.md, ARCHITECTURE.md, EVAL.md
 - Retrieval eval: `cd backend && python -m scripts.eval_retrieval`
 - Retrieval eval with the agent's query rewrite (about 32 fast-LLM calls, paced): `cd backend && python -m scripts.eval_retrieval --rewrite`
 - API for local page checks, leads on the Neon test branch (never main): `cd backend && python -m scripts.serve_test_branch` (for the dashboard add a throwaway key: `SALES_API_KEY=any-local-key-of-16-chars python -m scripts.serve_test_branch`)
-- Demo leads on the test branch (8 leads, 2 callbacks, 1 support request; about 8 fast-LLM calls for the reasons; a second run adds nothing; pytest empties these tables, so re-run it after tests): `cd backend && python -m scripts.seed_demo_leads` (`--main` writes to main only after you type "main")
+- Slow-Google drill (every Gemini chat call hangs, so the deadlines, Groq and the skip list answer; test server only): `cd backend && python -m scripts.serve_test_branch --slow-gemini`
+- Demo leads on the test branch (8 leads, 2 callbacks, 1 support request; about 8 main-model calls for the reasons; a second run adds nothing): `cd backend && python -m scripts.seed_demo_leads` (`--main` writes to main only after you type "main")
+- Reset the test branch's leads, callbacks and support requests, then seed again (test branch only): `cd backend && python -m scripts.seed_demo_leads --reset`. Pytest empties these tables before and after each DB test, so run it after the tests and never between live checks
 - Frontend setup: `cd frontend && npm install`
 - Frontend: `cd frontend && npm run dev` (http://localhost:5173; calls the API at `VITE_API_URL`, default http://127.0.0.1:8000; the sales dashboard is at /leads and /support and asks for the sales API key)
 - Frontend tests: `cd frontend && npm test`

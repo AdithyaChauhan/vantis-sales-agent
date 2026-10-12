@@ -47,7 +47,7 @@ So an unlisted city or a need outside the reference packages means **"check firs
 
 **Status:** HOT at 75 or more · WARM at 45 to 74 · COLD below 45.
 
-**Caps:** a city that is not on the list, or a need outside the reference packages, caps the lead at WARM, and the score at 74, so that the score and the status always agree and the dashboard never sorts a capped lead above a real HOT one. The breakdown keeps the score before the cap (`raw_score`) and says which cap applied.
+**Caps:** a city that is not on the list, or a need outside the reference packages, caps the lead at WARM, and the score at 74, so that the score and the status always agree and the dashboard never sorts a capped lead above a real HOT one. The breakdown keeps the score before the cap (`raw_score`) and says which cap applied. A cap is recorded only when it lowers the score (a raw score above 74): a COLD lead in an unlisted city has nothing to cap, so neither its reason nor its action mentions one.
 
 Every lead stores its **score breakdown** as JSON: each rule with its points, the maximum and a short label, plus the raw score and the caps. The dashboard shows it, so a sales rep can see where every point came from.
 
@@ -69,14 +69,24 @@ Accepted value ranges: monthly bill ₹100 to ₹10,00,000 · system size 0.5 to
 | Status | Action |
 |---|---|
 | HOT | Contact the lead within 1 hour and offer a site assessment. |
-| WARM | Follow up within 24 hours, plus what to do next: "Verify service availability for <city>." (unlisted city) · "Check whether the requirement fits the reference packages." · "Confirm the owner's permission for a rooftop installation." (renting) · "Collect: …" (the missing details that would add points: timeline, monthly bill or usage, phone number, email, ownership, rooftop availability) |
+| WARM | Follow up within 24 hours, plus what to do next: "Verify service availability for <city>." (unlisted city) · "Check whether the requirement fits the reference packages." · "Confirm the owner's permission for a rooftop installation." (renting) · "Collect: …" (the missing details that would add points, most useful first: timeline, monthly bill or usage, rooftop availability, ownership, email, phone number) |
 | COLD | Add to the nurture list, share product information and follow up in 30 days. |
 
-If the customer asked for a callback, the action ends with "Customer asked for a callback: <their words>". Callbacks are stored as **requested**: the team confirms them, the assistant never books them.
+If the customer asked for a callback, its time replaces the status's own timing, so the action never says "within 24 hours" next to "the day after tomorrow":
+
+| Status | Action with a callback |
+|---|---|
+| HOT | Call <their time>, as requested, and offer a site assessment. |
+| WARM | Call <their time>, as requested. (then the same next steps as above) |
+| COLD | Call <their time>, as requested. Add to the nurture list and share product information. |
+
+Callbacks are stored as **requested**: the team confirms them, the assistant never books them. A lead keeps one requested callback; a new time updates it ("4pm", then "day after tomorrow" gives "day after tomorrow, 4pm").
 
 ## The reason sentence
 
-The fast model writes one sentence from the breakdown only: status, score, the rule labels with their points, the caps and the city. It never sees a name, phone number, email or money amount (labels say "monthly bill given", not the amount). If the model fails, or its sentence is empty, too long, more than one sentence, names a different status, or mentions prices, savings, subsidies, financing, EMIs or guarantees (KB Section 16), a template sentence built from the same breakdown is used instead. The reason is rewritten only when the status or breakdown changes, to save LLM quota.
+The main model writes one sentence (it has 4 seconds; it was the fast model until T12a) from the breakdown only: status, score, the rule labels with their points, the caps, the city and what keeps the lead from the next status. It never sees a name, phone number, email or money amount (labels say "monthly bill given", not the amount). If the model fails, or its sentence is empty, too long, more than one sentence, names a different status, or mentions prices, savings, subsidies, financing, EMIs or guarantees (KB Section 16), a template sentence built from the same breakdown is used instead. The reason is rewritten only when the status or breakdown changes, to save LLM quota.
+
+**What keeps a lead from the next status.** A WARM or COLD reason ends with it, for example "…, not HOT yet: no timeline." For a capped lead it is the cap's cause ("not HOT yet: city not in the listed service areas"). Otherwise it is the missing signals worth the most points, most first (the timeline first on a tie), until they would reach the next status: a WARM lead at 63 with no timeline needs 12 points, and a timeline is worth up to 20. Signals that more details can't change (a city not on the list, renting) are never named. A reason that leaves this part out gets the template.
 
 ## Worked examples
 
@@ -98,7 +108,9 @@ Action: "Contact the lead within 1 hour and offer a site assessment."
 
 The location gives 5 instead of 20 (Pune is not in the KB list), so the raw score is 82. The unverified city caps the lead at WARM, and the score at 74.
 
-Action: "Follow up within 24 hours. Verify service availability for Pune. Collect: ownership, rooftop availability."
+Action: "Follow up within 24 hours. Verify service availability for Pune. Collect: rooftop availability, ownership."
+
+Reason (template form): "WARM: ready to buy, …; not HOT yet: city not in the listed service areas."
 
 **3. A visitor who is only exploring → 36, COLD**
 

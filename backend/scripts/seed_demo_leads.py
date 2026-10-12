@@ -1,12 +1,16 @@
 """Add demo leads, so the sales dashboard has something to show. Writes to the Neon test branch.
 
-Run: python -m scripts.seed_demo_leads          (the test branch, TEST_DATABASE_URL)
-     python -m scripts.seed_demo_leads --main   (the main database; you must type "main" first)
+Run: python -m scripts.seed_demo_leads           (the test branch, TEST_DATABASE_URL)
+     python -m scripts.seed_demo_leads --reset   (the test branch: empty the lead tables first, then seed)
+     python -m scripts.seed_demo_leads --main    (the main database; you must type "main" first)
 
 Every lead goes through app.leads.service, exactly like a chat lead: the same checks, score, status,
-caps, recommended action and reason (written by the fast LLM, or the template if that fails; about
+caps, recommended action and reason (written by the main model, or the template if that fails; about
 one call per new lead). The leads have source_channel "demo", so the dashboard tags them. Contacts are
 clearly fake: phone numbers 90000 0000N (valid in format only) and @example.com emails.
+
+--reset (T12a) deletes every lead, callback and support request on the test branch (chat leads from local
+checks too) and seeds again, so the dashboard shows the demo data with real reasons. It never runs on main.
 
 Running it again adds nothing: a demo lead with the same name, a callback with the same time for that
 lead and a support request with the same name and issue are skipped. The output never shows a phone
@@ -17,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from langchain_core.runnables import Runnable
-from sqlalchemy import Engine, create_engine, select
+from sqlalchemy import Engine, create_engine, func, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
@@ -140,6 +144,17 @@ def seed(engine: Engine, *, llm: Runnable | None = None, areas: ServiceAreas | N
     return report
 
 
+def reset(engine: Engine) -> tuple[int, int, int]:
+    """Delete every lead, callback and support request (ids start again at 1). Returns how many there were.
+    main() only calls it for the test branch."""
+    with Session(engine) as session:
+        counts = tuple(int(session.scalar(select(func.count()).select_from(model)))
+                       for model in (Lead, Callback, SupportRequest))
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE leads, callbacks, support_requests RESTART IDENTITY CASCADE"))
+    return counts
+
+
 def target_engine(settings: Settings, use_main: bool, ask: Callable[[str], str] = input) -> Engine:
     """The test branch (refuses an empty or same-as-main TEST_DATABASE_URL), or main after "main" is typed.
 
@@ -162,20 +177,28 @@ def print_summary(engine: Engine, report: SeedReport, where: str) -> None:
           f"{report.callbacks_added} callbacks, {report.support_added} support request.")
     with Session(engine) as session:
         leads = session.scalars(select(Lead).where(Lead.source_channel == "demo").order_by(Lead.id)).all()
-        print(f"{'id':>4}  {'name':<16}{'city':<10}{'location':<12}{'score':>5}  {'status':<7}{'reason':<9}callback")
+        print(f"{'id':>4}  {'name':<16}{'city':<10}{'location':<12}{'score':>5}  {'status':<7}{'source':<9}"
+              f"{'callback':<22}reason")
         for lead in leads:
             callback = lead.callbacks[-1].preferred_time if lead.callbacks else "-"
             print(f"{lead.id:>4}  {lead.name:<16}{lead.city:<10}{lead.location_status:<12}{lead.lead_score:>5}  "
-                  f"{lead.lead_status:<7}{lead.reason_source:<9}{callback}")
+                  f"{lead.lead_status:<7}{lead.reason_source:<9}{callback:<22}{lead.reason}")
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Parse --main, pick the database, create missing tables, seed and print the result."""
+    """Parse --main and --reset, pick the database, create missing tables, (empty them,) seed and print."""
     parser = argparse.ArgumentParser(description="Add demo leads to the test branch (or to main with --main).")
     parser.add_argument("--main", action="store_true", help='write to the main database (asks you to type "main")')
+    parser.add_argument("--reset", action="store_true",
+                        help="test branch only: delete every lead, callback and support request first")
     args = parser.parse_args(argv)
+    if args.reset and args.main:
+        raise SystemExit("--reset works on the test branch only; it can't be combined with --main.")
     engine = target_engine(get_settings(), args.main)
     init_db(engine)
+    if args.reset:
+        leads, callbacks, support = reset(engine)
+        print(f"Reset the test branch: deleted {leads} leads, {callbacks} callbacks and {support} support requests.")
     report = seed(engine)
     print_summary(engine, report, "main" if args.main else "the test branch")
 

@@ -11,11 +11,21 @@ from scripts.eval_retrieval import KB_QUESTIONS, OFFTOPIC_QUESTIONS, load_questi
 MAX_SIMILARITY = 70  # rapidfuzz score (0-100); 70 or more counts as a paraphrase
 QUOTED_RE = re.compile(r'"([^"]{3,})"')
 LIVE_MESSAGE_RE = re.compile(r'ask\(client, "([^"]+)"')  # ask(client, "...") in the live tests
+# Adithya's own test (T12 notes), replayed live in T12a; its one-word messages ("yes", "4pm") are generic
+REPLAY_T12 = [
+    "i want to install one at my organisation",
+    "adithya, 329939",
+    "naah. can you tell me the capital of jharkhand?",
+    "is there any other info u need that can help u assist me apart from timing?",
+    "are you sure? rooftop availability info is not needed?",
+    "get back to me day after tomorrow",
+]
 
 
 def test_questions() -> list[str]:
-    """Every eval question and every message the live tests send."""
+    """Every eval question, every message the live tests send and the replayed T12 conversation."""
     questions = [q.question for q in load_questions(KB_QUESTIONS) + load_questions(OFFTOPIC_QUESTIONS)]
+    questions += REPLAY_T12
     for path in sorted((BACKEND_DIR / "tests").glob("test_live_*.py")):  # every live test file
         questions += LIVE_MESSAGE_RE.findall(path.read_text(encoding="utf-8"))
     return questions

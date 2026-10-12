@@ -1,15 +1,14 @@
 """scripts/seed_demo_leads.py: demo leads through the lead service, the test branch by default, never twice."""
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.db import init_db
 from app.leads import service
 from app.leads.models import Callback, Lead, SupportRequest
 from app.services.service_areas import ServiceAreas
 from scripts import seed_demo_leads as demo
-from tests.test_answer import FakeLLM
+from tests.test_answer import ReasonLLM
 
 MAIN = "postgresql://u:p@main-host/db?sslmode=require"
 TEST = "postgresql://u:p@test-host/db?sslmode=require"
@@ -68,11 +67,8 @@ def test_demo_is_a_lead_channel_and_unknown_ones_still_raise():
 
 
 @pytest.fixture
-def db(test_engine):
-    init_db(test_engine)
-    with test_engine.begin() as conn:
-        conn.execute(text("TRUNCATE leads, callbacks, support_requests RESTART IDENTITY CASCADE"))
-    return test_engine
+def db(leads_db):
+    return leads_db
 
 
 def counts(db) -> tuple[int, int, int]:
@@ -81,7 +77,7 @@ def counts(db) -> tuple[int, int, int]:
 
 
 def test_seeds_scored_demo_leads_two_callbacks_and_one_support_request_once(db):
-    llm = FakeLLM("A demo reason.")
+    llm = ReasonLLM("A demo reason.")
     first = demo.seed(db, llm=llm, areas=AREAS)
     assert (first.leads_added, first.leads_skipped, first.callbacks_added, first.support_added) == (8, 0, 2, 1)
     assert len(llm.calls) == 8  # one reason per new lead
@@ -96,7 +92,12 @@ def test_seeds_scored_demo_leads_two_callbacks_and_one_support_request_once(db):
         sana = by_name["Sana Khan"]
         assert sana.score_breakdown["raw_score"] == 85 and [c["rule"] for c in sana.score_breakdown["caps"]] == [
             "unverified_location"]
-        assert sana.recommended_action.endswith("Customer asked for a callback: tomorrow after 5 pm.")
+        assert sana.recommended_action.startswith("Call tomorrow after 5 pm, as requested. Verify service")
+        assert sana.reason.endswith("not HOT yet: city not in the listed service areas.")
+        # T12 note 8: a cap that changes nothing is not recorded, so Rohit's reason never mentions one
+        rohit = by_name["Rohit Patel"]
+        assert rohit.score_breakdown["caps"] == [] and "capped" not in rohit.reason
+        assert rohit.reason.endswith("not WARM yet: only exploring.")
         assert [(c.preferred_time, c.status) for c in by_name["Arjun Mehta"].callbacks] == [("Thursday 11 am", "requested")]
         support = session.scalars(select(SupportRequest)).one()
         assert support.issue.startswith("Demo:") and support.session_id is None
@@ -107,8 +108,27 @@ def test_seeds_scored_demo_leads_two_callbacks_and_one_support_request_once(db):
     assert counts(db) == (8, 2, 1)
 
 
+def test_reset_never_runs_on_main():
+    with pytest.raises(SystemExit, match="test branch only"):
+        demo.main(["--reset", "--main"])  # refused before any database is chosen or "main" is asked for
+
+
+def test_reset_empties_the_lead_tables_then_seed_starts_again(db):
+    llm = ReasonLLM("A demo reason.")
+    chat_lead = service.create_lead(db, {"name": "Asha Rao", "phone": "9876543210", "city": "Kanpur",
+                                         "property_type": "house"}, llm=llm, areas=AREAS).lead
+    service.schedule_callback(db, chat_lead.id, "tomorrow")
+    service.create_support_request(db, {"name": "Anil Kumar", "phone": "9876511111", "issue": "Inverter error"})
+    assert demo.reset(db) == (1, 1, 1)
+    assert counts(db) == (0, 0, 0)
+    demo.seed(db, llm=llm, areas=AREAS)
+    with Session(db) as session:
+        assert sorted(session.scalars(select(Lead.id)).all()) == list(range(1, 9))  # ids start again at 1
+        assert set(session.scalars(select(Lead.source_channel)).all()) == {"demo"}
+
+
 def test_a_chat_lead_with_a_demo_name_is_not_mistaken_for_demo_data(db):
-    llm = FakeLLM("A demo reason.")
+    llm = ReasonLLM("A demo reason.")
     service.create_lead(db, {**demo.DEMO_LEADS[0]}, llm=llm, areas=AREAS)  # a real "Priya Verma" from the chat
     report = demo.seed(db, llm=llm, areas=AREAS)
     assert report.leads_added == 8

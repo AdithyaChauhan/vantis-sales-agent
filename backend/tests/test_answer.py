@@ -1,4 +1,6 @@
 """Prompts, context format, citations and sources (the answer helpers the agent reuses)."""
+import re
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -10,7 +12,10 @@ from app.rag.answer import (
     cited_sections,
     format_context,
     pick_sources,
+    is_claim,
+    soften_promises,
     strip_tool_citations,
+    strip_unsourced_citations,
     tidy_citations,
 )
 from app.rag.retriever import RetrievedChunk
@@ -28,6 +33,18 @@ class FakeLLM:
         if self.error:
             raise self.error
         return AIMessage(content=self.reply, response_metadata={"model_provider": self.provider})
+
+
+class ReasonLLM(FakeLLM):
+    """A fake reason model that, as the reason prompt asks, ends its sentence with the prompt's "not … yet"
+    part for a lead that is not HOT (T12a). For a HOT lead it returns the reply as it is."""
+
+    def invoke(self, messages):
+        message = super().invoke(messages)
+        gap = re.search(r"Missing for the next status: (not \w+ yet: [^\n]*)", str(messages[0].content))
+        if gap:
+            message = message.model_copy(update={"content": f"{self.reply.rstrip('.')}, {gap.group(1)}."})
+        return message
 
 
 def chunk(section_no, title, content="text", page=3, chunk_id=None):
@@ -100,9 +117,10 @@ def test_one_source_per_section_in_retrieval_order():
     assert [(s["section"], s["snippet"]) for s in sources] == [("11", "panels"), ("15", "faq")]
 
 
-def test_no_citation_means_all_context_sections():
-    assert [s["section"] for s in pick_sources("No label here.", CHUNKS)] == ["8", "15"]
-    assert len(pick_sources("Only [KB Section 99: Not In Context].", CHUNKS)) == 2
+def test_a_reply_that_cites_nothing_has_no_sources():
+    # T12a: a question or a confirmation used to get every context section as its sources ("KB 10" on a question)
+    assert pick_sources("Could you share your name and phone number?", CHUNKS) == []
+    assert pick_sources("Only [KB Section 99: Not In Context].", CHUNKS) == []
 
 
 def test_snippet_is_one_line_and_cut_at_a_word():
@@ -155,3 +173,71 @@ def test_clean_citations_are_left_alone():
     reply = ("Packages [KB Section 8: Product & Service Catalog]. "
              "Lucknow [KB Section 10: Reference Service Locations].")
     assert tidy_citations(reply, [CATALOG, AREAS_SUMMARY]) == reply
+
+
+# ---------- T12a: KB tags only on facts from this turn's sources ----------
+
+def test_a_tag_whose_section_is_not_among_this_turns_chunks_is_removed():
+    reply = "HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog]. Warranty varies [KB Section 11: Warranty]."
+    assert strip_unsourced_citations(reply, [CATALOG]) == (
+        "HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog]. Warranty varies.", 1)
+
+
+def test_a_turn_without_chunks_keeps_no_tag():
+    reply = "Thanks [KB Section 10: Locations]! Your number looks short.\nCould you check it? [KB Section 1: Overview]"
+    assert strip_unsourced_citations(reply, []) == (
+        "Thanks! Your number looks short.\nCould you check it?", 2)
+
+
+def test_tags_on_questions_and_claims_are_removed_even_for_a_found_section():
+    reply = ("HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog]. "
+             "I've saved your details [KB Section 8: Product & Service Catalog]. "
+             "Would you like a quote? [KB Section 15: Frequently Asked Questions]")
+    assert strip_unsourced_citations(reply, [CATALOG, FAQ]) == (
+        "HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog]. I've saved your details. "
+        "Would you like a quote?", 2)
+
+
+def test_a_tag_on_a_thank_you_is_removed():
+    # T12a replay: "Thank you for your interest in installing a solar system for your organization [KB Section 2]"
+    reply = ("Thank you for your interest in solar for your organisation [KB Section 8: Product & Service Catalog]. "
+             "HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog].")
+    assert strip_unsourced_citations(reply, [CATALOG]) == (
+        "Thank you for your interest in solar for your organisation. "
+        "HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog].", 1)
+
+
+def test_supported_tags_and_lists_are_left_exactly_as_they_are():
+    reply = "Packages:\n1. HomeStart 3\n2. HomePro 5 [KB Section 8: Product & Service Catalog]\n\nAsk me more."
+    assert strip_unsourced_citations(reply, [CATALOG]) == (reply, 0)
+
+
+@pytest.mark.parametrize("sentence, claim", [
+    ("Your details are saved.", True),
+    ("I have passed your details to our sales team.", True),
+    ("We've logged your callback request.", True),
+    ("I've shared the steps above.", False),  # handing on counts only when a team or person got it
+    ("Your details will be saved once you share a phone number.", False),
+    ("Could you share your phone number?", False),
+])
+def test_save_claims(sentence, claim):
+    assert is_claim(sentence) is claim
+
+
+@pytest.mark.parametrize("reply, softened", [
+    # T12a replay, on Groq: "Your details have been saved and our sales team will follow up with you shortly."
+    ("Our sales team will follow up with you shortly.", "Our sales team can follow up with you shortly."),
+    ("We'll call you tomorrow.", "We can call you tomorrow."),
+    ("Someone will get back to you.", "Someone can get back to you."),
+])
+def test_a_promise_of_a_human_action_becomes_can(reply, softened):
+    assert soften_promises(reply) == (softened, 1)
+
+
+@pytest.mark.parametrize("reply", [
+    "The team can follow up after a site assessment.",
+    "The site assessment will confirm the final size.",  # not a person's action
+    "Will you call us back?",
+])
+def test_other_wording_is_left_alone(reply):
+    assert soften_promises(reply) == (reply, 0)

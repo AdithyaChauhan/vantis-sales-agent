@@ -27,6 +27,7 @@ class AgentState(TypedDict, total=False):
     support: dict  # issue and project_details, in the customer's words
     support_request_id: int | None
     asked_cities: list[str]  # cities asked about but not (yet) confirmed as the customer's
+    ruled_out: list[str]  # details the customer ruled out ("apart from timing"); never asked for again (T12a)
     # This turn's tool calls and tool results
     scratch: Annotated[list[AnyMessage], add_messages]
     intents: list[str]
@@ -38,6 +39,10 @@ class AgentState(TypedDict, total=False):
     tool_rounds: int
     steps: list[dict]
     contact_request: bool  # this turn the customer asked to be contacted
+    new_details: list[str]  # lead fields stated or changed this turn (T12a)
+    declines: bool  # this turn the customer said no to what the assistant asked (T12a)
+    lead_created_now: bool  # create_lead saved the lead this turn (T12a)
+    callback_now: str | None  # "requested" or "updated" when schedule_callback wrote this turn (T12a)
     reply: str
     sources: list[dict]
     lead_summary: dict | None
@@ -51,6 +56,10 @@ def turn_input(message: str, session_id: str = "") -> dict:
         "messages": [HumanMessage(message)],
         "session_id": session_id,
         "contact_request": False,
+        "new_details": [],
+        "declines": False,
+        "lead_created_now": False,
+        "callback_now": None,
         "lead_summary": None,
         "reason_pending": None,
         "scratch": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],

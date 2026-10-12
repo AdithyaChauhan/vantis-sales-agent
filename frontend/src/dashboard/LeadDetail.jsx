@@ -7,10 +7,10 @@ import { DemoTag } from "./LeadTable.jsx";
 import { useSlow } from "./useSalesData.js";
 
 /**
- * The selected lead (GET /api/leads/{id}): who it is, the API's score and status, why it scored that
- * way (score_breakdown: each rule's points and maximum, and any cap), the reason, the full next action,
- * contact details, callbacks, and everything else the customer told us. On phones it covers the screen
- * and has a Back button. Customer-typed text is always rendered as plain text.
+ * The selected lead (GET /api/leads/{id}): who it is, the API's score and status, the full next action,
+ * the callback and contact details, why it scored that way (score_breakdown: each rule's points and
+ * maximum, and any cap), the reason, and everything else the customer told us. On phones it covers the
+ * screen and has a Back button. Customer-typed text is always rendered as plain text.
  */
 
 function WhyThisScore({ breakdown, score }) {
@@ -142,6 +142,10 @@ function DetailsCollected({ lead }) {
   );
 }
 
+/**
+ * The order (T12a): who and how hot first; then what to do (next action, callback, contact), so a rep can
+ * act without scrolling; then why (the score breakdown, the reason) and everything the customer told us.
+ */
 function Body({ lead }) {
   const breakdown = lead.score_breakdown;
   const where = placeAndType(lead);
@@ -166,13 +170,6 @@ function Body({ lead }) {
           <span style={{ width: `${Math.max(0, Math.min(100, lead.lead_score))}%` }} />
         </div>
       </div>
-      <WhyThisScore breakdown={breakdown} score={lead.lead_score} />
-      <section className="detail-section">
-        <h3 className="detail-heading">
-          Reason
-        </h3>
-        <p className="detail-text">{lead.reason}</p>
-      </section>
       <div className="next-action">
         <ListTodo className="next-action-icon" aria-hidden="true" />
         <div>
@@ -180,8 +177,15 @@ function Body({ lead }) {
           <p className="detail-text">{lead.recommended_action}</p>
         </div>
       </div>
-      <Contact lead={lead} />
       <Callbacks callbacks={lead.callbacks} />
+      <Contact lead={lead} />
+      <WhyThisScore breakdown={breakdown} score={lead.lead_score} />
+      <section className="detail-section">
+        <h3 className="detail-heading">
+          Reason
+        </h3>
+        <p className="detail-text">{lead.reason}</p>
+      </section>
       <DetailsCollected lead={lead} />
     </>
   );

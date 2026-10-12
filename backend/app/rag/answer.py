@@ -16,6 +16,25 @@ LLM_DOWN_REPLY = "I'm having trouble right now. Please try again in a minute."
 SNIPPET_CHARS = 160
 _CITATION_RE = re.compile(r"KB Section (\d+)")
 _LABEL_RE = re.compile(r"([ \t]*)\[KB Section (\d+)(?::[^\[\]]*)?\]")  # spaces before it, section number
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")  # "4.5 kW" and "₹2,000" are not split
+# A claim that something was saved or logged: "your details are saved", "I've recorded your bill". Future or
+# conditional wording ("will be saved", "once you share it, I can save it") is not a claim (T12a).
+_SAVED = r"(?:saved|recorded|stored|registered|logged)"
+# Handing on is a claim only when the sentence names who got it: "I've passed your details to the team"
+# (but "I've shared the steps above" is not).
+_HANDED_ON = r"(?:passed|forwarded|sent|shared)"
+_DONE_BY = r"\b(?:i|we)(?:'ve|’ve| have)?\s+(?:now\s+|just\s+|also\s+|already\s+)?"
+_DONE_TO = r"\b(?:is|are|was|were|has been|have been)\s+(?:now\s+|all\s+|already\s+|successfully\s+)?"
+_SAVED_RE = re.compile(rf"{_DONE_BY}{_SAVED}\b|{_DONE_TO}{_SAVED}\b|^\s*(?:all\s+)?{_SAVED}\b", re.IGNORECASE)
+_HANDED_ON_RE = re.compile(rf"{_DONE_BY}{_HANDED_ON}\b|{_DONE_TO}{_HANDED_ON}\b", re.IGNORECASE)
+_TEAM_RE = re.compile(r"\b(?:team|sales|someone|representative|colleague|expert)s?\b", re.IGNORECASE)
+# A thank-you is never a KB fact ("Thank you for your interest ... [KB Section 2]" in the T12a replay)
+_THANKS_RE = re.compile(r"^\W*(?:thanks|thank you)\b", re.IGNORECASE)
+# "The team will follow up" promises a human action that has not happened (KB Section 16); the assistant may
+# only say the team can (T8b rule, slipped on Groq in the T12a replay)
+_PROMISE_RE = re.compile(
+    r"(\s+will|'ll|’ll)(\s+(?:follow up|call|contact|reach out|get in touch|get back))\b", re.IGNORECASE
+)
 
 
 def citation_label(chunk: RetrievedChunk) -> str:
@@ -55,6 +74,71 @@ def strip_tool_citations(reply: str, tool_names: list[str]) -> str:
     if cleaned != reply:
         logger.warning("reply cited a tool; removed")
     return cleaned
+
+
+def split_sentences(line: str) -> list[str]:
+    """One line of a reply as sentences; a piece holding only KB tags belongs to the sentence before it."""
+    return _SENTENCE_SPLIT_RE.split(line)
+
+
+def without_tags(text: str) -> str:
+    """The text with its [KB Section N: Title] tags removed."""
+    return _LABEL_RE.sub("", text).strip()
+
+
+def is_claim(sentence: str) -> bool:
+    """True if the sentence says something was saved, recorded or logged, or passed to the team (T12a)."""
+    text = without_tags(sentence)
+    return bool(_SAVED_RE.search(text) or (_HANDED_ON_RE.search(text) and _TEAM_RE.search(text)))
+
+
+def strip_unsourced_citations(reply: str, chunks: list[RetrievedChunk]) -> tuple[str, int]:
+    """Remove the KB tags this turn's sources don't support (T12a): a section that is not among this turn's
+    chunks (every tag when there are none, e.g. a validation message), and any tag on a question, a thank-you or
+    a "saved" or "logged" sentence, which are never KB facts. Returns (reply, tags removed).
+
+    The prompts ask for this; this is the safety net, and it logs a warning so a slipping prompt shows.
+    """
+    sections = {c.section_no for c in chunks}
+    removed = 0
+
+    def keep_tags(text: str, facts: bool) -> str:
+        nonlocal removed
+
+        def one(match: re.Match) -> str:
+            nonlocal removed
+            if facts and int(match.group(2)) in sections:
+                return match.group(0)
+            removed += 1
+            return ""
+
+        return _LABEL_RE.sub(one, text)
+
+    lines = []
+    for line in reply.split("\n"):
+        kept, facts = [], True
+        for piece in split_sentences(line):
+            bare = without_tags(piece)
+            if bare:  # a sentence; tags alone take the verdict of the sentence before them
+                facts = not (bare.endswith("?") or is_claim(bare) or _THANKS_RE.match(bare))
+            piece = keep_tags(piece, facts).strip()
+            if piece:
+                kept.append(piece)
+        indent = re.match(r"[ \t]*", line).group(0)  # keeps a list item's indentation
+        lines.append(indent + " ".join(kept) if kept else "")
+    if not removed:
+        return reply, 0
+    logger.warning("reply cited KB sections without support from this turn; removed", extra={"removed": removed})
+    return "\n".join(lines).strip(), removed
+
+
+def soften_promises(reply: str) -> tuple[str, int]:
+    """'our team will follow up' becomes 'our team can follow up' (T12a): a reply never promises that a person
+    will call, contact or follow up. Returns (reply, changes). The system prompt asks for this; this is the net."""
+    changed, count = _PROMISE_RE.subn(lambda m: " can" + m.group(2), reply)
+    if count:
+        logger.warning("reply promised a human action; softened", extra={"changed": count})
+    return changed, count
 
 
 def tidy_citations(reply: str, chunks: list[RetrievedChunk]) -> str:
@@ -98,11 +182,12 @@ def snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
 def pick_sources(reply: str, chunks: list[RetrievedChunk]) -> list[dict]:
     """One source per KB Section, because citations are per section.
 
-    Uses the context chunks whose section the reply cites (all of them if it cites none of them),
-    in retrieval order. A section's first (highest-ranked) chunk gives the snippet.
+    Uses the context chunks whose section the reply cites, in retrieval order; a reply that cites none (a
+    question, a confirmation) has no sources (T12a: it used to get every context section, so a question showed
+    a "KB 10" source). A section's first (highest-ranked) chunk gives the snippet.
     """
     cited = set(cited_sections(reply))
-    used = [c for c in chunks if c.section_no in cited] or chunks
+    used = [c for c in chunks if c.section_no in cited]
     if cited - {c.section_no for c in chunks}:
         logger.warning("reply cites a section that was not in the context")
     first_per_section = {}

@@ -34,21 +34,33 @@ PAUSE_BETWEEN_TURNS_S = 15  # up to 4 main-model calls a turn; the free tier all
 LAST_TURN = {"session": None}
 
 
+SESSIONS: list[str] = []  # this run's chat sessions; their leads are removed afterwards
+
+
 @pytest.fixture
 def lead_agent(test_engine):
-    """The real agent writing leads to the test branch; skips without the database, keys or KB."""
+    """The real agent writing leads to the test branch; skips without the database, keys or KB.
+
+    T12a: it no longer empties the lead tables (that wiped the demo data); afterwards it deletes only the
+    leads its own sessions created (their callbacks go with them)."""
     settings = get_settings()
     if not (settings.database_url and settings.google_api_key):
         pytest.skip("DATABASE_URL and GOOGLE_API_KEY are needed")
     if not count_kb_chunks(get_engine()):
         pytest.skip("kb_chunks is empty; run python -m app.rag.ingest first")
     init_db(test_engine)
-    with test_engine.begin() as conn:
-        conn.execute(text("TRUNCATE leads, callbacks, support_requests RESTART IDENTITY CASCADE"))
     agent = build_agent(get_engine(), InMemorySaver(), leads_engine=test_engine)
     app.dependency_overrides[get_agent] = lambda: agent
     yield agent
+    with test_engine.begin() as conn:
+        conn.execute(text("DELETE FROM leads WHERE session_id = ANY(:sessions)"), {"sessions": SESSIONS})
     time.sleep(4)  # stay under 15 requests a minute per Gemini model
+
+
+def new_session() -> str:
+    session = str(uuid.uuid4())
+    SESSIONS.append(session)
+    return session
 
 
 def ask(client, message: str, session_id: str) -> dict:
@@ -79,7 +91,7 @@ def ask(client, message: str, session_id: str) -> dict:
 
 
 def test_demo_script_creates_a_hot_lead_with_a_requested_callback(client, lead_agent, test_engine):
-    session = str(uuid.uuid4())
+    session = new_session()
     ask(client, "What solar systems do you offer for homes?", session)
     second = ask(client, "I'm interested in a 5 kW system for my house in Lucknow. My bill is about ₹4,000 a month "
                          "and I'd like it installed next month.", session)
@@ -89,9 +101,7 @@ def test_demo_script_creates_a_hot_lead_with_a_requested_callback(client, lead_a
     fourth = ask(client, "Yes, call me tomorrow evening.", session)
     assert any(s.get("name") == "schedule_callback" for s in fourth["steps"])
 
-    leads, total = service.list_leads(test_engine)
-    assert total == 1
-    lead = service.get_lead(test_engine, leads[0].id)
+    lead = service.get_lead(test_engine, fourth["lead"]["id"])  # this session's lead (the demo data may be there too)
     print(f"\nLEAD {lead.id}: {lead.lead_score} {lead.lead_status} ({lead.location_status}) | reason "
           f"[{lead.reason_source}]: {lead.reason} | action: {lead.recommended_action} | callbacks: "
           f"{[(c.preferred_time, c.status) for c in lead.callbacks]}")
@@ -102,7 +112,7 @@ def test_demo_script_creates_a_hot_lead_with_a_requested_callback(client, lead_a
 
 
 def test_yes_please_connect_me_asks_for_name_and_phone(client, lead_agent):
-    session = str(uuid.uuid4())
+    session = new_session()
     ask(client, "Do you provide installation in Delhi?", session)
     body = ask(client, "Yes please, connect me", session)
     assert NAME_AND_PHONE_RE.search(body["reply"]), "should ask for name and phone"

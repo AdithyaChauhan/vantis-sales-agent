@@ -8,7 +8,7 @@ data/eval/offtopic_eval.jsonl (questions the KB cannot answer). Each question is
 docs/EVAL.md; the hand-written "Tuning notes" section of that file is kept.
 
 --rewrite also runs the agent's understand step on every question (one understand_llm call each: the main
-model, falling back to fast and then Groq after 5 s; paced to stay under the free tier's 15 requests a minute), embeds the rewritten search_query and adds two modes:
+model, falling back to Groq and then the fast model after 4 s each; paced to stay under the free tier's 15 requests a minute), embeds the rewritten search_query and adds two modes:
 "rewrite" (hybrid search on the rewritten query) and "fused" (RRF of the raw-question and rewritten
 hybrid rankings). It also reports where the small-to-big rule (app/agent/graph.py) would add a table
 summary chunk to the agent's 4-chunk context.
@@ -497,7 +497,7 @@ def main() -> int:
             row_counts = dict(conn.execute(text(
                 "SELECT section_no, count(*) FROM kb_chunks WHERE chunk_type = 'table_row' GROUP BY section_no"
             )).all())
-        setup.append(("Rewrite", f"understand step ({settings.llm_model_main}; fast, then Groq after 5 s), "
+        setup.append(("Rewrite", f"understand step ({settings.llm_model_main}; then Groq, then fast, 4 s each), "
                                  "no history; fused = RRF of raw and rewritten hybrid rankings"))
         extra = [
             "", "## Query rewrite (understand step)", "",
