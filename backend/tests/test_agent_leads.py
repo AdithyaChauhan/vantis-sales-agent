@@ -1,4 +1,5 @@
 """Lead tools in the agent: scripted models, the real T7 leads service on the Neon test branch."""
+import json
 import threading
 import uuid
 
@@ -7,7 +8,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from app.agent.leads import LeadOps, confirmed_city, status_block
+from app.agent.leads import LeadOps, card_fields, confirmed_city, status_block
 from app.core.db import init_db
 from app.leads import service
 from app.leads.models import Callback, Lead, SupportRequest
@@ -84,11 +85,21 @@ def test_demo_flow_creates_a_hot_lead_and_a_requested_callback(ops):
     graph, agent = demo_graph(ops)
     run(graph, "What systems do you offer for homes?", thread="demo")
     second = run(graph, "5 kW for my house in Lucknow, bill about 4000, next month", thread="demo")
-    assert second["lead_summary"]["missing_fields"] == ["name", "phone or email"]
+    draft = second["lead_summary"]
+    assert draft["missing_fields"] == ["name", "phone or email"]
+    assert (draft["name"], draft["city"], draft["property_type"], draft["customer_type"]) == (
+        None, "Lucknow", "house", "residential")
+    assert {"city", "monthly_bill_inr", "system_size_kw", "timeline"} <= set(draft["known_fields"])
+    assert "4000" not in json.dumps(draft) and "4,000" not in json.dumps(draft)  # field names, never amounts
     assert "Still needed before it can be saved: name, phone or email" in lead_status_text(agent)
     third = run(graph, "Rahul Sharma, 98765 43210, rahul.sharma@example.com", thread="demo")
     assert [s.get("name") for s in third["steps"] if s["node"] == "tool"] == ["create_lead"]
     assert third["lead_id"] and third["lead_summary"]["status"] == "HOT"
+    saved = third["lead_summary"]
+    assert (saved["name"], saved["city"], saved["customer_type"]) == ("Rahul Sharma", "Lucknow", "residential")
+    assert {"phone", "email", "monthly_bill_inr"} <= set(saved["known_fields"])
+    for value in ("98765", "43210", "rahul.sharma@example.com", "4000"):  # names only, no contact or money
+        assert value not in json.dumps(saved), value
     fourth = run(graph, "Yes, call me tomorrow evening", thread="demo")
     assert fourth["callback_status"] == "requested"
     assert fourth["lead_summary"]["callback_status"] == "requested"
@@ -206,6 +217,18 @@ def test_information_only_turn_does_not_ask_for_details():
 def test_interest_brings_back_the_missing_details(state):
     block = status_block(state)
     assert "Still needed before it can be saved" in block and "do not ask for their details" not in block
+
+
+def test_card_fields_send_names_and_never_contact_or_money_values():
+    values = {"name": "Rahul Sharma", "city": "Lucknow", "phone": "+919876543210", "email": "r@example.com",
+              "monthly_bill_inr": 4000, "property_type": "house", "customer_type": "residential", "timeline": None}
+    card = card_fields(values)
+    assert (card["name"], card["city"], card["property_type"], card["customer_type"]) == (
+        "Rahul Sharma", "Lucknow", "house", "residential")
+    assert card["known_fields"] == ["city", "customer_type", "email", "monthly_bill_inr", "name", "phone",
+                                    "property_type"]  # a null field is not known
+    for value in ("+919876543210", "r@example.com", 4000):
+        assert value not in card.values() and str(value) not in str(card), value
 
 
 def test_two_asked_cities_ask_which():

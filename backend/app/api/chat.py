@@ -104,13 +104,19 @@ class Step(BaseModel):
 
 class LeadSummary(BaseModel):
     """The lead so far, for the chat page's demo panel. status and score are null unless
-    CHAT_SHOW_LEAD_SCORE is on (this endpoint is customer-facing)."""
+    CHAT_SHOW_LEAD_SCORE is on (this endpoint is customer-facing). known_fields holds field names only,
+    never their values (no phone, email or money amounts)."""
 
     id: int | None = None
     status: str | None = None
     score: int | None = None
     missing_fields: list[str] = []
     callback_status: str | None = None
+    name: str | None = None
+    city: str | None = None
+    property_type: str | None = None
+    customer_type: str | None = None
+    known_fields: list[str] = []
 
 
 class ChatResponse(BaseModel):

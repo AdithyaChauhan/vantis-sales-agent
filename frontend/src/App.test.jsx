@@ -234,6 +234,61 @@ describe("reply and lead", () => {
     expect(screen.getByText("Reference Service Locations")).toBeTruthy();
     expect(screen.getByText("Tool: schedule_callback")).toBeTruthy();
     expect(screen.getByText("Saved as lead #12")).toBeTruthy();
-    expect(screen.getByText("Requested, the team will confirm")).toBeTruthy();
+    expect(screen.getByText("requested, the team will confirm")).toBeTruthy();
+  });
+
+  it("new messages show when they were sent; messages saved without a time show none", async () => {
+    fakeApi({ chat: () => jsonResponse(200, chatReply("Hello!")) });
+    const { container } = render(<App />);
+    await screen.findByText(WELCOME.text);
+    send("Hi");
+    await screen.findByText("Hello!");
+    const times = [...container.querySelectorAll("time")];
+    expect(times).toHaveLength(2); // the customer's message and the reply
+    for (const time of times) expect(Number.isNaN(Date.parse(time.getAttribute("datetime")))).toBe(false);
+
+    cleanup();
+    const old = [{ id: "1", role: "user", text: "Saved before T10c" }];
+    sessionStorage.setItem("vantis-chat", JSON.stringify({ sessionId: SESSION, messages: old, lead: null }));
+    const reloaded = render(<App />);
+    await screen.findByText("Saved before T10c");
+    expect(reloaded.container.querySelector("time")).toBeNull();
+  });
+});
+
+describe("page frame", () => {
+  it("the Sales view switch is on by default, hides the card when off, and is remembered", async () => {
+    fakeApi();
+    render(<App />);
+    await screen.findByText(WELCOME.text);
+    const toggle = screen.getByRole("switch", { name: "Sales view" });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("heading", { name: "Sales view (demo)" })).toBeTruthy();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByRole("heading", { name: "Sales view (demo)" })).toBeNull();
+
+    cleanup(); // a reload: the choice comes back from localStorage
+    render(<App />);
+    await screen.findByText(WELCOME.text);
+    expect(screen.getByRole("switch", { name: "Sales view" }).getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByRole("heading", { name: "Sales view (demo)" })).toBeNull();
+  });
+
+  it("has no button or link without an action (no attach, emoji, menu or missing pages)", async () => {
+    fakeApi();
+    render(<App />);
+    await screen.findByText(WELCOME.text);
+    const names = screen.getAllByRole("button").map((button) => button.textContent.trim());
+    expect(names.sort()).toEqual(["New chat", "Send", ...WELCOME.starter_questions].sort());
+    expect(screen.getAllByRole("switch").map((s) => s.textContent.trim())).toEqual(["Sales view"]);
+    expect(screen.queryAllByRole("link")).toEqual([]);
+    for (const missing of [/attach/i, /emoji/i, /more/i, /^leads$/i, /installations/i, /products/i, /knowledge/i, /analytics/i]) {
+      expect(screen.queryByRole("button", { name: missing })).toBeNull();
+      expect(screen.queryByText(missing)).toBeNull();
+    }
+    // The only section is the current page, marked as such
+    expect(screen.getByRole("navigation", { name: "Sections" }).textContent).toBe("Chat");
   });
 });

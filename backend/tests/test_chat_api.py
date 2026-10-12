@@ -152,7 +152,10 @@ import time  # noqa: E402
 from app.api import chat as chat_api  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 
-SUMMARY = {"id": 7, "status": "HOT", "score": 97, "missing_fields": ["ownership"], "callback_status": "requested"}
+CARD = {"name": "Rahul Sharma", "city": "Lucknow", "property_type": "house", "customer_type": "residential",
+        "known_fields": ["city", "customer_type", "monthly_bill_inr", "name", "phone", "property_type"]}
+SUMMARY = {"id": 7, "status": "HOT", "score": 97, "missing_fields": ["ownership"], "callback_status": "requested",
+           **CARD}
 
 
 class StateAgent:
@@ -177,8 +180,9 @@ def test_lead_summary_hides_status_and_score_by_default(client, monkeypatch):
     monkeypatch.setattr(get_settings(), "chat_show_lead_score", False)
     app.dependency_overrides[get_agent] = lambda: StateAgent(SUMMARY)
     lead = post(client, "hi").json()["lead"]
+    # The card's name, city, type and known field names stay; only score and status are hidden
     assert lead == {"id": 7, "status": None, "score": None, "missing_fields": ["ownership"],
-                    "callback_status": "requested"}
+                    "callback_status": "requested", **CARD}
 
 
 def test_lead_summary_shows_status_and_score_for_the_demo(client, monkeypatch):

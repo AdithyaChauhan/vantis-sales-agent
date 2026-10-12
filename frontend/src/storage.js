@@ -38,3 +38,25 @@ export function clearChat() {
     // Nothing to do.
   }
 }
+
+// The "Sales view" switch is a viewer preference, not chat data, so it lives in localStorage
+// (remembered across visits on this browser). On for the demo when nothing is saved.
+const SALES_VIEW_KEY = "vantis-sales-view";
+
+/** Whether the sales card is shown (true unless the viewer turned it off). */
+export function loadSalesView() {
+  try {
+    return localStorage.getItem(SALES_VIEW_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+/** Remember the switch position. */
+export function saveSalesView(on) {
+  try {
+    localStorage.setItem(SALES_VIEW_KEY, on ? "on" : "off");
+  } catch {
+    // Blocked storage: the switch still works for this visit.
+  }
+}

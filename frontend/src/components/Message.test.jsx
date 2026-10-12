@@ -24,7 +24,7 @@ describe("source chips", () => {
     render(<Message message={assistant({ sources: SOURCES })} />);
     const chips = within(screen.getByRole("list", { name: "Sources" })).getAllByRole("listitem");
     expect(chips).toHaveLength(2);
-    expect(within(chips[0]).getByText("KB Section 8")).toBeTruthy();
+    expect(chips[0].querySelector(".chip-section").textContent).toBe("KB Section 8"); // shown as "KB 8"
     expect(within(chips[0]).getByText("Product & Service Catalog")).toBeTruthy();
     expect(within(chips[0]).getByText("Vantis HomePro 5: 5 kW rooftop system")).toBeTruthy();
     expect(within(chips[0]).getByText("Page 3 of the knowledge base")).toBeTruthy();
@@ -46,10 +46,12 @@ describe("How I answered", () => {
     const { container } = render(<Message message={assistant({ steps: STEPS })} />);
     const panel = container.querySelector("details.steps");
     expect(panel.open).toBe(false);
-    expect(within(panel).getByText("How I answered (4 steps, 6.4 s)")).toBeTruthy();
+    expect(within(panel).getByText("How I answered · 4 steps · 6.4 s")).toBeTruthy();
     expect(within(panel).getByText("Understood the message")).toBeTruthy();
-    expect(within(panel).getByText("1200 ms")).toBeTruthy();
-    expect(within(panel).queryByText("984 ms")).toBeNull(); // already in the model call's detail
+    expect(within(panel).getByText("1.2 s")).toBeTruthy(); // every time in seconds
+    expect(within(panel).getByText("1.0 s")).toBeTruthy(); // the model call's 984 ms
+    expect(within(panel).queryByText(/\d+ ms/)).toBeNull();
+    expect(within(panel).getByText("gemini, calls check_service_area")).toBeTruthy();
     expect(within(panel).getByText("Tool: check_service_area")).toBeTruthy();
     expect(within(panel).getByText("Lucknow: listed")).toBeTruthy();
   });
@@ -64,5 +66,19 @@ describe("How I answered", () => {
     expect(container.querySelector("details")).toBeNull();
     expect(container.querySelector("b")).toBeNull();
     expect(screen.getByText("<b>hi</b>")).toBeTruthy();
+  });
+});
+
+describe("time", () => {
+  it("shows when a message was sent, as a <time> with the exact moment", () => {
+    const at = "2026-10-12T05:32:00.000Z";
+    const { container } = render(<Message message={assistant({ at })} />);
+    expect(container.querySelector("time").getAttribute("datetime")).toBe(at);
+    expect(container.querySelector("time").textContent).toMatch(/\d{1,2}[:.]\d{2}/);
+  });
+
+  it("shows nothing for a message saved without a time", () => {
+    const { container } = render(<Message message={{ id: "3", role: "user", text: "Old message" }} />);
+    expect(container.querySelector("time")).toBeNull();
   });
 });

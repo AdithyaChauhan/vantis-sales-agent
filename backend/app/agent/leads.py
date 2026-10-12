@@ -153,9 +153,22 @@ def _breakdown_stub(lead: dict) -> dict:
     return score_lead(LeadData.model_validate(lead), "unknown")
 
 
+def card_fields(values: dict) -> dict:
+    """What the chat page's sales card shows: the name, city and type, plus the names of the fields that
+    are known (only names, so no phone number, email or money amount is ever sent)."""
+    return {
+        "name": values.get("name"),
+        "city": values.get("city"),
+        "property_type": values.get("property_type"),
+        "customer_type": values.get("customer_type"),
+        "known_fields": sorted(name for name, value in values.items() if value is not None),
+    }
+
+
 def lead_summary(state: dict, engine: Engine | None) -> dict | None:
-    """{id, status, score, missing_fields, callback_status} for the API's demo panel, or None when nothing
-    about a lead is known. The API hides status and score unless CHAT_SHOW_LEAD_SCORE is on."""
+    """{id, status, score, missing_fields, callback_status, name, city, property_type, customer_type,
+    known_fields} for the API's demo panel, or None when nothing about a lead is known. The API hides
+    status and score unless CHAT_SHOW_LEAD_SCORE is on."""
     lead = state.get("lead", {})
     if state.get("support_case") and not state.get("lead_id"):
         return None
@@ -169,6 +182,7 @@ def lead_summary(state: dict, engine: Engine | None) -> dict | None:
                 "score": view.lead_score,
                 "missing_fields": missing_details(view, view.score_breakdown),
                 "callback_status": callbacks[-1].status if callbacks else None,
+                **card_fields(view.model_dump(include=set(LeadData.model_fields))),
             }
     if not lead:
         return None
@@ -178,4 +192,5 @@ def lead_summary(state: dict, engine: Engine | None) -> dict | None:
         "score": None,
         "missing_fields": ordered_missing(lead, state.get("contact_request", False)),
         "callback_status": None,
+        **card_fields(LeadData.model_validate(lead).model_dump()),
     }

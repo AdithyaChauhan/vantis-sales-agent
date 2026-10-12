@@ -1,9 +1,12 @@
+import { Send } from "lucide-react";
+
 // The API accepts 1-1,000 characters (backend/app/api/chat.py).
 export const MAX_MESSAGE_CHARS = 1000;
 
 /**
  * The message box. Enter sends, Shift+Enter adds a line. While a reply is on its way the box is
  * read-only (it keeps focus) and Send is disabled; during a 429 wait Send shows the countdown.
+ * The box starts as one line and grows with the text.
  */
 export default function Composer({ draft, setDraft, onSend, pending, waitLeft }) {
   const blocked = pending || waitLeft > 0;
@@ -27,25 +30,26 @@ export default function Composer({ draft, setDraft, onSend, pending, waitLeft })
       <label htmlFor="message" className="visually-hidden">
         Your message
       </label>
-      <textarea
-        id="message"
-        rows={2}
-        maxLength={MAX_MESSAGE_CHARS}
-        value={draft}
-        readOnly={pending}
-        onChange={(event) => setDraft(event.target.value)}
-        onKeyDown={onKeyDown}
-        placeholder="Ask about rooftop solar for your home or business"
-        aria-describedby="composer-hint"
-      />
-      <div className="composer-bar">
-        <p id="composer-hint" className="composer-hint">
-          Enter to send, Shift+Enter for a new line
-        </p>
-        <button type="submit" className="btn btn-primary" disabled={!canSend}>
-          {waitLeft > 0 ? `Wait ${formatWait(waitLeft)}` : "Send"}
-        </button>
+      <div className="composer-field">
+        <textarea
+          id="message"
+          rows={1}
+          maxLength={MAX_MESSAGE_CHARS}
+          value={draft}
+          readOnly={pending}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={onKeyDown}
+          placeholder="Type a message…"
+          aria-describedby="composer-hint"
+        />
       </div>
+      <p id="composer-hint" className="visually-hidden">
+        Enter to send, Shift+Enter for a new line
+      </p>
+      <button type="submit" className="btn btn-primary btn-send" disabled={!canSend}>
+        <Send className="btn-icon" aria-hidden="true" />
+        <span>{waitLeft > 0 ? `Wait ${formatWait(waitLeft)}` : "Send"}</span>
+      </button>
     </form>
   );
 }

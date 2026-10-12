@@ -2,7 +2,7 @@
 
 The single source of truth for what we build and why.
 Roles: Adithya owns the project. Claude (chat) reviews and writes the tasks. Claude Code builds.
-Last updated: 2026-10-12 (T10b).
+Last updated: 2026-10-12 (T10c).
 
 ---
 
@@ -268,7 +268,7 @@ Response:
   "degraded": false
 }
 ```
-`lead` (T8b): `{"id", "status", "score", "missing_fields", "callback_status"}`, or null while nothing about a lead is known. Before saving, `missing_fields` is what the lead still needs; after saving, the details that would still add points. **`status` and `score` are filled only when `CHAT_SHOW_LEAD_SCORE=true`**: on for the demo panel, **off for production** (the chat is customer-facing; the README says so in T14). The model never sees these values. Each step is `{"node", "name" (tools only), "detail", "data"}`.
+`lead` (T8b): `{"id", "status", "score", "missing_fields", "callback_status"}`, plus (T10c, for the sales card) `"name"`, `"city"`, `"property_type"`, `"customer_type"` and `"known_fields"` (the names of the known fields only, never their values, so no phone, email or money amount), or null while nothing about a lead is known. Before saving, `missing_fields` is what the lead still needs; after saving, the details that would still add points. **`status` and `score` are filled only when `CHAT_SHOW_LEAD_SCORE=true`**: on for the demo panel, **off for production** (the chat is customer-facing; the README says so in T14). The model never sees these values. Each step is `{"node", "name" (tools only), "detail", "data"}`.
 
 | Method | Path | Notes |
 |---|---|---|
@@ -334,16 +334,46 @@ Tables are created on startup with `create_all` + `CREATE EXTENSION IF NOT EXIST
 
 Frontend (`frontend/.env.example`): `VITE_API_URL`, default `http://127.0.0.1:8000`, with or without a trailing slash. Use `127.0.0.1`, not `localhost`: uvicorn listens on IPv4 only, and `localhost` can resolve to `::1` first (on Adithya's laptop a Docker/WSL relay answers there with 404).
 
-### 3.14 Chat page (T10, `frontend/`)
-React 19 + Vite 8, plain JavaScript (JSX with JSDoc on exported functions) and plain CSS. Dependencies: react, react-dom; dev only: vite, @vitejs/plugin-react, vitest, jsdom, @testing-library/react + @testing-library/dom. Exact versions, lockfile committed.
-- **Welcome (F0):** `GET /api/welcome` on load, shown as the first assistant message with the starter questions as buttons (only before the first message). After 3 s without an answer: "Waking up the server. This can take up to a minute." After 90 s or a network error: "Couldn't reach the server" + **Try again**.
+### 3.14 Chat page (T10, redesigned in T10c, `frontend/`)
+React 19 + Vite 8, plain JavaScript (JSX with JSDoc on exported functions) and plain CSS. Dependencies: react, react-dom, lucide-react 1.48.0 (icons; React 19 is in its peer range), @fontsource-variable/plus-jakarta-sans 5.3.0 (the self-hosted font); dev only: vite, @vitejs/plugin-react, vitest, jsdom, @testing-library/react + @testing-library/dom. Exact versions, lockfile committed.
+- **Welcome (F0):** `GET /api/welcome` on load, shown as the first assistant message with the starter questions as pill buttons (only before the first message). After 3 s without an answer: "Waking up the server. This can take up to a minute." After 90 s or a network error: "Couldn't reach the server" + **Try again**.
 - **Session:** the first `POST /api/chat` has no `session_id`; the page keeps the returned one and sends it every time. Id, transcript and latest lead live in **sessionStorage** (survive a reload, gone when the tab closes, so personal details don't stay on a shared computer). **New chat** clears them.
-- **Replies:** React text nodes only (never HTML; `<script>` shows as text). Lines become paragraphs, `- ` lines a list, `**x**` bold. `[KB Section N: Title]` becomes a small "KB Section N" tag (full title on hover and for screen readers); text that doesn't match stays as it is. Sources are chips ("KB Section 8 Product & Service Catalog"); a click opens the snippet and page. **How I answered** (collapsed): each step's label, detail and time, the client's total time, and "Fallback used" when degraded.
-- **Lead card ("Sales view (demo)"):** from the `lead` field: not saved yet + still needed, or saved as lead #N + details that would add points; callback status. Status and score only when the API sends them (`CHAT_SHOW_LEAD_SCORE`). Desktop: a sticky side panel; phone (< 900 px): a strip under the header.
+- **Replies:** React text nodes only (never HTML; `<script>` shows as text). Lines become paragraphs; `- ` or `* ` lines a list and `1. ` lines a numbered list (keeping its first number); `# ` (with a space) at the start of a line a heading, so "#1" stays as it is; `**x**` bold and `*x*` italic, and any other asterisk is dropped so none ever shows; underscores are left alone (they appear in email addresses). `[KB Section N: Title]` becomes a small, quiet "KB N" tag (full title on hover and for screen readers); text that doesn't match stays as it is. Each message has an avatar (the Vantis sun on peach, a person on light blue) and its time (`<time>`, in the browser's language; messages saved before T10c show none). Sources are pills with a book icon ("KB 8 · Product & Service Catalog"); a click opens the snippet and page. **How I answered · N steps · X s** is the reply bubble's footer row (collapsed; the chevron opens it): each step's label, detail and time in seconds, and "Fallback used" when degraded.
+- **Sales card ("Sales view (demo)"),** from the `lead` field (part 3.9):
+  - The note "What the sales team sees; hidden from customers in production."
+  - The lead's name (or "New lead") with "City · Residential" (customer type, else property type).
+  - The status badge (HOT with a flame, WARM with a sun, COLD with a snowflake, each in its own colour and always with the word) and the score "97 / 100" with an orange bar, both only when the API sends them (`CHAT_SHOW_LEAD_SCORE`); "Saved as lead #N" or "Not saved yet".
+  - "Details collected": City, Need, Bill, Timeline, Contact and Rooftop, each with a line icon and a green check or an empty circle, ticked from `known_fields`; "Still needed to save" or "Would add points" from `missing_fields`; and the callback row.
+  - Empty state: the same cards with "No lead yet" and every row empty.
+  - Desktop: a column on the right. Phone (< 900 px): a collapsible strip under the header.
+- **Sales view switch** (header, `role="switch"`): on by default, remembered in localStorage (a viewer preference, not chat data); off hides the card and the phone strip, and the chat takes the space.
 - **Sending:** one message at a time (Send disabled, box read-only, typing dots). After 8 s: "the first answer after the server wakes up can take about 20 seconds". Client timeout 90 s.
 - **Errors:** the typed text always goes back into the box. 429: the API's `detail`, Send disabled for `retry_after` (body, else the `Retry-After` header) with a countdown. 422: the field's message (a refused `session_id` is dropped, so the next message starts a new chat). Anything else: "Something went wrong. Please try again."
-- **Accessibility:** Enter sends, Shift+Enter adds a line (not while an input method is composing), visible focus ring, a polite live region reads each new reply once, labels on all controls, light and dark themes, motion only without `prefers-reduced-motion`.
-- **Design:** a fictional brand (text name + a CSS rising-sun mark, also the favicon), cool neutrals, one teal accent, system fonts, pill buttons and chips, 12 px cards.
+- **Accessibility:** Enter sends, Shift+Enter adds a line (not while an input method is composing), visible focus ring, a polite live region reads each new reply once, labels on all controls (icon-only phone buttons keep their names), light and dark themes, motion only without `prefers-reduced-motion`.
+- **Design (T10c),** after `docs/design/chat-design.png` (a reference image made with Google Gemini):
+  - Warm off-white page with a peach glow, white cards, navy text, an orange accent and a blue for the customer.
+  - **Font:** Plus Jakarta Sans, a rounded geometric sans close to the image's lettering, self-hosted. The whole package is imported, so the ₹ sign (in the latin-ext file) renders in it too. Its narrow space (0.17em, measured) gets `word-spacing: 0.06em`.
+  - **Type scale:** the root size is `clamp(1rem, 0.75rem + 0.3125vw, 1.125rem)`: 16 px up to 1280 px wide, 18 px at 1920 px and no bigger. Everything is in rem, so the page scales together, and the layout is capped at 88rem so wide screens don't look empty. The reference reads as a 16 px page at 150% zoom, so the comparison screenshot is a 1280×720 window at device scale 1.5.
+  - **Layout:** a header; a sidebar with only "Chat" (the current page; T11 adds Leads) and a rooftop photo (Pexels, `docs/CREDITS.md`) as a CSS background, so phones never download it; the chat card; the sales card. At 900–1099 px there is no sidebar. Phone: header, strip, chat, with the composer pinned (safe-area padding).
+  - **Dark mode:** from `prefers-color-scheme`, with the photo dimmed.
+  - **No control without an action:** no attach, emoji or menu buttons, no links to pages that don't exist.
+- **Colours (T10c):**
+  - Three versions were compared from the same chat: the image's exact colours (several pairs fail WCAG AA, e.g. white on orange 2.0–2.7:1); the fixes with navy on the bright orange; the fixes with white on a darker orange. Adithya chose navy on the bright orange.
+  - Every text pair passes AA (4.5:1), and every icon and control pair passes 3:1, in light and dark: 68 pairs checked. The lowest text pair is 4.65:1 (muted text inside a reply bubble), the lowest icon pair 3.36:1 (the green check).
+
+  Key pairs (light):
+
+  | Pair | Colours | Ratio |
+  |---|---|---|
+  | Navy text on the orange button (both ends) | `#101b3f` on `#fea537` / `#fd7a1a` | 8.52 / 6.38 |
+  | White text on the customer bubble | `#ffffff` on `#1f6fd8` | 4.86 |
+  | Timestamps, note, placeholder (muted) | `#626f88` on `#fffefc` | 5.02 |
+  | How I answered | `#4f6390` on `#f7f8fc` | 5.62 |
+  | HOT / WARM / COLD badges | white on `#d92d3a` / navy on `#f59e0b` / white on `#2f62c8` | 4.79 / 7.82 / 5.67 |
+  | Empty circle, green check (icons) | `#7b869e`, `#22a05a` on white | 3.65 / 3.36 |
+  | Switch on (track, thumb), focus ring | `#c2410c` on page, white on `#c2410c` | 4.94 / 5.18 |
+
+  Dark key pairs: muted `#8a95b0` on the card 5.72; white on the bubble `#2569d4` 5.19; the switch's dark thumb on `#fb923c` 8.19.
 - **Local checks never write to main:** `python -m scripts.serve_test_branch` runs the API with the chat agent's lead writes and the sales API on the test branch (KB read from main, chat memory in the process). It refuses to start when `TEST_DATABASE_URL` is empty or equals `DATABASE_URL`.
 
 ---
@@ -366,6 +396,7 @@ One task = one Claude Code session = one `/handoff`.
 | T9 | Mon | Sales API, API key, rate limit, error paths, API tests | API tests pass; `/docs` lists every endpoint. **Done 2026-10-11:** 5 sales endpoints behind `X-API-Key` (fail closed, failed-key lockout), chat 10/min + 100/day per IP with 429 + Retry-After, client IP from `CF-Connecting-IP`, UUID v4 session ids. **Render check passed** (all 6 steps): key required; 10 chat messages then 429 with Retry-After; `"ip_source": "header"` in the logs; lockout after 10 wrong keys |
 | T10 | Tue | Chat page: welcome message + starter buttons (F0, no LLM call), messages, source chips, agent-steps panel, live lead card, error states, "server waking up" notice | Demo flow works locally in the browser. **Done 2026-10-12** (part 3.14): the 4-turn demo in headless Edge against the local API on the test branch: cited answer (KB Section 8) → Lucknow listed, asks name and phone → lead #1 saved, HOT 97 → callback requested; turns 7.9 / 5.2 / 4.8 / 3.8 s; transcript and session survive a reload; no horizontal scroll at 400 px |
 | T10b | Tue | Fast, natural chat: understand on the fastest reliable model with a 5 s cut-off per model; voice fixes in the prompts and the lead progress block; a city answer's source is the KB Section 10 summary | Understand about 2-3 s, a turn under about 6 s; Adithya's 4 turns read naturally with every safety rule kept. **Done 2026-10-12** (final run): understand 1.3-1.8 s on gemini-3.5-flash-lite (before: 6.7-29.7 s on the fast model, with Groq answering after timeouts); Adithya's 4 turns 5.0 / 4.3 / 4.9 / 5.9 s (before: 22.1 / 13.8 / 9.7 / 32.9 s); demo 4.1 / 3.8 / 18.0 / 4.1 s, where turn 3's steps take 4.7 s and the rest is the lead reason on the slow fast model, which TestClient runs before returning (the app runs it after the reply); lead 97 HOT, callback requested; rewrite eval hit@3 24/24 (`docs/EVAL.md`) |
+| T10c | Tue | Chat page redesign after the Gemini reference image (part 3.14): header with the Sales view switch, sidebar with a photo, avatars, times, pills, steps footer, the new sales card; phone and dark mode; colours that pass AA; the lead summary's name, city, type and known field names | At 1280×720 @1.5 the page looks like the image apart from the agreed changes; phone and dark look finished. **Done 2026-10-12:** version B chosen (navy on the bright orange), 68 colour pairs pass AA; demo in Edge 9.5 / 4.2 / 4.7 / 3.8 s per reply (the first is the server's cold start), none waited for the previous turn's background lead reason; a real numbered answer renders as a list |
 | T11 | Tue | Dashboard: API-key prompt, leads table + filter, lead detail with breakdown | Rahul shows as HOT with reason and action |
 | T12 | Wed | Edge-case pass, live scenario tests, prompt fixes logged | Every scenario in part 5 passes or is documented |
 | T13 | Wed | GitHub Actions CI, deploy backend (Render) + frontend (Vercel), CORS, live smoke test | CI green; the demo flow works on the live URL |
@@ -375,11 +406,12 @@ Rule: no extras until the current task's "Done when" passes.
 
 ### T13 notes (from T10)
 - **Vercel:** set `VITE_API_URL` to the Render URL (a trailing slash is fine) and add the Vercel URL to `CORS_ORIGINS` (render.yaml and `PROD_DIFFERS` in `tests/test_deploy_config.py`). Vite reads `VITE_*` at build time, so changing it needs a redeploy.
-- **The demo card in production:** with `CHAT_SHOW_LEAD_SCORE=false` the card shows no score or status, but it still shows lead and callback state to customers. Decide whether the deployed page shows the card at all (e.g. a `VITE_SHOW_SALES_VIEW` flag), or keep it on for the review and say so in the README.
+- **The demo card in production:** with `CHAT_SHOW_LEAD_SCORE=false` the card shows no score or status, but it still shows the customer's own name, city, checklist and callback state. The Sales view switch (T10c) is on by default and remembered per browser; decide its production default (e.g. off through a `VITE_SALES_VIEW_DEFAULT` setting, or hide the switch), or keep it on for the review and say so in the README.
 
 ### T11 notes (from T10)
 - **Local dashboard checks:** `python -m scripts.serve_test_branch` already points the sales API (`leads_engine`) at the test branch, so the dashboard shows and writes only test-branch leads. Pass a throwaway `SALES_API_KEY=... python -m scripts.serve_test_branch` to use a known key locally.
 - Reuse `frontend/src/api.js` (`apiUrl`, `ApiError`, `errorFrom`) for the dashboard's calls.
+- **Sidebar (T10c):** add "Leads" to `Sidebar.jsx` only together with the page, and turn both items into real links then (today "Chat" is a current-page marker, because a link to nowhere would be a control without an action). Reuse the design tokens in `styles.css`, the lucide icons, the badge classes (`badge-hot` / `badge-warm` / `badge-cold`) and `checklist()` from `LeadCard.jsx`.
 
 ### T12 notes (from T10)
 - **Tool name in a reply:** in the T10 demo run, turn 4 ended with "… the team will confirm it [schedule_callback result]." The model cited the tool result like a KB section. The page shows it as plain text. Fix in `system_prompt.md` (cite only KB sections, never tools) and log it in `prompts/README.md`. **Done in T10b** (`system_prompt.md`, `rag_prompt.md`, and `strip_tool_citations` in finalize as the safety net).

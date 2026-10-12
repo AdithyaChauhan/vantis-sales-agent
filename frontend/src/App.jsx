@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from "react";
+import { ChartColumn, ChevronDown } from "lucide-react";
 
 import Composer, { formatWait } from "./components/Composer.jsx";
+import Header from "./components/Header.jsx";
 import LeadCard, { leadHeadline } from "./components/LeadCard.jsx";
-import Message from "./components/Message.jsx";
+import Message, { AssistantAvatar } from "./components/Message.jsx";
 import ReplyText from "./components/ReplyText.jsx";
+import Sidebar from "./components/Sidebar.jsx";
+import { loadSalesView, saveSalesView } from "./storage.js";
 import { useChat } from "./useChat.js";
 import { useWelcome } from "./useWelcome.js";
 
@@ -23,50 +27,73 @@ function useWideScreen() {
   return wide;
 }
 
+/** The "Sales view" switch: on by default, remembered in this browser. */
+function useSalesView() {
+  const [on, setOn] = useState(loadSalesView);
+  useEffect(() => saveSalesView(on), [on]);
+  return [on, () => setOn((value) => !value)];
+}
+
 function prefersReducedMotion() {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+}
+
+/** An assistant row without a saved message: the welcome, the typing dots. */
+function AssistantRow({ children, busy = false }) {
+  return (
+    <div className="msg msg-assistant" aria-busy={busy || undefined}>
+      <AssistantAvatar />
+      <div className="msg-body">{children}</div>
+    </div>
+  );
 }
 
 /** The welcome (F0) as the first assistant message, with its starter questions. */
 function Welcome({ welcome, showStarters, startersDisabled, onStarter }) {
   if (welcome.status === "loading") {
     return (
-      <div className="message message-assistant" aria-busy="true">
-        <div className="skeleton" aria-hidden="true">
-          <span />
-          <span />
-          <span />
+      <AssistantRow busy>
+        <div className="bubble bubble-assistant bubble-text">
+          <div className="skeleton" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </div>
+          {welcome.slow ? (
+            <p className="wake" role="status">
+              Waking up the server. This can take up to a minute.
+            </p>
+          ) : (
+            <p className="visually-hidden">Loading</p>
+          )}
         </div>
-        {welcome.slow ? (
-          <p className="wake" role="status">
-            Waking up the server. This can take up to a minute.
-          </p>
-        ) : (
-          <p className="visually-hidden">Loading</p>
-        )}
-      </div>
+      </AssistantRow>
     );
   }
   if (welcome.status === "error") {
     return (
-      <div className="message message-assistant">
-        <p role="alert">Couldn't reach the server. Check your connection and try again.</p>
-        <button type="button" className="btn btn-secondary" onClick={welcome.retry}>
-          Try again
-        </button>
-      </div>
+      <AssistantRow>
+        <div className="bubble bubble-assistant bubble-text">
+          <p role="alert">Couldn't reach the server. Check your connection and try again.</p>
+          <button type="button" className="btn btn-secondary btn-retry" onClick={welcome.retry}>
+            Try again
+          </button>
+        </div>
+      </AssistantRow>
     );
   }
   return (
-    <div className="message message-assistant">
-      <ReplyText text={welcome.welcome.text} />
+    <AssistantRow>
+      <div className="bubble bubble-assistant bubble-text">
+        <ReplyText text={welcome.welcome.text} />
+      </div>
       {showStarters ? (
         <div className="starters" role="group" aria-label="Suggested questions">
           {welcome.welcome.starter_questions.map((question) => (
             <button
               key={question}
               type="button"
-              className="btn btn-secondary starter"
+              className="starter"
               disabled={startersDisabled}
               onClick={() => onStarter(question)}
             >
@@ -75,25 +102,27 @@ function Welcome({ welcome, showStarters, startersDisabled, onStarter }) {
           ))}
         </div>
       ) : null}
-    </div>
+    </AssistantRow>
   );
 }
 
 function Typing({ slow }) {
   return (
-    <div className="message message-assistant typing">
-      <span className="dots" aria-hidden="true">
-        <span />
-        <span />
-        <span />
-      </span>
-      <span className="visually-hidden">{TYPING}</span>
-      {slow ? (
-        <p className="typing-slow" role="status">
-          Still working. The first answer after the server wakes up can take about 20 seconds.
-        </p>
-      ) : null}
-    </div>
+    <AssistantRow>
+      <div className="bubble bubble-assistant bubble-text typing">
+        <span className="dots" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </span>
+        <span className="visually-hidden">{TYPING}</span>
+        {slow ? (
+          <p className="typing-slow" role="status">
+            Still working. The first answer after the server wakes up can take about 20 seconds.
+          </p>
+        ) : null}
+      </div>
+    </AssistantRow>
   );
 }
 
@@ -116,10 +145,29 @@ function Notice({ notice, waitLeft }) {
   return null;
 }
 
+/** Phone: the sales card folds into a strip under the header. */
+function SalesStrip({ lead }) {
+  return (
+    <details className="sales-strip">
+      <summary>
+        <ChartColumn className="strip-icon" aria-hidden="true" />
+        <span className="strip-title">Sales view (demo):</span>
+        <span className="strip-headline">{leadHeadline(lead)}</span>
+        {lead?.status ? <span className={`strip-badge badge-${String(lead.status).toLowerCase()}`}>{lead.status}</span> : null}
+        <ChevronDown className="strip-chevron" aria-hidden="true" />
+      </summary>
+      <div className="strip-body">
+        <LeadCard lead={lead} showTitle={false} />
+      </div>
+    </details>
+  );
+}
+
 export default function App() {
   const welcome = useWelcome();
   const chat = useChat();
   const wide = useWideScreen();
+  const [salesView, toggleSalesView] = useSalesView();
   const endRef = useRef(null);
 
   // Screen readers hear each new reply once; replies restored after a reload are not read again.
@@ -146,28 +194,16 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <span className="mark" aria-hidden="true" />
-          <div>
-            <h1 className="brand-name">Vantis Energy Solutions</h1>
-            <p className="brand-sub">Rooftop solar assistant</p>
-          </div>
-        </div>
-        <button type="button" className="btn btn-secondary" onClick={chat.newChat} disabled={chat.pending || !hasChat}>
-          New chat
-        </button>
-      </header>
-
-      {!wide ? (
-        <details className="sales-strip">
-          <summary>Sales view (demo): {leadHeadline(chat.lead)}</summary>
-          <LeadCard lead={chat.lead} showTitle={false} />
-        </details>
-      ) : null}
-
-      <div className="layout">
-        <main className="chat">
+      <div className={`frame${salesView ? "" : " frame-no-sales"}`}>
+        <Header
+          salesView={salesView}
+          onToggleSalesView={toggleSalesView}
+          onNewChat={chat.newChat}
+          newChatDisabled={chat.pending || !hasChat}
+        />
+        {!wide && salesView ? <SalesStrip lead={chat.lead} /> : null}
+        <Sidebar />
+        <main className="chat-card">
           <section className="transcript" role="log" aria-live="off" aria-label="Conversation" aria-busy={chat.pending}>
             <Welcome
               welcome={welcome}
@@ -190,7 +226,7 @@ export default function App() {
             waitLeft={chat.waitLeft}
           />
         </main>
-        {wide ? (
+        {wide && salesView ? (
           <aside className="sales-panel">
             <LeadCard lead={chat.lead} />
           </aside>

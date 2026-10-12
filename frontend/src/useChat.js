@@ -37,7 +37,7 @@ export function useChat() {
     const message = text.trim();
     if (!message || pending || waitLeft > 0) return;
     const gen = generation.current;
-    const userMessage = { id: newId(), role: "user", text: message };
+    const userMessage = { id: newId(), role: "user", text: message, at: new Date().toISOString() };
     setChat((c) => ({ ...c, messages: [...c.messages, userMessage] }));
     setDraft((d) => (d.trim() === message ? "" : d));
     setPending(true);
@@ -56,6 +56,7 @@ export function useChat() {
         steps: Array.isArray(body.steps) ? body.steps : [],
         degraded: Boolean(body.degraded),
         elapsedMs: Math.round(performance.now() - started),
+        at: new Date().toISOString(),
       };
       setChat((c) => ({ sessionId: body.session_id, messages: [...c.messages, reply], lead: body.lead ?? null }));
     } catch (error) {

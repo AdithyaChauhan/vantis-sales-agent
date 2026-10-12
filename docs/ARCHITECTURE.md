@@ -18,7 +18,7 @@ Short map of how the code is built. Updated at the end of each task. See `docs/P
 | `app/agent/understand.py` | `Understanding` schema (intents, `search_query`, details generated from `LeadData`), `load_kb_hints` (section titles + table summary chunks from `kb_chunks`), `understand()` |
 | `app/agent/tools.py` | `make_tools`: `search_knowledge_base`, `check_service_area` (content + KB chunk artifacts) and, with `LeadOps`, `create_lead`, `update_lead`, `schedule_callback`, `create_support_request` (no arguments; read the draft via `InjectedState`; no score in results); `tool_step` |
 | `app/agent/graph.py` | `build_graph(AgentDeps)`: understand → retrieve → agent ⇄ tools → finalize, plus welcome / closing / redirect; `build_agent()`, `get_agent()` (FastAPI dependency) |
-| `app/agent/leads.py` | `LeadOps` (leads database, reason model, `reason_now`), the lead progress block (`status_block`; T10b: says not to ask for details until `shows_interest`), `confirmed_city`, `pending_changes` (write-once sync), `lead_summary` for the API |
+| `app/agent/leads.py` | `LeadOps` (leads database, reason model, `reason_now`), the lead progress block (`status_block`; T10b: says not to ask for details until `shows_interest`), `confirmed_city`, `pending_changes` (write-once sync), `lead_summary` for the API (T10c: plus `card_fields`: name, city, property and customer type, and the names of the known fields, never their values) |
 | `app/core/tracing.py` | `configure_tracing`: optional LangSmith; copies LANGSMITH_* settings into os.environ only when tracing is on and a key is set |
 | `app/agent/memory.py` | `get_checkpointer()` (PostgresSaver over a psycopg pool), `setup_checkpointer()` (never fails the boot) |
 | `app/agent/welcome.py` | Fixed texts: welcome (F0), starter questions, closing line, off-topic redirect |
@@ -170,19 +170,20 @@ flowchart TD
   finalize -.-> memory
 ```
 
-## Chat page (T10, `frontend/`)
-React 19 + Vite 8, plain JavaScript and CSS. Behaviour: PLAN.md part 3.14.
+## Chat page (T10, redesigned in T10c, `frontend/`)
+React 19 + Vite 8, plain JavaScript and CSS, lucide-react icons, Plus Jakarta Sans (self-hosted). Behaviour and design: PLAN.md part 3.14; credits: `docs/CREDITS.md`.
 
 | Module | Role |
 |---|---|
 | `src/api.js` | `apiUrl(path)` (VITE_API_URL, trailing slashes removed, default `http://127.0.0.1:8000`), `getWelcome()`, `postChat({message, sessionId})`, `ApiError` (`rate_limit` / `invalid` / `server` / `network`), `errorFrom` (429 → `detail` + `retry_after` or the `Retry-After` header; 422 → first field message; else a generic message); 90 s timeout |
-| `src/storage.js` | `loadChat` / `saveChat` / `clearChat`: session id, transcript and lead in sessionStorage; never throws |
-| `src/useChat.js` | The conversation hook: messages, lead, session id, draft, `pending` / `slow` (8 s), `notice`, `waitLeft` (429 countdown), `send(text)` (one at a time; on failure the text goes back into the draft), `newChat()` |
+| `src/storage.js` | `loadChat` / `saveChat` / `clearChat`: session id, transcript and lead in sessionStorage; `loadSalesView` / `saveSalesView`: the Sales view switch in localStorage (on by default); never throws |
+| `src/useChat.js` | The conversation hook: messages, lead, session id, draft, `pending` / `slow` (8 s), `notice`, `waitLeft` (429 countdown), `send(text)` (one at a time; on failure the text goes back into the draft; each new message gets an `at` time), `newChat()` |
 | `src/useWelcome.js` | `GET /api/welcome` once; `slow` after 3 s (the waking-up notice), `retry()` after an error |
-| `src/App.jsx` | Layout (header, transcript, notices, composer, sales panel or phone strip at 900 px), welcome + starters, typing indicator, screen-reader announcer |
-| `src/components/ReplyText.jsx` | Reply text as React text nodes: paragraphs, lists, bold, `[KB Section N: Title]` → "KB Section N" tag |
-| `src/components/SourceChips.jsx`, `StepsPanel.jsx`, `Message.jsx` | Source chips (`<details>`: section + title, snippet on open); "How I answered" (`<details>`: step label, detail, time); one message |
-| `src/components/LeadCard.jsx` | "Sales view (demo)": saved or not, still needed / would add points, callback; status and score only when sent |
+| `src/App.jsx` | The frame grid (header, sidebar, chat card, sales card; no sidebar below 1100 px; phone strip below 900 px), `useSalesView`, welcome + starters, typing indicator, screen-reader announcer |
+| `src/components/Header.jsx`, `Sidebar.jsx`, `Logo.jsx` | Brand, Sales view switch (`role="switch"`), New chat; the sections nav (only "Chat", the current page) and the rooftop photo (CSS background); the sun-and-horizon mark (`Logo`, and `SunMark` for the assistant avatar) |
+| `src/components/ReplyText.jsx` | Reply text as React text nodes: paragraphs, lists (`<ol start>`), "# " headings, bold and italics with stray asterisks dropped (underscores kept), `[KB Section N: Title]` → a quiet "KB N" tag |
+| `src/components/SourceChips.jsx`, `StepsPanel.jsx`, `Message.jsx` | Source pills (`<details>`: book icon, "KB 8 · title", snippet on open); "How I answered · N steps · X s" (`<details>`, the bubble's footer: label, detail, time in seconds); one message with its avatar and `<time>` |
+| `src/components/LeadCard.jsx` | "Sales view (demo)": name, "City · type", status badge and score (only when sent), saved or not, "Details collected" (`checklist(lead)` from `known_fields`), still needed / would add points, callback; designed empty state |
 | `src/components/Composer.jsx` | Textarea (Enter sends, Shift+Enter new line, 1,000 characters), Send / "Wait N s" |
 | `src/*.test.js(x)` | Vitest + Testing Library, `fetch` stubbed (`src/test-utils.js`) |
 
@@ -195,6 +196,7 @@ flowchart LR
   api --> backend["FastAPI (Render, or local 127.0.0.1:8000)"]
   chat <--> store[("sessionStorage: session id, transcript, lead")]
   chat --> view["Message: ReplyText, SourceChips, StepsPanel"]
-  chat --> card["LeadCard (Sales view, demo)"]
+  chat --> card["LeadCard (Sales view, demo): identity, score, checklist, callback"]
+  prefs[("localStorage: Sales view switch")] --> card
   chat --> composer["Composer + notices (429 countdown, 422, errors)"]
 ```
