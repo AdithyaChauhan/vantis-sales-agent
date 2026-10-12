@@ -224,3 +224,31 @@ def test_health_kb_chunks_is_null_when_table_is_missing(client, use_engine, test
     response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json()["kb_chunks"] is None
+
+
+def test_kb_hints_include_the_package_guidance_rows(test_engine):
+    # T13a: the KB Section 9 rows, read once with the titles and summaries (fake one-hot vectors, test database)
+    from app.agent import understand
+
+    guidance = Section(
+        9, "Reference Package Guidance", 3,
+        tables=[Table(3, ["Customer Signal", "Potential Reference Offering", "Do Not Assume"],
+                      [["Moderate residential requirement", "Plan A", "Do not assume 3 kW is suitable."],
+                       ["Higher residential requirement", "Plan B", "Do not assume 5 kW is sufficient."]])],
+    )
+
+    class OneHot:
+        model, dim = "fake-embed", DIM
+
+        def embed_documents(self, texts):
+            return [[1.0] + [0.0] * (DIM - 1) for _ in texts]
+
+    ingest_sections(SECTIONS + [guidance], "abc123def456", test_engine, OneHot())
+    understand._hints_cache.pop(id(test_engine), None)
+    try:
+        rows = understand.load_kb_hints(test_engine).guidance
+    finally:
+        understand._hints_cache.pop(id(test_engine), None)
+    assert [r["section_no"] for r in rows] == [9, 9]
+    assert {r["chunk_type"] for r in rows} == {"table_row"}
+    assert any("Plan A" in r["content"] and "3 kW" in r["content"] for r in rows)

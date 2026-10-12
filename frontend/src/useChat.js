@@ -3,8 +3,10 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError, GENERIC_ERROR, postChat } from "./api.js";
 import { clearChat, loadChat, saveChat } from "./storage.js";
 
-// After this long without a reply, say that the first answer after a wake-up is slow.
+// After this long without a reply, say it is still working (T13a: neutral words). A tab left idle for 15+ minutes
+// finds the server asleep again, and no new health ping is sent then.
 export const SLOW_AFTER_MS = 8000;
+export const STILL_WORKING = "Still working on it. This can take up to a minute.";
 
 const EMPTY_CHAT = { sessionId: null, messages: [], lead: null };
 let lastId = 0;

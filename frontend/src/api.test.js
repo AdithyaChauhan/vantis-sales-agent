@@ -1,7 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { apiUrl, errorFrom, GENERIC_ERROR, getLead, getLeads, getSupportRequests, postChat } from "./api.js";
-import { fakeApi, jsonResponse, SALES_KEY } from "./test-utils.js";
+import {
+  apiUrl,
+  errorFrom,
+  GENERIC_ERROR,
+  getLead,
+  getLeads,
+  getSupportRequests,
+  pingServer,
+  postChat,
+  REQUEST_TIMEOUT_MS,
+} from "./api.js";
+import { chatReply, fakeApi, jsonResponse, SALES_KEY } from "./test-utils.js";
 
 describe("apiUrl", () => {
   it.each([
@@ -110,5 +120,42 @@ describe("postChat", () => {
   it("treats a 200 that isn't JSON as a server error", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("<html>proxy page</html>", { status: 200 })));
     await expect(postChat({ message: "hi", sessionId: null })).rejects.toMatchObject({ kind: "server" });
+  });
+});
+
+describe("timeouts and the health ping (T13a)", () => {
+  it("no request gives up before 60 s: a chat reply at 61 s still arrives", async () => {
+    expect(REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          (url, init) =>
+            new Promise((resolve, reject) => {
+              const late = setTimeout(() => resolve(jsonResponse(200, chatReply("late but fine"))), 61_000);
+              init.signal.addEventListener("abort", () => {
+                clearTimeout(late);
+                reject(new DOMException("aborted", "AbortError"));
+              });
+            }),
+        ),
+      );
+      const reply = postChat({ message: "hi", sessionId: null });
+      await vi.advanceTimersByTimeAsync(61_000);
+      await expect(reply).resolves.toMatchObject({ reply: "late but fine" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("pingServer asks /api/health/live once per page load and never throws", async () => {
+    vi.stubEnv("VITE_API_URL", "https://x.onrender.com/");
+    const fetchMock = vi.fn(() => Promise.reject(new TypeError("Failed to fetch")));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(pingServer()).resolves.toBe(false);
+    await expect(pingServer()).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://x.onrender.com/api/health/live");
   });
 });

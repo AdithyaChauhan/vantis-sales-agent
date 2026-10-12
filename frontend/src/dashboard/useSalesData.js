@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
 import { ApiError, GENERIC_ERROR, getLead, getLeads, getSupportRequests } from "../api.js";
-import { WAKE_NOTICE_AFTER_MS } from "../useWelcome.js";
 
 /**
  * The dashboard's data from the sales API. Filtering, search, sorting and paging all happen on the
@@ -11,18 +10,6 @@ import { WAKE_NOTICE_AFTER_MS } from "../useWelcome.js";
  */
 
 export const PAGE_SIZE = 50;
-
-/** True once `active` has stayed true for `ms` (shows the "waking up the server" notice). */
-export function useSlow(active, ms = WAKE_NOTICE_AFTER_MS) {
-  const [slow, setSlow] = useState(false);
-  useEffect(() => {
-    setSlow(false);
-    if (!active) return undefined;
-    const timer = setTimeout(() => setSlow(true), ms);
-    return () => clearTimeout(timer);
-  }, [active, ms]);
-  return slow;
-}
 
 /** `value`, but only after it has stopped changing for `ms` (search as you type, one request). */
 export function useDebounced(value, ms) {

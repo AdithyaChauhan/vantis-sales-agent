@@ -46,6 +46,22 @@ NOTHING_LEFT_LINE = ("The customer asked what else you need: nothing else is nee
 SAVED_INFO_LINE = ("The customer only asked for information or said no: answer and offer one next step related to "
                    "it; do not ask for these details.")
 NOTHING_MORE_LINE = "Nothing more is needed for the lead: answer and offer one next step."
+# T13a: a city the customer only asked about counts as theirs
+ASKED_CITY_LINE = "City: the one they asked about counts as theirs; never ask for it or confirm it again."
+MAX_CITY_CANDIDATES = 3
+# A question that asks for the city, or one that confirms a known city (drop_known_city_question, T13a)
+_CITY_ASK_RE = re.compile(
+    r"\b(?:which|what)\s+(?:city|town|location|area)\b|\byour\s+(?:city|town|location)\b|\blocated\b|"
+    r"\bwhere\s+(?:is|are|do|will|would)\b[^?]*\b(?:home|house|property|based|live|living|shop|office|business|"
+    r"installation)\b", re.I)
+
+
+def _confirms_city_re(city: str) -> re.Pattern:
+    """'Is the property in Lucknow?', 'your home in Lucknow', 'Lucknow, right?'"""
+    name = re.escape(city)
+    return re.compile(rf"\b(?:is|are)\s+(?:it|this|that|the\s+\w+|your\s+\w+)\s+in\s+{name}\b|"
+                      rf"\byour\s+(?:home|house|property|place|shop|office|business|building)\s+in\s+{name}\b|"
+                      rf"\b{name}\s*,?\s*(?:right|correct)\b", re.I)
 _QUESTION_RE = re.compile(r"[^.!?]*\?")
 # Short answers (T12a): a bare amount, or a bare yes or no
 _BARE_AMOUNT_RE = re.compile(r"^\s*(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?\s*(?:k|rs\.?|rupees|/-)?[\s.!]*$", re.I)
@@ -161,17 +177,50 @@ def final_question(message) -> str:
 
 
 def confirmed_city(asked_cities: list[str], previous: object, out: dict) -> str | None:
-    """A likely city the customer confirmed: the assistant's last question named it, and the reply
-    gives no other city, isn't off-topic and doesn't say no. None otherwise."""
+    """A candidate city the customer confirmed: the assistant's last question named exactly one of the candidates
+    (T13a: "yes" to "Lucknow or Kanpur?" picks nothing), and the reply gives no other city, isn't off-topic and
+    doesn't say no. None otherwise."""
     if not asked_cities or out["details"].get("city") or out.get("declines"):
         return None
     if "off_topic" in out["intents"]:
         return None
     question = final_question(previous).lower()
-    for city in reversed(asked_cities):
-        if city.lower() in question:
-            return city
-    return None
+    named = [city for city in asked_cities if city.lower() in question]
+    return named[0] if len(named) == 1 else None
+
+
+def _distinct(names: list[str], key: Callable[[str], str]) -> list[str]:
+    """The names without repeats (by `key`), in order, keeping the first spelling."""
+    seen, kept = set(), []
+    for name in names:
+        if key(name) not in seen:
+            seen.add(key(name))
+            kept.append(name)
+    return kept
+
+
+def resolve_city(
+    *, current: str | None, source: str | None, candidates: list[str], stated: str | None, asked: list[str],
+    saved: bool, key: Callable[[str], str] = str.lower,
+) -> tuple[str | None, str | None, list[str]]:
+    """The customer's city after this message (T13a): (city, city_source, candidates).
+
+    - A stated city ("I'm in Kanpur", or a candidate they confirmed) is theirs ("stated"). The same city as an asked
+      one stays "asked" (the extractor often repeats the city from the history).
+    - Before the lead is saved, a city they only asked about counts as theirs ("asked"), unless more than one city
+      is in question (this message's and the earlier asked one together): then none is guessed, and they become
+      the candidates, so the bot asks which one when the city is the next missing detail.
+    - A question never replaces a stated city, and after the save it changes nothing.
+    `key` decides when two names are the same city (the graph uses the service-area match: Gurgaon is Gurugram).
+    """
+    if stated and not (source == "asked" and current and key(stated) == key(current)):
+        return stated, "stated", []
+    if not asked or source == "stated" or saved:
+        return current, source, candidates
+    pool = _distinct(([current] if current else []) + candidates + asked, key)
+    if len(pool) == 1:
+        return pool[0], "asked", []
+    return None, None, pool[-MAX_CITY_CANDIDATES:]
 
 
 def short_answer_details(previous: object, message: str, details: dict) -> dict:
@@ -333,6 +382,41 @@ def remove_false_claims(reply: str, state: dict) -> tuple[str, bool]:
     return text, True
 
 
+def drop_known_city_question(reply: str, state: dict) -> tuple[str, list[str]]:
+    """Never ask again for a city the bot already has (T13a): with a city in the draft, a question sentence that asks
+    for the city ("Which city is your home in?") or confirms it ("Is the property in Lucknow?") is removed. If no
+    question is left and the lead isn't saved yet, the honest ask for what is still needed takes its place.
+    Returns (reply, the removed sentences); the graph puts them in a guard step, so a removal can be checked."""
+    city = state.get("lead", {}).get("city")
+    if not city or state.get("support_case"):
+        return reply, []
+    confirms = _confirms_city_re(str(city))
+    lines, removed = [], []
+    for line in reply.split("\n"):
+        kept, dropped_last = [], False
+        for piece in split_sentences(line):
+            text = without_tags(piece)
+            if not text:  # tags alone follow the sentence before them
+                if piece.strip() and not dropped_last:
+                    kept.append(piece.strip())
+                continue
+            dropped_last = text.endswith("?") and bool(_CITY_ASK_RE.search(text) or confirms.search(text))
+            if dropped_last:
+                removed.append(text)
+            elif piece.strip():
+                kept.append(piece.strip())
+        indent = re.match(r"[ \t]*", line).group(0)
+        lines.append(indent + " ".join(kept) if kept else "")
+    if not removed:
+        return reply, []
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    if "?" not in text and not state.get("lead_id") and shows_interest(state):
+        if ordered_missing(state.get("lead", {}), state.get("contact_request", False)):
+            text = f"{text} {_still_needed_ask(state)}".strip()
+    logger.warning("reply asked for a city the bot already has; removed", extra={"removed": len(removed)})
+    return text, removed
+
+
 def _wanted_item(state: dict) -> str | None:
     """The detail the reply should ask for next, if any: the support request's next need, the lead's next
     missing field once the customer showed interest, or after the save the next useful detail."""
@@ -442,12 +526,12 @@ def status_block(state: dict) -> str:
                      "do not answer earlier questions again.")
     for name, message in sorted(state.get("validation_errors", {}).items()):
         lines.append(f"Looked wrong, ask again: {name.replace('_', ' ')}: {message}")
-    cities = state.get("asked_cities", [])
-    if cities and not lead.get("city") and not state.get("support_case"):
-        if len(cities) == 1:
-            lines.append(f"City asked about, not confirmed as theirs: {cities[0]}. Confirm it inside your next "
-                         "question.")
-        else:
+    if not state.get("support_case"):
+        if lead.get("city") and state.get("city_source") == "asked":  # T13a
+            lines.append(ASKED_CITY_LINE)
+        cities = state.get("asked_cities", [])
+        missing = ordered_missing(lead, state.get("contact_request", False)) if not state.get("lead_id") else []
+        if len(cities) > 1 and not lead.get("city") and missing[:1] == ["city"]:  # only when the city is next
             lines.append("Cities asked about: " + ", ".join(cities) + ". Ask which one the property is in.")
     lines.extend(_callback_lines(state))
     return "\n".join(lines)

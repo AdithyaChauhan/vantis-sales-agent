@@ -27,9 +27,9 @@ from langgraph.prebuilt import ToolNode
 
 from app.agent import welcome
 from app.agent.leads import (
-    LeadOps, changed_fields, confirmed_city, fix_callback_claims, is_clock_time, keep_one_question, lead_summary,
-    merge_callback_time, own_details_question, pending_changes, remove_false_claims, ruled_out_details,
-    short_answer_details, status_block,
+    LeadOps, changed_fields, confirmed_city, drop_known_city_question, fix_callback_claims, is_clock_time,
+    keep_one_question, lead_summary, merge_callback_time, own_details_question, pending_changes, remove_false_claims,
+    resolve_city, ruled_out_details, short_answer_details, status_block,
 )
 from app.agent.state import AgentState
 from app.agent.tools import make_tools, service_area_data, tool_step
@@ -59,7 +59,6 @@ CONTEXT_CHUNKS = 4
 # searches. T12a: with no KB context, "is rooftop info not needed?" can't be answered with a KB quote.
 NO_SEARCH_INTENTS = {"gives_details", "contact_request", "asks_what_is_needed", "reply_to_assistant"}
 NO_SEARCH_TRIGGERS = {"gives_details", "contact_request", "asks_what_is_needed"}
-MAX_ASKED_CITIES = 3
 # T12b: every city named in the message is checked in code before the model answers (it saves one model round per
 # city turn, which Groq's 8K tokens a minute could not carry in the slow-Google drill); not for these intents alone
 MAX_CITY_CHECKS = 3
@@ -174,6 +173,13 @@ def build_graph(deps: AgentDeps):
     tool_node = ToolNode(deps.tools, messages_key="scratch")
     tool_names = [t.name for t in deps.tools]
 
+    def city_key(name: str) -> str:
+        """When two names are the same city: the service-area match (Gurgaon is Gurugram), else the name."""
+        try:
+            return (deps.areas_fn().lookup(name).matched_city or name).lower()
+        except Exception:  # the list can't be read: compare the names
+            return name.lower()
+
     def understand_node(state: AgentState) -> dict:
         message = state["messages"][-1].content
         history = state["messages"][:-1]
@@ -212,14 +218,6 @@ def build_graph(deps: AgentDeps):
             query_note = query_note or "no query from the model: the message is the query"
         out = {**out, "intents": intents_list, "search_query": search_query}
         intents = set(intents_list)
-        asked = list(state.get("asked_cities", []))
-        city = confirmed_city(asked, previous, out)
-        if city:  # the customer confirmed the city the assistant's question named
-            clean["city"] = city
-        if clean.get("city"):
-            asked = []  # a stated or confirmed city replaces the guesses
-        elif out["asked_city"] and out["asked_city"] not in asked:
-            asked = (asked + [out["asked_city"]])[-MAX_ASKED_CITIES:]
         support = dict(state.get("support", {}))
         for key in ("issue", "project_details"):
             if out[key]:
@@ -227,6 +225,20 @@ def build_graph(deps: AgentDeps):
         support_case = bool(state.get("support_case")) or "existing_customer_issue" in intents
         if "buying_interest" in intents and "existing_customer_issue" not in intents:
             support_case = False  # the customer moved on to buying: sales rules apply again
+        # T13a: a city the customer only asked about counts as theirs; two or more in question: none is guessed
+        before = state.get("lead", {})
+        asked = list(state.get("asked_cities", []))
+        stated = clean.get("city") or confirmed_city(asked, previous, out)
+        named_now = [str(n) for n in [*out.get("cities", []), out["asked_city"]] if n]
+        asks = [] if intents <= NO_CITY_CHECK_INTENTS or support_case else [
+            n for n in named_now if not stated or n.lower() != str(stated).lower()]
+        city, city_source, asked = resolve_city(
+            current=before.get("city"), source=state.get("city_source"), candidates=asked, stated=stated,
+            asked=asks, saved=bool(state.get("lead_id")), key=city_key)
+        if city and city != clean.get("city") and city != before.get("city"):
+            city = LeadData.from_raw({"city": city})[0].city  # an asked city is checked like a stated one
+            if city:
+                clean["city"] = city
         # T12b: every city named is checked in code; its step and the KB Section 10 summary (the source) go along
         named = [str(n) for n in [*out.get("cities", []), out["asked_city"], out["details"].get("city")] if n]
         checks = [] if intents <= NO_CITY_CHECK_INTENTS else check_named_cities(named, deps.areas_fn)
@@ -242,7 +254,7 @@ def build_graph(deps: AgentDeps):
                 "query_note": query_note,
                 "details": sorted(clean),
                 "invalid": sorted(errors),
-                "city_confirmed": bool(city),
+                "city_source": city_source,
                 "short_answer": sorted(short),
                 "provider": out["provider"],
                 "model": out["model"],
@@ -250,17 +262,25 @@ def build_graph(deps: AgentDeps):
                 "tokens": out["tokens"],
             },
         }
-        before = state.get("lead", {})
         lead = {**before, **clean}
+        if not city and asked:  # two or more cities in question: none is guessed (T13a)
+            lead.pop("city", None)
+        new_details = changed_fields(before, lead)
+        # T13a: a monthly bill given this turn brings KB Section 9 (which reference package fits which need), so a
+        # package suggestion has its source even on a turn without a KB search (in C7 and C7b the number guard had
+        # to remove "…fits nicely with our 3 kW residential reference package")
+        bill_now = "monthly_bill_inr" in new_details and not support_case
+        guidance = deps.hints_fn().guidance if bill_now else []
         return {
             "intents": out["intents"],
             "search_query": out["search_query"],
             "lead": lead,
-            "new_details": changed_fields(before, lead),
+            "new_details": new_details,
             "declines": bool(out["declines"]),
             "ruled_out": sorted(set(state.get("ruled_out", [])) | set(ruled_out_details(str(message)))),
             "validation_errors": errors,
             "asked_cities": asked,
+            "city_source": city_source,
             # "4pm" then "day after tomorrow" -> "day after tomorrow, 4pm" (T12a)
             "callback_time": callback_time,
             "support": support,
@@ -268,7 +288,7 @@ def build_graph(deps: AgentDeps):
             "contact_request": "contact_request" in intents,
             "degraded": degraded,
             "area_checks": checks,
-            "chunks": [summary] if summary else [],
+            "chunks": ([summary] if summary else []) + guidance,
             "steps": state["steps"] + [step] + area_steps,
         }
 
@@ -409,10 +429,10 @@ def build_graph(deps: AgentDeps):
                            + [str(m.content) for m in scratch if isinstance(m, ToolMessage)]
                            + [str(m.content) for m in state["messages"]]  # the customer's and earlier replies
                            + list(state.get("validation_errors", {}).values()))
-                reply, numbers = remove_unsupported_numbers(reply, allowed, welcome.NUMBERS_CONFIRM_TEXT)
-                if numbers:
+                reply, numbers, cut = remove_unsupported_numbers(reply, allowed, welcome.NUMBERS_CONFIRM_TEXT)
+                if numbers:  # the removed sentences go into the step (not the log), so each one can be checked
                     steps.append({"node": "guard", "detail": f"removed {len(numbers)} number(s) no source gave",
-                                  "data": {"removed": len(numbers)}})
+                                  "data": {"removed": cut, "numbers": numbers}})
                 reply, fixed = remove_false_claims(reply, state) if deps.ops is not None else (reply, False)
                 if fixed:
                     steps.append({"node": "guard", "detail": "removed a claim that details were saved (no lead "
@@ -429,6 +449,10 @@ def build_graph(deps: AgentDeps):
                 if plain:
                     steps.append({"node": "guard", "detail": "'reference locations' became 'service areas'",
                                   "data": {}})
+                reply, city_asks = drop_known_city_question(reply, state)
+                if city_asks:  # the removed sentences are kept in the step, so each removal can be checked (T13a)
+                    steps.append({"node": "guard", "detail": "removed a question about a city it already has",
+                                  "data": {"removed": city_asks}})
                 reply, trimmed = keep_one_question(reply, state)
                 if trimmed:
                     steps.append({"node": "guard", "detail": "kept one question", "data": {}})

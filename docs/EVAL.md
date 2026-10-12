@@ -600,3 +600,56 @@ Both cases are unit tests. The test branch must be seeded again after the next b
 
 - The forced Gemini hangs in the drill never left the machine, so they are not counted.
 - Embedding calls are counted apart: 4 batched calls in the eval (40 questions, 32 rewritten queries) and about 20 query embeddings in the chat runs.
+
+## T13a: city memory (live, `live_scenarios --group edge --only …`, `serve_test_branch --port 8001`)
+
+Written by hand on 2026-10-13. The live check of "Do you install in Lucknow?" on Render gave a good reply, but the understand step saved no details.
+
+### Before the fix (C7 on the T12b code)
+
+| Turn | Customer | Reply (short) | City |
+|---|---|---|---|
+| 1 | Do you install in Lucknow? | "Vantis currently covers Lucknow [KB 10]. Would you like the Vantis sales team to check if we can install at your property in Lucknow?" | **none** (FAIL: the asked city was not the customer's city yet) |
+| 2 | My bill is about 4000 a month, it's for my home. | asks for name and phone | Lucknow |
+| 3 | I'm Arjun, 9876543210 | saved, offers a callback | Lucknow |
+
+- The chat passed only because the turn-1 question happened to name the city, so the old `confirmed_city` rule picked it up in turn 2.
+- A reply that didn't name the city would have left the city missing, and the bot would have asked for it again before saving.
+- That awkward turn-1 question came from the old instruction to "confirm it inside your next question".
+
+### After the fix (T13a code)
+
+| Scenario | Turn | Customer | Reply (short) | Time | Result |
+|---|---|---|---|---|---|
+| C7 | 1 | Do you install in Lucknow? | "Vantis currently covers Lucknow [KB 10]"; asks the bill | 7.1 s | pass (city Lucknow from turn 1) |
+| | 2 | My bill is about 4000 a month, it's for my home. | asks name and phone | 3.7 s | pass |
+| | 3 | I'm Arjun, 9876543210 | saved; offers a callback | 4.7 s | pass (lead: Lucknow, listed) |
+| C7b | 1 | Do you install in Raipur? | "Vantis can't confirm service there yet… the team can check it…" [KB 10]; asks the bill | 3.7 s | pass (city Raipur) |
+| | 2 | My bill is about 4000 a month, it's for my home. | asks name and phone | 3.4 s | pass |
+| | 3 | I'm Arjun, 9876543210 | saved; offers a callback | 4.8 s | pass (lead: Raipur, **unverified**, WARM) |
+| C3a | 1-4 | Dehli + 4k → 329939 → rahul@gmail → 9876500001 | Delhi covered; phone and email asked again; saved | 3.9-5.1 s | 4 of 4 pass (city Delhi) |
+| C3b | 1 | Do you install in Gurgaon? | "Vantis currently covers Gurgaon [KB 10]"; asks the bill | 4.6 s | pass |
+| C6 | 1-2 | cricket → "Okay. Do you install in Kanpur?" | redirect, then "Kanpur is within our service area…" [KB 10]; asks name and phone | 5.2 / 2.7 s | 2 of 2 pass |
+
+- **The city guard** (`drop_known_city_question`) removed nothing in any of these runs; the server log has no "city it already has" warning. Its removals are covered by unit tests only.
+- **The number guard (T12b) fired in turn 2 of both C7 and C7b**, removing one sentence each. The step keeps only the count, so the removed text is not known (see "Problems seen" in the T13a report).
+- **Not re-run, by decision:** C4 (the slow-Google drill; the task doesn't touch the fallback models), C5 (its city is in a support request's project details) and the held-out group.
+- **LLM calls:** 45 requests (8 before the fix, 37 after; one Gemini understand call failed and Groq answered), against a budget of about 50.
+
+### T13a fix round: what the number guard removed, and the package guidance
+
+The number guard now records each sentence it removes in the reply's steps (`data.removed`, with the numbers in `data.numbers`); the server log keeps only the count. C7 and C7b again (18 requests), turn 2 each:
+- C7: "That monthly bill fits nicely with our 3 kW residential reference package."
+- C7b: "A monthly bill around 4000 INR for a home typically aligns with our 3 kW residential solar package, which includes site assessment, system design, permits, installation, and grid connection."
+
+**Which case:**
+- Both were package suggestions (HomeStart 3 as 3 kW), not made-up units, savings or costs.
+- The cause: the bill turn had no KB text, so "3 kW" had no source.
+- The C7b sentence also invented what the package includes ("permits", "grid connection"). That part has no number, so no guard sees it.
+
+**Fix:** on a turn whose new details include the monthly bill, the KB Section 9 rows (which reference package fits which need, with each "Do not assume" caution) join the context. They are read from the KB with the other hints, like T12b's catalog summary for a kW size.
+
+**C7 again** (7 requests), turn 2: "For a moderate residential requirement, a helpful reference option is the HomeStart 3 package, though the final system size is set after a site assessment [KB Section 9: Reference Package Guidance]."
+- The sentence and its tag stay, and no guard fired.
+- In this run the model also gave turn 2 a search query, so the KB search ran too (9 chunks: 5 guidance rows plus 4 searched). The no-search path is covered by a test with fakes.
+- 25 requests in this round.

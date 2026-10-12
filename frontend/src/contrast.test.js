@@ -108,6 +108,7 @@ function pairs(t, theme) {
     ["Contact icons on card", t.accent, t.card, ICON],
     ["Unlock key icon on its circle", t.accent, t["sun-avatar-bg"], ICON],
     ["Text on a phone card (dashboard)", t.text, t.card, TEXT],
+    ["Waking note text on its card (T13a)", t.text, t.card, TEXT],
   ];
 }
 

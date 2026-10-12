@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import ChatPage from "./ChatPage.jsx";
+import { STILL_WORKING } from "./useChat.js";
 import { chatPayloads, chatReply, fakeApi, jsonResponse, SESSION, WELCOME } from "./test-utils.js";
 
 const FAKE_TIMERS = { toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] };
@@ -38,17 +39,15 @@ describe("welcome", () => {
     expect(screen.queryByRole("button", { name: WELCOME.starter_questions[1] })).toBeNull();
   });
 
-  it("says the server is waking up when the welcome takes more than 3 seconds", async () => {
+  it("a slow welcome shows only the loading skeleton (T13a: the note comes from the ping)", async () => {
     vi.useFakeTimers(FAKE_TIMERS);
     let answer;
     fakeApi({ welcome: () => new Promise((resolve) => (answer = resolve)) });
     render(<ChatPage />);
-    await settle(2900);
+    await settle(5000);
     expect(screen.queryByText(/Waking up the server/)).toBeNull();
-    await settle(100);
-    expect(screen.getByText("Waking up the server. This can take up to a minute.")).toBeTruthy();
+    expect(screen.getByText("Loading")).toBeTruthy();
     await act(async () => answer(jsonResponse(200, WELCOME)));
-    expect(screen.queryByText(/Waking up the server/)).toBeNull();
     expect(screen.getByText(WELCOME.text)).toBeTruthy();
     expect(screen.getByRole("button", { name: WELCOME.starter_questions[0] })).toBeTruthy();
   });
@@ -114,7 +113,7 @@ describe("sending", () => {
     expect(chatPayloads(fetchMock)).toHaveLength(1);
   });
 
-  it("allows one message at a time and explains a slow first answer", async () => {
+  it("allows one message at a time and says it is still working after 8 s, in neutral words", async () => {
     vi.useFakeTimers(FAKE_TIMERS);
     let answer;
     const fetchMock = fakeApi({ chat: () => new Promise((resolve) => (answer = resolve)) });
@@ -126,9 +125,10 @@ describe("sending", () => {
     expect(box().readOnly).toBe(true);
     fireEvent.keyDown(box(), { key: "Enter" });
     expect(chatPayloads(fetchMock)).toHaveLength(1);
-    expect(screen.queryByText(/about 20 seconds/)).toBeNull();
+    expect(screen.queryByText(STILL_WORKING)).toBeNull();
     await settle(8000);
-    expect(screen.getByText(/The first answer after the server wakes up can take about 20 seconds/)).toBeTruthy();
+    expect(screen.getByText("Still working on it. This can take up to a minute.")).toBeTruthy();
+    expect(screen.queryByText(/waking/i)).toBeNull(); // a slow reply never says the server is waking up
     await act(async () => answer(jsonResponse(200, chatReply("Here you go."))));
     expect(screen.getByText("Here you go.")).toBeTruthy();
     expect(box().readOnly).toBe(false);

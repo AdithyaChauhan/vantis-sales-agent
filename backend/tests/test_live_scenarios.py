@@ -97,3 +97,18 @@ def test_the_number_check_allows_step_details_and_the_phone_message():
     assert ok(live.no_invented_numbers(), response("I have saved your support request with ID 1.", steps=[support]))
     phone = "That doesn't look like a 10-digit Indian mobile number (it should start with 6, 7, 8 or 9)."
     assert ok(live.no_invented_numbers(), response(f"{phone} Could you share it again?"))
+
+
+def test_guards_fired_quotes_what_the_city_guard_removed():
+    steps = [{"node": "guard", "detail": "removed a question about a city it already has",
+              "data": {"removed": ["Is the property in Lucknow?"]}},
+             {"node": "guard", "detail": "kept one question", "data": {}}]
+    assert live.guards_fired({"steps": steps}) == [
+        'removed a question about a city it already has: "Is the property in Lucknow?"', "kept one question"]
+
+
+def test_no_city_question_check():
+    _, fn = live.no_city_question("Lucknow")
+    assert fn(response("Thanks. What is your monthly bill?"), None)
+    assert not fn(response("Thanks. Is the property in Lucknow?"), None)
+    assert not fn(response("Which city is your home in?"), None)

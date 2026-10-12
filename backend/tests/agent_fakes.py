@@ -19,7 +19,16 @@ AREAS_SUMMARY = {
     "chunk_id": "s10-table-summary", "section_no": 10, "section_title": "Locations", "page": 3,
     "chunk_type": "table_summary", "content": "All rows (Region; Reference Locations):\n- Uttar Pradesh; Lucknow, Kanpur",
 }
-HINTS = KbHints("KB Section 8: Catalog\nKB Section 10: Locations", {8: CATALOG_SUMMARY, 10: AREAS_SUMMARY})
+# KB Section 9 rows (T13a: in the context on a turn that gives the monthly bill)
+GUIDANCE = [
+    {"chunk_id": "s09-moderate", "section_no": 9, "section_title": "Guidance", "page": 3, "chunk_type": "table_row",
+     "content": "Customer Signal: Moderate residential requirement\nPotential Reference Offering: Plan A\n"
+                "Do Not Assume: Do not assume 3 kW is suitable without consumption/site information."},
+    {"chunk_id": "s09-higher", "section_no": 9, "section_title": "Guidance", "page": 3, "chunk_type": "table_row",
+     "content": "Customer Signal: Higher residential requirement\nPotential Reference Offering: Plan B\n"
+                "Do Not Assume: Do not assume 5 kW is sufficient for every household."},
+]
+HINTS = KbHints("KB Section 8: Catalog\nKB Section 10: Locations", {8: CATALOG_SUMMARY, 10: AREAS_SUMMARY}, GUIDANCE)
 
 
 TOP_LEVEL = ("asked_city", "cities", "callback_time", "issue", "project_details", "declines")

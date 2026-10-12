@@ -14,11 +14,14 @@ What counts as a number:
 Number words without a unit ("one question", "a few details") do not count. KB tags, "KB Section 10" and list
 markers ("1.") are ignored.
 """
+import logging
 import re
 from dataclasses import dataclass, field
 
 from app.leads.validators import AMOUNT_MULTIPLIERS
 from app.rag.answer import split_sentences, without_tags
+
+logger = logging.getLogger(__name__)
 
 _WORD_VALUES = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
@@ -175,15 +178,20 @@ def unsupported(text: str, known: Known) -> list[Mention]:
     return [m for m in number_mentions(text) if not is_supported(m, known)]
 
 
-def remove_unsupported_numbers(reply: str, allowed_texts: list[str], confirm_line: str) -> tuple[str, list[str]]:
-    """Remove every sentence that states a number the allowed texts don't give. Returns (reply, removed numbers).
+def remove_unsupported_numbers(
+    reply: str, allowed_texts: list[str], confirm_line: str
+) -> tuple[str, list[str], list[str]]:
+    """Remove every sentence that states a number the allowed texts don't give.
+    Returns (reply, the removed numbers, the removed sentences without their KB tags).
 
     If a removed number was a duration, an amount or a percentage, `confirm_line` (the team confirms these after
     an assessment) takes the first removed sentence's place, unless the reply already says the team confirms
-    something. A count such as "8 steps" is removed without it.
+    something. A count such as "8 steps" is removed without it. The graph puts the removed sentences in the reply's
+    steps (T13a), so each removal can be checked; the server log gets only their count.
     """
     known = known_numbers(allowed_texts)
     removed: list[Mention] = []
+    sentences: list[str] = []
     marker_at = None  # (line index, piece index) of the first removed sentence
     lines = []
     for line in reply.split("\n"):
@@ -200,6 +208,7 @@ def remove_unsupported_numbers(reply: str, allowed_texts: list[str], confirm_lin
             dropped_last = bool(bad)
             if bad:
                 removed += bad
+                sentences.append(bare)
                 if marker_at is None:
                     marker_at = (len(lines), len(kept))
                 continue
@@ -207,7 +216,7 @@ def remove_unsupported_numbers(reply: str, allowed_texts: list[str], confirm_lin
                 kept.append(piece.strip())
         lines.append((prefix, kept, bool(body.strip())))
     if not removed:
-        return reply, []
+        return reply, [], []
     text_lines = []
     for index, (prefix, kept, had_text) in enumerate(lines):
         if marker_at and marker_at[0] == index:
@@ -221,4 +230,6 @@ def remove_unsupported_numbers(reply: str, allowed_texts: list[str], confirm_lin
     text = text.replace("\0", confirm_line if needs_line else "")
     text = re.sub(r"[ \t]+\n", "\n", re.sub(r"(?<=\S) {2,}", " ", text))
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text, [m.text for m in removed]
+    # The count only: a removed sentence is reply text, which never goes into the server log
+    logger.warning("reply stated a number no source gave; sentences removed", extra={"removed": len(sentences)})
+    return text, [m.text for m in removed], sentences

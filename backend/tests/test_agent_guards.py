@@ -236,3 +236,54 @@ def test_a_model_failure_after_only_a_lookup_is_still_try_again():
     agent = Scripted(tool_call("check_service_area", {"city": "Pune"}), RuntimeError("down"))
     graph, _ = make_graph(Scripted(understood(["question"], "areas")), agent)
     assert run(graph, "Do you install there?")["reply"] == LLM_DOWN_REPLY
+
+
+def test_the_number_guard_step_quotes_each_removed_sentence():
+    agent = Scripted(answer("Timing varies with the site [KB Section 15: FAQ]. Most installs take a few weeks."))
+    search = FakeSearch(SearchResult(chunks=[TIMING], mode="hybrid"))
+    graph, _ = make_graph(Scripted(understood(["question"], "installation timing")), agent, search=search)
+    state = run(graph, "How long does installation take?")
+    [step] = [s for s in state["steps"] if s["node"] == "guard" and "number" in s["detail"]]
+    assert step["data"] == {"removed": ["Most installs take a few weeks."], "numbers": ["a few weeks"]}
+
+
+# ---------- T13a: the package guidance (KB Section 9) on a turn that gives the monthly bill ----------
+
+def test_a_bill_brings_the_package_guidance_so_the_suggestion_keeps_its_number_and_tag():
+    # C7 and C7b turn 2: "That monthly bill fits nicely with our 3 kW residential reference package." was removed
+    # by the number guard, because a details-only turn has no KB search and so no source for "3 kW"
+    reply = ("Plan A could be a starting point for that bill, though 3 kW is not assumed without a site check "
+             "[KB Section 9: Guidance]. Could you share your name and phone number?")
+    agent = Scripted(answer(reply))
+    search = FakeSearch()
+    graph, _ = make_graph(Scripted(understood(["gives_details"], None, monthly_bill_inr="4000")), agent, search=search)
+    state = run(graph, "My bill is about 4000 a month")
+    assert search.queries == []  # still no KB search on a details-only turn
+    assert "Moderate residential requirement" in agent.calls[0][-1].content
+    assert [c["chunk_id"] for c in state["chunks"]] == ["s09-moderate", "s09-higher"]
+    assert state["reply"] == reply  # the number and the KB tag both stay
+    assert not [s for s in state["steps"] if s["node"] == "guard"]
+    assert [s["section"] for s in state["sources"]] == ["9"]
+
+
+def test_no_bill_this_turn_no_guidance():
+    agent = Scripted(answer("Thanks."))
+    graph, _ = make_graph(Scripted(understood(["gives_details"], None, name="Arjun")), agent)
+    assert run(graph, "I am Arjun")["chunks"] == []
+    assert "Moderate residential requirement" not in agent.calls[0][-1].content
+
+
+def test_a_bill_already_known_does_not_bring_it_again():
+    understand = Scripted(understood(["gives_details"], None, monthly_bill_inr="4000"),
+                          understood(["gives_details"], None, monthly_bill_inr="4000", name="Arjun"))
+    graph, _ = make_graph(understand, Scripted(answer("Thanks.")))
+    run(graph, "My bill is about 4000 a month")
+    assert run(graph, "Arjun, and yes, 4000")["chunks"] == []
+
+
+def test_a_bill_on_a_turn_with_a_search_adds_the_guidance_first():
+    search = FakeSearch(SearchResult(chunks=[PRICING], mode="hybrid"))
+    graph, _ = make_graph(Scripted(understood(["question", "gives_details"], "Pricing", monthly_bill_inr="4000")),
+                          Scripted(answer("It depends.")), search=search)
+    state = run(graph, "My bill is 4000, how much would it cost?")
+    assert [c["chunk_id"] for c in state["chunks"]] == ["s09-moderate", "s09-higher", "s05-pricing"]

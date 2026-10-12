@@ -13,7 +13,7 @@ import {
   salesCalls,
   supportItem,
 } from "../test-utils.js";
-import { WAKE_NOTICE } from "../useWelcome.js";
+import { WAKE_NOTE } from "../useServerWake.js";
 import { KEY_STOPPED } from "./Dashboard.jsx";
 import { NO_LEADS, NO_MATCH } from "./LeadsView.jsx";
 import { NO_SUPPORT } from "./SupportView.jsx";
@@ -356,19 +356,33 @@ describe("support requests", () => {
 });
 
 describe("states", () => {
-  it("says the server is waking up after 3 s, then shows the leads", async () => {
+  it("says the server is waking up while the page-load ping waits, then shows the leads (T13a)", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let wake;
     let answer;
-    fakeApi({ leads: () => new Promise((resolve) => (answer = resolve)) });
+    fakeApi({
+      health: () => new Promise((resolve) => (wake = resolve)),
+      leads: () => new Promise((resolve) => (answer = resolve)),
+    });
     openAt("/leads");
-    await act(() => vi.advanceTimersByTimeAsync(2900));
-    expect(screen.queryByText(WAKE_NOTICE)).toBeNull();
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    expect(screen.getByText(WAKE_NOTICE)).toBeTruthy();
+    await act(() => vi.advanceTimersByTimeAsync(1400));
+    expect(screen.queryByText(WAKE_NOTE)).toBeNull();
+    await act(() => vi.advanceTimersByTimeAsync(100));
+    expect(screen.getByText(WAKE_NOTE)).toBeTruthy();
+    await act(async () => wake(jsonResponse(200, { status: "ok" })));
+    expect(screen.queryByText(WAKE_NOTE)).toBeNull();
     await act(async () => answer(jsonResponse(200, leadList([leadItem()]))));
     await act(() => vi.advanceTimersByTimeAsync(0));
     expect(screen.getByRole("table", { name: "Leads" })).toBeTruthy();
-    expect(screen.queryByText(WAKE_NOTICE)).toBeNull();
+  });
+
+  it("a slow leads request after the server answered shows no waking note (T13a)", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    fakeApi({ leads: () => new Promise(() => {}) });
+    openAt("/leads");
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    expect(screen.queryByText(WAKE_NOTE)).toBeNull();
+    expect(screen.getByText("Loading leads")).toBeTruthy();
   });
 
   it("empty: says how leads get here; a search with no match says so instead", async () => {

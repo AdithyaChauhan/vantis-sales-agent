@@ -4,8 +4,6 @@ import { KeyRound, LockOpen } from "lucide-react";
 import { getLeads } from "../api.js";
 import { formatWait } from "../components/Composer.jsx";
 import { Link } from "../router.jsx";
-import { WAKE_NOTICE } from "../useWelcome.js";
-import { useSlow } from "./useSalesData.js";
 
 /** What to say when the key check fails, from the API's answer. */
 export function unlockMessage(error) {
@@ -28,7 +26,6 @@ export default function UnlockCard({ note, onUnlock }) {
   const [value, setValue] = useState("");
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState(null);
-  const slow = useSlow(checking);
   const ids = { title: useId(), input: useId(), error: useId() };
 
   async function submit(event) {
@@ -89,11 +86,6 @@ export default function UnlockCard({ note, onUnlock }) {
       {error ? (
         <p id={ids.error} className="unlock-error" role="alert">
           {error}
-        </p>
-      ) : null}
-      {slow ? (
-        <p className="wake" role="status">
-          {WAKE_NOTICE}
         </p>
       ) : null}
       <Link to="/" className="unlock-back">

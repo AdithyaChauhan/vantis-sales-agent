@@ -1,10 +1,8 @@
 import { ArrowLeft, Circle, CircleCheck, ListTodo, Mail, Phone, TriangleAlert } from "lucide-react";
 
 import { checklist, DETAILS, StatusBadge } from "../components/LeadCard.jsx";
-import { WAKE_NOTICE } from "../useWelcome.js";
 import { detailValues, formatPhone, knownFields, otherDetails, placeAndType, timeAgo } from "./format.js";
 import { DemoTag } from "./LeadTable.jsx";
-import { useSlow } from "./useSalesData.js";
 
 /**
  * The selected lead (GET /api/leads/{id}): who it is, the API's score and status, the full next action,
@@ -196,7 +194,6 @@ function Body({ lead }) {
  * overlay: the phone version (full screen, with Back).
  */
 export default function LeadDetail({ detail, overlay = false, onBack }) {
-  const slow = useSlow(detail.status === "loading" && !detail.lead);
   let content;
   if (detail.lead) {
     content = <Body lead={detail.lead} />;
@@ -208,13 +205,7 @@ export default function LeadDetail({ detail, overlay = false, onBack }) {
           <span />
           <span />
         </div>
-        {slow ? (
-          <p className="wake" role="status">
-            {WAKE_NOTICE}
-          </p>
-        ) : (
-          <p className="visually-hidden">Loading the lead</p>
-        )}
+        <p className="visually-hidden">Loading the lead</p>
       </div>
     );
   } else if (detail.status === "error") {

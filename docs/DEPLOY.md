@@ -1,6 +1,6 @@
 # DEPLOY.md: backend on Render (free plan)
 
-How to put the backend API on Render, check it works, and what the free plan means for the demo. The frontend (Vercel) comes in T13.
+How to put the backend API on Render, check it works, and what the free plan means for the demo. The frontend goes on Vercel in T13b: see "T13b steps" at the end.
 
 What gets deployed: `render.yaml` (repo root) describes one free web service, built from `Dockerfile` in the Singapore region, next to the Neon database. Render rebuilds and redeploys on every push to `main` that touches the image (see "Build minutes").
 
@@ -172,9 +172,59 @@ For trying the page on your laptop. Leads, callbacks and support requests go to 
 
 Use `127.0.0.1`, not `localhost`, for the API. uvicorn listens on IPv4 only, and `localhost` can resolve to IPv6 `::1` first; on this laptop a Docker/WSL relay listens on port 8000 there and answers 404. The plain `uvicorn app.main:app --port 8000` writes chat leads to **main**: use it only when that is what you want.
 
-## Frontend on Vercel (T13)
+## T13b steps: the frontend on Vercel
 
-- Set `VITE_API_URL` to the Render URL. A trailing slash is fine (the page removes it). Vite reads it at build time, so a change needs a redeploy.
-- Add the Vercel URL to `CORS_ORIGINS` on Render (and in `render.yaml`), or the browser blocks every call.
-- Deep links (T11): the page routes `/leads`, `/leads/<id>` and `/support` in the browser, so Vercel must serve `index.html` for every path. Add `frontend/vercel.json` with `{"rewrites": [{"source": "/(.*)", "destination": "/index.html"}]}`; without it a reload or a shared link to `/leads/12` returns 404. Check: open `<vercel-url>/leads/1` directly.
-- The first visit after Render's service sleeps waits about 30 seconds. The page shows "Waking up the server" after 3 seconds, and the first chat answer can take about 20 seconds.
+Do these in order. **No secret goes into Vercel.** Vite copies every `VITE_` variable into the public JavaScript, and the sales key is never one of them: staff type it into the dashboard page, which keeps it in that browser tab only.
+
+### 1. The Vercel project
+
+1. On <https://vercel.com>, click **Add New… → Project**. Import the GitHub repo `vantis-sales-agent`; when GitHub asks, give Vercel access to this repo only.
+2. On the import screen, set:
+
+   | Setting | Value |
+   |---|---|
+   | Root Directory | `frontend` (click **Edit** and pick the folder) |
+   | Framework Preset | **Vite** (detected from `frontend/package.json`) |
+   | Build Command | `npm run build` (the default) |
+   | Output Directory | `dist` (the default for Vite) |
+   | Install Command | the default (`npm install`; `package-lock.json` pins every version) |
+   | Environment Variable | `VITE_API_URL` = the Render URL from the service's page, for example `https://vantis-sales-agent-api.onrender.com` (no path; a trailing slash is fine). Environment: **Production** |
+
+3. Click **Deploy**. Write down the production URL (the project's **Domains**), for example `https://vantis-sales-agent.vercel.app`.
+
+Notes:
+- `VITE_API_URL` is read when Vercel **builds** the page. Vercel's docs: changes to environment variables "only apply to new deployments", so after changing it, redeploy.
+- `frontend/vercel.json` (T13a) sends every page path to `/index.html`, so `/leads`, `/leads/<id>` and `/support` survive a refresh or a shared link. Vercel serves real files such as `/assets/…` first.
+
+### 2. Render: allow the Vercel site (CORS)
+
+`CORS_ORIGINS` must be **the Vercel production URL only**, written exactly as the browser sends it in the `Origin` header:
+
+```
+https://vantis-sales-agent.vercel.app
+```
+
+- **Format:** scheme and host only, with no trailing slash, no path and no `*`. The backend splits the value on commas and compares each origin exactly (`app/core/config.py`, `cors_origin_list`).
+- **Not included:** Vercel's preview URLs (one per branch or commit, ending in `.vercel.app`) stay blocked on purpose. `http://localhost:5173` is not included either: local checks run `serve_test_branch` on the laptop, which reads `backend/.env`.
+- **Change it in `render.yaml`, not only in the Dashboard.** It is a plain `value` in the Blueprint, and Render's Blueprint docs say a sync "can create new environment variables or modify the values of existing ones", so a Dashboard-only edit could be overwritten on the next sync.
+
+The steps:
+1. `render.yaml`: set the `CORS_ORIGINS` value to the URL above.
+2. `backend/tests/test_deploy_config.py`: add `"CORS_ORIGINS"` to `PROD_DIFFERS` with the reason ("the Vercel production URL; local runs use http://localhost:5173"). That test compares `render.yaml` with `backend/.env.example`.
+3. Run the backend tests, commit (`/handoff`) and push.
+4. Auto Sync is on by default: Render applies the Blueprint change on the push and redeploys. Check the service's **Environment** page shows the new value. If the Blueprint's Auto Sync is off, click **Manual Sync** on the Blueprint's page.
+
+### 3. Checks after both deploys
+
+- Open `<vercel-url>/leads/1` directly, and refresh `<vercel-url>/support`. Both pages load (no Vercel 404).
+- Send one chat message. DevTools (F12) → **Console** shows no CORS error, and **Network** shows `/api/chat` with status 200.
+- After Render's service has slept (15 idle minutes), open the page.
+  - The note "Waking up the server. The first reply can take up to a minute." shows at the top within about 2 seconds, and goes away when the server answers (30-40 s).
+  - A warm visit shows no note. A slow chat reply only says "Still working on it. This can take up to a minute." after 8 seconds.
+- The dashboard asks for the sales key; nothing in Vercel's settings holds it.
+
+Docs used:
+- Vercel: [Vite on Vercel](https://vercel.com/docs/frameworks/frontend/vite) (SPA rewrites), [Configuring a build](https://vercel.com/docs/builds/configure-a-build) (Root Directory, build and output settings), [Environment variables](https://vercel.com/docs/environment-variables).
+- Render: [Blueprint YAML reference](https://render.com/docs/blueprint-spec), [Blueprints (Infrastructure as Code)](https://render.com/docs/infrastructure-as-code) (Auto Sync, Manual Sync), [Environment variables](https://render.com/docs/configure-environment-variables).
+
+All checked on 2026-10-13.

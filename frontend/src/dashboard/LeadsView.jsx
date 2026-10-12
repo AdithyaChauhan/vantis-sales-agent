@@ -2,11 +2,10 @@ import { useState } from "react";
 
 import { StatusBadge } from "../components/LeadCard.jsx";
 import { navigate } from "../router.jsx";
-import { WAKE_NOTICE } from "../useWelcome.js";
 import { useWideScreen } from "../useWideScreen.js";
 import LeadDetail from "./LeadDetail.jsx";
 import { LeadList, LeadTable } from "./LeadTable.jsx";
-import { useDebounced, useLeadDetail, useLeadList, useSlow } from "./useSalesData.js";
+import { useDebounced, useLeadDetail, useLeadList } from "./useSalesData.js";
 
 const STATUSES = ["HOT", "WARM", "COLD"];
 export const NO_LEADS = "No leads yet. They appear here when customers share their details in the chat.";
@@ -50,8 +49,8 @@ function StatusChips({ value, onChange }) {
   );
 }
 
-/** Skeleton rows while the first page loads, with the waking-up notice after 3 s. */
-function Loading({ slow }) {
+/** Skeleton rows while the first page loads (T13a: the waking note comes from the page-load ping). */
+function Loading() {
   return (
     <div className="dash-state" aria-busy="true">
       <div className="skeleton skeleton-rows" aria-hidden="true">
@@ -60,13 +59,7 @@ function Loading({ slow }) {
         <span />
         <span />
       </div>
-      {slow ? (
-        <p className="wake" role="status">
-          {WAKE_NOTICE}
-        </p>
-      ) : (
-        <p className="visually-hidden">Loading leads</p>
-      )}
+      <p className="visually-hidden">Loading leads</p>
     </div>
   );
 }
@@ -89,7 +82,6 @@ export default function LeadsView({ apiKey, leadId, search, refreshTick, onUnaut
   const q = useDebounced(search.trim(), 300);
   const list = useLeadList(apiKey, { status, q, sort }, refreshTick, onUnauthorized);
   const firstLoad = list.status === "loading" && !list.body;
-  const slow = useSlow(firstLoad);
   const selectedId = leadId ?? (wide ? (list.items[0]?.id ?? null) : null);
   const detail = useLeadDetail(apiKey, selectedId, refreshTick, onUnauthorized);
 
@@ -105,7 +97,7 @@ export default function LeadsView({ apiKey, leadId, search, refreshTick, onUnaut
 
   let body;
   if (firstLoad) {
-    body = <Loading slow={slow} />;
+    body = <Loading />;
   } else if (list.status === "error") {
     body = (
       <div className="dash-state">

@@ -18,7 +18,7 @@ from sqlalchemy import Engine, text
 from app.core.llm import LLMError, provider_of, tokens_of
 from app.core.prompts import load_prompt
 from app.leads.schemas import LeadData
-from app.rag.chunker import CATALOG_SECTION
+from app.rag.chunker import CATALOG_SECTION, PACKAGE_GUIDANCE_SECTION
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +94,11 @@ class Understanding(BaseModel):
 
 @dataclass
 class KbHints:
-    """KB section titles and the table summary chunks, read from kb_chunks."""
+    """KB section titles, the table summary chunks and (T13a) the package-guidance rows, read from kb_chunks."""
 
     titles: str = ""
     summaries: dict[int, dict] = field(default_factory=dict)  # section_no -> chunk dict
+    guidance: list[dict] = field(default_factory=list)  # KB Section 9 rows: which reference package fits which need
 
     @property
     def catalog(self) -> str:
@@ -114,11 +115,16 @@ _SUMMARIES_SQL = text(
     "SELECT chunk_id, section_no, section_title, page, chunk_type, content FROM kb_chunks "
     "WHERE chunk_type = 'table_summary' ORDER BY section_no"
 )
+_GUIDANCE_SQL = text(
+    "SELECT chunk_id, section_no, section_title, page, chunk_type, content FROM kb_chunks "
+    "WHERE section_no = :section AND chunk_type = 'table_row' ORDER BY chunk_id"
+)
 _hints_cache: dict[int, KbHints] = {}
 
 
 def load_kb_hints(engine: Engine | None) -> KbHints:
-    """Titles and summaries from the DB, cached per process once read. Empty (not cached) if the DB fails."""
+    """Titles, summaries and the package guidance from the DB, cached per process once read. Empty (not cached) if
+    the DB fails."""
     if engine is None:
         return KbHints()
     key = id(engine)
@@ -128,10 +134,11 @@ def load_kb_hints(engine: Engine | None) -> KbHints:
         with engine.connect() as conn:
             titles = [f"KB Section {r.section_no}: {r.section_title}" for r in conn.execute(_TITLES_SQL)]
             summaries = {r.section_no: dict(r._mapping) for r in conn.execute(_SUMMARIES_SQL)}
+            guidance = [dict(r._mapping) for r in conn.execute(_GUIDANCE_SQL, {"section": PACKAGE_GUIDANCE_SECTION})]
     except Exception as exc:
         logger.warning("kb hints unavailable: %s", type(exc).__name__)
         return KbHints()
-    hints = KbHints("\n".join(titles), summaries)
+    hints = KbHints("\n".join(titles), summaries, guidance)
     _hints_cache[key] = hints
     return hints
 

@@ -8,8 +8,8 @@ import Message, { AssistantAvatar } from "./components/Message.jsx";
 import ReplyText from "./components/ReplyText.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import { loadSalesView, saveSalesView } from "./storage.js";
-import { useChat } from "./useChat.js";
-import { useWelcome, WAKE_NOTICE } from "./useWelcome.js";
+import { STILL_WORKING, useChat } from "./useChat.js";
+import { useWelcome } from "./useWelcome.js";
 import { useWideScreen } from "./useWideScreen.js";
 
 const TYPING = "Assistant is typing";
@@ -46,13 +46,7 @@ function Welcome({ welcome, showStarters, startersDisabled, onStarter }) {
             <span />
             <span />
           </div>
-          {welcome.slow ? (
-            <p className="wake" role="status">
-              {WAKE_NOTICE}
-            </p>
-          ) : (
-            <p className="visually-hidden">Loading</p>
-          )}
+          <p className="visually-hidden">Loading</p>
         </div>
       </AssistantRow>
     );
@@ -105,7 +99,7 @@ function Typing({ slow }) {
         <span className="visually-hidden">{TYPING}</span>
         {slow ? (
           <p className="typing-slow" role="status">
-            Still working. The first answer after the server wakes up can take about 20 seconds.
+            {STILL_WORKING}
           </p>
         ) : null}
       </div>

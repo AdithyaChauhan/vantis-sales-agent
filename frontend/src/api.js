@@ -76,6 +76,28 @@ async function request(path, options = {}) {
   }
 }
 
+let ping = null; // the one health ping of this page load (pingServer)
+
+/**
+ * GET /api/health/live once per page load (T13a), so a sleeping Render server starts waking while the visitor
+ * reads. Resolves to true when the server answered and false when it didn't; it never throws. Later calls get the
+ * same promise, so React's double effects in development and moving between pages send no second ping.
+ */
+export function pingServer() {
+  if (!ping) {
+    ping = request("/api/health/live").then(
+      () => true,
+      () => false,
+    );
+  }
+  return ping;
+}
+
+/** Tests only: the next pingServer() sends a new ping. */
+export function forgetPing() {
+  ping = null;
+}
+
 /** GET /api/welcome: {text, starter_questions}. */
 export async function getWelcome() {
   const body = await request("/api/welcome");

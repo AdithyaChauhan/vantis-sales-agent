@@ -10,9 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.agent import welcome
 from app.agent.leads import (
-    ASKED_WHAT_LINE, INTEREST_LINE, SAVED_INFO_LINE, LeadOps, card_fields, confirmed_city, details_named,
-    fix_callback_claims, is_clock_time, merge_callback_time, remove_false_claims, ruled_out_details,
-    short_answer_details, status_block,
+    ASKED_CITY_LINE, ASKED_WHAT_LINE, INTEREST_LINE, SAVED_INFO_LINE, LeadOps, card_fields, confirmed_city,
+    details_named, drop_known_city_question, fix_callback_claims, is_clock_time, merge_callback_time,
+    remove_false_claims, resolve_city, ruled_out_details, short_answer_details, status_block,
 )
 from app.leads import service
 from app.leads.models import Callback, Lead, SupportRequest
@@ -190,20 +190,21 @@ def test_city_not_confirmed_when_the_question_did_not_name_it():
     assert confirmed_city(["Delhi"], question, {"intents": ["reply_to_assistant"], "details": {}}) is None
 
 
-def test_city_confirmation_through_the_graph(ops):
+def test_an_asked_city_counts_as_theirs_at_once(ops):
+    # T13a: before, the city became theirs only if the bot's next question happened to name it
     understand_llm = Scripted(
-        understood(["question"], "service area Delhi", asked_city="Delhi"),
+        understood(["question"], "service area Delhi", asked_city="Delhi", cities=["Delhi"]),
         understood(["gives_details"], None, name="Rahul Sharma", phone="9876543210"),
     )
-    agent = Scripted(answer("Delhi is listed. Could I have your name and number for the property in Delhi?"),
-                     answer("Thanks."))
+    agent = Scripted(answer("Vantis currently covers Delhi. What is your monthly bill?"), answer("Thanks."))
     graph, _ = make_graph(understand_llm, agent, ops=ops)
     first = run(graph, "Do you install in Delhi?")
-    assert first["asked_cities"] == ["Delhi"] and "city" not in first["lead"]
-    assert "City asked about, not confirmed as theirs: Delhi" in lead_status_text(agent, 0)
+    assert first["lead"]["city"] == "Delhi" and first["city_source"] == "asked" and first["asked_cities"] == []
+    block = lead_status_text(agent, 0)
+    assert ASKED_CITY_LINE in block and "Confirm it" not in block
     second = run(graph, "Rahul Sharma, 9876543210")
-    assert second["lead"]["city"] == "Delhi" and second["asked_cities"] == []
-    assert second["steps"][0]["data"]["city_confirmed"] is True
+    assert second["lead"]["city"] == "Delhi"
+    assert second["steps"][0]["data"]["city_source"] == "asked"
 
 
 def test_information_only_turn_does_not_ask_for_details():
@@ -630,3 +631,162 @@ def test_a_model_failure_after_the_save_says_the_lead_is_saved_not_try_again(ops
     assert state["reply"] == welcome.SAVED_FALLBACK_TEXT and state["degraded"] is True
     assert state["lead_id"] and count(ops.engine, Lead) == 1
     assert any(s["detail"] == "LLM failed; the reply says what the tools did" for s in state["steps"])
+
+
+# ---------- T13a: city memory ----------
+
+@pytest.mark.parametrize("kwargs, expected", [
+    # one city asked about: theirs
+    ({"asked": ["Lucknow"]}, ("Lucknow", "asked", [])),
+    # two in one question: no guess, they become the candidates
+    ({"asked": ["Lucknow", "Kanpur"]}, (None, None, ["Lucknow", "Kanpur"])),
+    # an earlier asked city and a different one later: no guess either (Adithya's rule)
+    ({"current": "Lucknow", "source": "asked", "asked": ["Kanpur"]}, (None, None, ["Lucknow", "Kanpur"])),
+    # the same city again: kept
+    ({"current": "Lucknow", "source": "asked", "asked": ["lucknow"]}, ("Lucknow", "asked", [])),
+    # a stated city replaces an asked one, and clears the candidates
+    ({"current": "Lucknow", "source": "asked", "stated": "Kanpur"}, ("Kanpur", "stated", [])),
+    ({"candidates": ["Lucknow", "Kanpur"], "stated": "Kanpur"}, ("Kanpur", "stated", [])),
+    # the extractor repeating the asked city does not make it stated
+    ({"current": "Lucknow", "source": "asked", "stated": "Lucknow"}, ("Lucknow", "asked", [])),
+    # a question never replaces a stated city
+    ({"current": "Lucknow", "source": "stated", "asked": ["Kanpur"]}, ("Lucknow", "stated", [])),
+    # after the save, a question changes nothing
+    ({"current": "Lucknow", "source": "asked", "asked": ["Kanpur"], "saved": True}, ("Lucknow", "asked", [])),
+    # nothing about a city this turn: unchanged
+    ({"current": "Lucknow", "source": "asked"}, ("Lucknow", "asked", [])),
+])
+def test_resolve_city(kwargs, expected):
+    args = {"current": None, "source": None, "candidates": [], "stated": None, "asked": [], "saved": False, **kwargs}
+    assert resolve_city(**args) == expected
+
+
+def test_resolve_city_treats_an_old_name_as_the_same_city():
+    def key(name):
+        return (AREAS.lookup(name).matched_city or name).lower()
+
+    assert resolve_city(current="Gurgaon", source="asked", candidates=[], stated=None, asked=["Gurugram"],
+                        saved=False, key=key) == ("Gurgaon", "asked", [])
+
+
+def test_yes_to_a_two_city_question_picks_nothing():
+    question = AIMessage("Vantis covers both. Is the property in Lucknow or Kanpur?")
+    assert confirmed_city(["Lucknow", "Kanpur"], question, {"intents": ["reply_to_assistant"], "details": {}}) is None
+
+
+def _city_chat(ops, city, *more):
+    """Asked about `city`, then the bill, then the name and phone (the T13a live chat), plus any `more` turns."""
+    understand_llm = Scripted(
+        understood(["question"], f"service area {city}", asked_city=city, cities=[city]),
+        understood(["gives_details", "buying_interest"], None, monthly_bill_inr="4000", property_type="house"),
+        understood(["gives_details"], None, name="Arjun", phone="9876543210"),
+        *more,
+    )
+    agent = Scripted(
+        answer(f"Vantis can check {city} for you. What is your monthly electricity bill?"),
+        answer("Thanks. Could you share your name and phone number?"),
+        tool_call("create_lead", {}, "c1"),
+        answer("Your details are saved, and the sales team can follow up. What time suits you for a callback?"),
+        answer("Thanks."),
+    )
+    graph, _ = make_graph(understand_llm, agent, ops=ops)
+    states = [run(graph, "Do you install there?"), run(graph, "My bill is about 4000 a month, it is for my home."),
+              run(graph, "I am Arjun, 9876543210")]
+    return graph, agent, states
+
+
+def test_the_three_turn_chat_saves_the_asked_city_and_never_asks_for_it(ops):
+    _, agent, states = _city_chat(ops, "Lucknow")
+    assert [s["lead"]["city"] for s in states] == ["Lucknow"] * 3
+    assert states[2]["lead_id"]
+    lead = service.get_lead(ops.engine, states[2]["lead_id"])
+    assert (lead.city, lead.location_status) == ("Lucknow", "listed")
+    for call in range(len(agent.calls)):
+        block = lead_status_text(agent, call)
+        assert "Ask which one" not in block and "Confirm it" not in block
+        assert "Still needed before it can be saved: city" not in block
+
+
+def test_an_unlisted_asked_city_is_saved_as_not_confirmed(ops):
+    _, _, states = _city_chat(ops, "Raipur")
+    lead = service.get_lead(ops.engine, states[2]["lead_id"])
+    assert (lead.city, lead.location_status) == ("Raipur", "unverified")
+
+
+def test_actually_in_kanpur_replaces_the_asked_city(ops):
+    graph, _, states = _city_chat(ops, "Lucknow", understood(["gives_details"], None, city="Kanpur"))
+    after = run(graph, "actually I am in Kanpur")
+    assert (after["lead"]["city"], after["city_source"]) == ("Kanpur", "stated")
+    assert service.get_lead(ops.engine, states[2]["lead_id"]).city == "Kanpur"  # the finalize sync saved it
+
+
+def test_two_cities_ask_which_only_when_the_city_is_next():
+    graph, _ = make_graph(Scripted(understood(["question"], "service areas", cities=["Lucknow", "Kanpur"])),
+                          Scripted(answer("Vantis covers both.")))
+    state = run(graph, "Do you install in Lucknow or Kanpur?")
+    assert "city" not in state["lead"] and state["asked_cities"] == ["Lucknow", "Kanpur"]
+    assert "Cities asked about: Lucknow, Kanpur. Ask which one the property is in." in status_block(state)
+    contact = {**state, "contact_request": True}  # name and phone come first, so not yet
+    assert "Ask which one" not in status_block(contact)
+
+
+def test_a_later_different_asked_city_clears_the_guess_and_asks_which():
+    graph, _ = make_graph(Scripted(understood(["question"], "areas", asked_city="Lucknow", cities=["Lucknow"]),
+                                   understood(["question"], "areas", asked_city="Kanpur", cities=["Kanpur"])),
+                          Scripted(answer("Covered.")))
+    run(graph, "Do you install in Lucknow?")
+    state = run(graph, "And in Kanpur?")
+    assert "city" not in state["lead"] and state["asked_cities"] == ["Lucknow", "Kanpur"]
+    assert "Ask which one the property is in" in status_block(state)
+
+
+def test_after_the_save_a_question_about_another_city_changes_nothing(ops):
+    graph, _, states = _city_chat(ops, "Lucknow", understood(["question"], "areas", asked_city="Kanpur",
+                                                             cities=["Kanpur"]))
+    after = run(graph, "Do you also install in Kanpur?")
+    assert after["lead"]["city"] == "Lucknow"
+    assert service.get_lead(ops.engine, states[2]["lead_id"]).city == "Lucknow"
+
+
+@pytest.mark.parametrize("question", [
+    "Which city is your home in?",
+    "What city is the property in?",
+    "Is the property in Lucknow?",
+    "Is your home in Lucknow, right?",
+    "Would you like the Vantis sales team to check if we can install at your property in Lucknow?",
+    "Where is your home located?",
+])
+def test_a_question_for_a_known_city_is_removed(question):
+    state = {"lead": {"city": "Lucknow", "monthly_bill_inr": 4000}, "intents": ["buying_interest"]}
+    text, removed = drop_known_city_question(f"Vantis covers Lucknow [KB Section 10: Locations]. {question}", state)
+    assert removed == [question]
+    # nothing else to ask was left, so the honest ask for what is still needed takes its place
+    assert text == "Vantis covers Lucknow [KB Section 10: Locations]. " + welcome.STILL_NEEDED_ASK.format(
+        items="name and phone number")
+
+
+@pytest.mark.parametrize("question", [
+    "What is your monthly electricity bill?",
+    "Would you like to know which package fits your bill?",
+    "Would you like a callback from the team in Lucknow?",
+    "Do you also want to know about Kanpur?",
+])
+def test_other_questions_are_kept(question):
+    state = {"lead": {"city": "Lucknow"}, "intents": ["buying_interest"]}
+    reply = f"Vantis covers Lucknow. {question}"
+    assert drop_known_city_question(reply, state) == (reply, [])
+
+
+def test_no_known_city_no_removal():
+    reply = "Which city is your home in?"
+    assert drop_known_city_question(reply, {"lead": {}, "intents": ["buying_interest"]}) == (reply, [])
+
+
+def test_the_city_guard_keeps_the_removed_sentence_in_its_step(ops):
+    understand_llm = Scripted(understood(["buying_interest"], None, city="Lucknow", monthly_bill_inr="4000"))
+    agent = Scripted(answer("Thanks! Is the property in Lucknow?"))
+    graph, _ = make_graph(understand_llm, agent, ops=ops)
+    state = run(graph, "Lucknow, bill 4000")
+    [guard] = [s for s in state["steps"] if s["detail"] == "removed a question about a city it already has"]
+    assert guard["data"]["removed"] == ["Is the property in Lucknow?"]
+    assert state["reply"] == "Thanks! " + welcome.STILL_NEEDED_ASK.format(items="name and phone number")

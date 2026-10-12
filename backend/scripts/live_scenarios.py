@@ -151,12 +151,28 @@ def cites(section: int) -> Check:
     return f"cites KB Section {section}", lambda r, c: f"[KB Section {section}:" in _reply(r)
 
 
-def city_checked_listed() -> Check:
-    """The city check said listed: the code's check before the model (T12b) or the model's tool call."""
+def city_checked(status: str = "listed") -> Check:
+    """The city check said `status`: the code's check before the model (T12b) or the model's tool call."""
     def check(response: dict, ctx: Context) -> bool:
         by_code = [s.get("detail", "") for s in response.get("steps", []) if s.get("node") == "area_check"]
-        return any(d.endswith(": listed") for d in by_code + _tool_details(response, "check_service_area"))
-    return "service area check: listed", check
+        return any(d.endswith(f": {status}") for d in by_code + _tool_details(response, "check_service_area"))
+    return f"service area check: {status}", check
+
+
+def city_checked_listed() -> Check:
+    return city_checked("listed")
+
+
+_CITY_QUESTION_RE = re.compile(r"\b(?:city|town|where|location|located)\b", re.I)
+
+
+def no_city_question(city: str) -> Check:
+    """T13a: no question sentence asks for the city or confirms `city` once the bot has it."""
+    def check(response: dict, ctx: Context) -> bool:
+        questions = [without_tags(p) for line in _reply(response).split("\n") for p in split_sentences(line)
+                     if without_tags(p).endswith("?")]
+        return not any(_CITY_QUESTION_RE.search(q) or city.lower() in q.lower() for q in questions)
+    return "doesn't ask for the city again", check
 
 
 def support_saved() -> Check:
@@ -210,6 +226,21 @@ def holdout_scenarios(questions: list[tuple[str, str]]) -> list[Scenario]:
             for qid, question in questions]
 
 
+NEVER_NOT_SERVED = not_mentions(
+    r"\b(?:do not|don't|does not|doesn't|cannot|can't|won't)\s+(?:serve|install|cover|operate)",
+    "never says Vantis doesn't serve it")
+
+
+def city_memory(sid: str, city: str, status: str) -> Scenario:
+    """T13a: a city the customer only asked about counts as theirs and is never asked for again."""
+    return Scenario(sid, "edge", f"city memory: {city} asked about, then bill, then name and phone", [
+        Turn(f"Do you install in {city}?", [city_checked(status), city_is(city), NEVER_NOT_SERVED, no_lead(), *COMMON]),
+        Turn("My bill is about 4000 a month, it's for my home.",
+             [no_city_question(city), city_is(city), known("monthly_bill_inr"), no_lead(), *COMMON]),
+        Turn("I'm Arjun, 9876543210", [no_city_question(city), lead_saved(), city_is(city), known("phone"), *COMMON]),
+    ])
+
+
 EDGE = [
     Scenario("C1", "edge", "missing information", [
         Turn("I want solar for my house", [exactly_one_question(), no_lead(), no_saved_claim(), no_invented_numbers()]),
@@ -241,6 +272,8 @@ EDGE = [
         Turn("Who won the last cricket world cup?", [is_redirect(), no_lead()]),
         Turn("Okay. Do you install in Kanpur?", [not_redirect(), city_checked_listed(), cites(10), *COMMON]),
     ]),
+    city_memory("C7", "Lucknow", "listed"),
+    city_memory("C7b", "Raipur", "unverified"),
 ]
 
 SLOW = [
@@ -266,6 +299,7 @@ class TurnResult:
     failed: list[str]
     passed: list[str]
     llm_calls: int
+    guards: list[str] = field(default_factory=list)  # each reply guard that fired, with what it removed (T13a)
 
 
 def llm_calls_seen(response: dict) -> int:
@@ -298,16 +332,29 @@ def run_scenario(scenario: Scenario, post: Callable[[dict], dict], kb_texts: lis
                 ok = False
             (passed if ok else failed).append(name)
         results.append(TurnResult(scenario.id, number, turn.message, _reply(response), seconds, failed, passed,
-                                  llm_calls_seen(response)))
+                                  llm_calls_seen(response), guards_fired(response)))
         ctx.replies.append(_reply(response))
     return results
 
 
+def guards_fired(response: dict) -> list[str]:
+    """The reply guards that fired, e.g. 'removed a question about a city it already has: "Is it in Lucknow?"'."""
+    fired = []
+    for step in response.get("steps", []):
+        if step.get("node") == "guard":
+            removed = step.get("data", {}).get("removed")
+            text = "; ".join(f'"{r}"' for r in removed) if isinstance(removed, list) else ""
+            fired.append(f"{step.get('detail', '')}: {text}" if text else step.get("detail", ""))
+    return fired
+
+
 def print_turn(result: TurnResult) -> None:
-    """One turn: the customer's message, the reply and each check."""
+    """One turn: the customer's message, the reply, the guards that fired and each check."""
     print(f"\n[{result.scenario} turn {result.turn}] {result.seconds:.1f} s")
     print(f"  customer: {result.message}")
     print(f"  reply:    {result.reply}")
+    for guard in result.guards:
+        print(f"    guard: {guard}")
     for name in result.passed:
         print(f"    PASS {name}")
     for name in result.failed:

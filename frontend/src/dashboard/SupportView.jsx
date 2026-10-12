@@ -1,8 +1,7 @@
-import { WAKE_NOTICE } from "../useWelcome.js";
 import { useWideScreen } from "../useWideScreen.js";
 import { formatPhone, fullDate, timeAgo } from "./format.js";
 import { loadError } from "./LeadsView.jsx";
-import { useSlow, useSupportList } from "./useSalesData.js";
+import { useSupportList } from "./useSalesData.js";
 
 export const NO_SUPPORT = "No support requests yet. They appear here when existing customers report an issue in the chat.";
 
@@ -41,7 +40,6 @@ export default function SupportView({ apiKey, refreshTick, onUnauthorized }) {
   const wide = useWideScreen();
   const list = useSupportList(apiKey, refreshTick, onUnauthorized);
   const firstLoad = list.status === "loading" && !list.body;
-  const slow = useSlow(firstLoad);
 
   let body;
   if (firstLoad) {
@@ -52,13 +50,7 @@ export default function SupportView({ apiKey, refreshTick, onUnauthorized }) {
           <span />
           <span />
         </div>
-        {slow ? (
-          <p className="wake" role="status">
-            {WAKE_NOTICE}
-          </p>
-        ) : (
-          <p className="visually-hidden">Loading support requests</p>
-        )}
+        <p className="visually-hidden">Loading support requests</p>
       </div>
     );
   } else if (list.status === "error") {

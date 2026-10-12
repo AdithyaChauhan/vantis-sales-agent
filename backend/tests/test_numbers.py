@@ -10,7 +10,9 @@ CATALOG = ("- Vantis HomeStart 3; Residential; 3 kW rooftop solution\n"
 
 
 def guard(reply: str, *allowed: str) -> tuple[str, list[str]]:
-    return remove_unsupported_numbers(reply, list(allowed), NUMBERS_CONFIRM_TEXT)
+    """(reply, removed numbers): the removed sentences are tested on their own below."""
+    text, numbers, _ = remove_unsupported_numbers(reply, list(allowed), NUMBERS_CONFIRM_TEXT)
+    return text, numbers
 
 
 @pytest.mark.parametrize("text, found", [
@@ -110,3 +112,18 @@ def test_a_list_item_with_an_invented_number_goes_and_the_rest_of_the_list_stays
     text, removed = guard(reply, "General process: Inquiry → Installation → Handover")
     assert removed == ["2 days"]
     assert text == f"Steps:\n1. Inquiry\n2. {NUMBERS_CONFIRM_TEXT}\n3. Handover"
+
+
+def test_the_removed_sentences_are_returned_without_tags_and_the_log_has_only_the_count(caplog):
+    # T13a: each removed sentence goes into the reply's steps so it can be checked; never into the server log
+    reply = ("For your bill, HomeStart 3 could fit [KB Section 9: Guidance]. That saves about 30% "
+             "[KB Section 9: Guidance]. Shall I note your city?")
+    with caplog.at_level("WARNING", logger="app.rag.numbers"):
+        text, numbers, sentences = remove_unsupported_numbers(reply, ["my bill is 4000"], NUMBERS_CONFIRM_TEXT)
+    assert sentences == ["For your bill, HomeStart 3 could fit.", "That saves about 30%."]
+    assert numbers == ["3", "30%"]
+    assert text == f"{NUMBERS_CONFIRM_TEXT} Shall I note your city?"
+    [record] = caplog.records
+    assert record.removed == 2
+    assert "HomeStart" not in record.getMessage() and "30%" not in record.getMessage()
+    assert remove_unsupported_numbers("No numbers here.", [], NUMBERS_CONFIRM_TEXT) == ("No numbers here.", [], [])

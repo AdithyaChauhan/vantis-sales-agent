@@ -119,6 +119,7 @@ export function supportItem(overrides = {}) {
  * Returns the mock, so tests can read what was sent.
  */
 export function fakeApi({
+  health = () => jsonResponse(200, { status: "ok" }),
   welcome = () => jsonResponse(200, WELCOME),
   chat,
   leads = () => jsonResponse(200, leadList([leadItem()])),
@@ -129,6 +130,7 @@ export function fakeApi({
   let chatCalls = 0;
   const fetchMock = vi.fn(async (url, init = {}) => {
     const { pathname, searchParams } = new URL(url);
+    if (pathname === "/api/health/live") return health();
     if (pathname === "/api/welcome") return welcome();
     if (pathname === "/api/chat") return chat(JSON.parse(init.body), ++chatCalls);
     if (init.headers?.["X-API-Key"] !== key) {

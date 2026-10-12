@@ -9,6 +9,7 @@ TABLE_SECTIONS = {8, 9, 10, 11, 12}
 # offer?", "Where do you install?") match one chunk with the whole list (T5, docs/EVAL.md).
 CATALOG_SECTION = 8  # Product & Service Catalog
 SERVICE_AREA_SECTION = 10  # Reference Service Locations
+PACKAGE_GUIDANCE_SECTION = 9  # Reference Package Guidance (T13a: in the context on a turn that gives the monthly bill)
 SUMMARY_SECTIONS = {CATALOG_SECTION, SERVICE_AREA_SECTION}
 SUMMARY_LABEL = "Summary of all rows"
 FAQ_SECTION = 15

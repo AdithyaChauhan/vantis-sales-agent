@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 
 import ChatPage from "./ChatPage.jsx";
+import WakeNote from "./components/WakeNote.jsx";
 import Dashboard from "./dashboard/Dashboard.jsx";
 import { Link, usePath } from "./router.jsx";
 
@@ -39,14 +40,26 @@ function NotFound() {
   );
 }
 
-/** The app: one page per path (src/router.jsx), and the browser tab's title for it. */
+function Page({ where }) {
+  if (where.page === "chat") return <ChatPage />;
+  if (where.page === "missing") return <NotFound />;
+  return <Dashboard view={where.page} leadId={where.leadId} />;
+}
+
+/**
+ * The app: one page per path (src/router.jsx), the browser tab's title for it, and (T13a) the waking note, driven
+ * by one health ping when the page loads.
+ */
 export default function App() {
   const where = route(usePath());
   useEffect(() => {
     document.title = TITLES[where.page];
   }, [where.page]);
 
-  if (where.page === "chat") return <ChatPage />;
-  if (where.page === "missing") return <NotFound />;
-  return <Dashboard view={where.page} leadId={where.leadId} />;
+  return (
+    <>
+      <WakeNote />
+      <Page where={where} />
+    </>
+  );
 }

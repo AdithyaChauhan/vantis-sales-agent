@@ -26,7 +26,8 @@ class AgentState(TypedDict, total=False):
     support_case: bool  # an existing customer's issue: no sales lead for this conversation
     support: dict  # issue and project_details, in the customer's words
     support_request_id: int | None
-    asked_cities: list[str]  # cities asked about but not (yet) confirmed as the customer's
+    asked_cities: list[str]  # T13a: the cities in question while the city is open (two or more asked about)
+    city_source: str | None  # T13a: "stated" or "asked" (a city they only asked about counts as theirs)
     ruled_out: list[str]  # details the customer ruled out ("apart from timing"); never asked for again (T12a)
     area_checks: list[dict]  # this turn's service-area checks of every city named, made in code (T12b)
     # This turn's tool calls and tool results

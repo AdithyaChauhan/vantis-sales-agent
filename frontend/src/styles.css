@@ -848,9 +848,29 @@ textarea {
   width: 55%;
 }
 
-.wake {
-  margin-top: 0.75rem;
-  color: var(--text-2);
+/* T13a: the waking note (src/components/WakeNote.jsx), fixed at the top so it never moves a page. The region is
+   always there (an empty live region takes no space and catches no clicks). */
+.wake-region {
+  position: fixed;
+  top: 0.75rem;
+  left: 50%;
+  z-index: 50;
+  width: max-content;
+  max-width: calc(100vw - 2rem);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.wake-note {
+  margin: 0;
+  padding: 0.6rem 1rem;
+  border: 1px solid var(--card-border);
+  border-radius: 0.75rem;
+  background: var(--card);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font-size: 0.9375rem;
+  text-align: center;
 }
 
 .typing .dots {
