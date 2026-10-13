@@ -2,7 +2,7 @@
 
 The single source of truth for what we build and why.
 Roles: Adithya owns the project. Claude (chat) reviews and writes the tasks. Claude Code builds.
-Last updated: 2026-10-13 (T13a).
+Last updated: 2026-10-13 (T13b).
 
 ---
 
@@ -60,7 +60,7 @@ Skipped on purpose: mock WhatsApp (optional in the PDF), streaming.
 
 ### Rules from the KB (they drive prompts and tests)
 - **Never invent** (KB Section 16): exact price, savings, subsidy amount or eligibility, financing approval or EMI, installation date, warranty length when the equipment is unspecified, service in an unlisted city, specs not in the KB, appointments that weren't made, human actions that didn't happen.
-- **No package recommendation** without bill or usage info (KB Sections 3, 9). Packages are reference options pending a site assessment.
+- **No package recommendation** without bill or usage info (KB Sections 3, 9). Packages are reference options pending a site assessment. **A bill alone never picks one package** (T13b): KB Sections 8 and 9 describe the packages by household use and give no bill ranges, so the reply names the reference packages for a home or a business and says the site assessment decides which one fits.
 - **Unlisted city** (KB Sections 7, 10): say availability isn't confirmed, collect details, offer verification by sales.
 - **Tone** (KB Section 17): short, friendly, honest, not pushy. At most 1–2 questions per turn.
 
@@ -143,6 +143,15 @@ The turn input resets every per-turn field (`scratch` with `RemoveMessage(REMOVE
   - A `question` with no query searches with the message itself (q13 once had none).
   - The new field `cities` lists every city the message names. Each is checked in code before the model (`check_named_cities`, at most 3, not for a greeting, thanks or off-topic message alone): an `area_check` step ("Service area check: Lucknow: listed"), the KB Section 10 summary as the first chunk (the source chip), and the results in the agent's message (`<service_area_check>`). The model keeps `check_service_area` for any other city. Why: in the slow-Google drill Groq could not carry the extra answer call of a city tool round within its 8K tokens a minute (`docs/EVAL.md` T12b).
 - **T13a package guidance:** on a turn whose new details include the monthly bill, the KB Section 9 rows (which reference package fits which need, with each "Do not assume" caution; `KbHints.guidance`, read from the KB) join the context, also on a details-only turn without a KB search. Before, the number guard removed the suggestion "…fits nicely with our 3 kW residential reference package" because that turn had no source for "3 kW". The number guard's step now quotes each removed sentence (`data.removed`); the log keeps only the count.
+- **T13b package rule (`package_case` in `app/agent/leads.py`).** The same bill message got HomeStart 3 locally and HomePro 5 on Render, because KB Sections 8 and 9 give no bill ranges: one package for a bill is a guess. A **package turn** gives the monthly bill, or the property type after it, while no system size is settled, outside a support case and a contact request (name and phone come first).
+  - **Property type known** ("home" or "business", from `customer_type`): the KB Section 9 rows join the context, followed by the `<package_guidance>` block (`prompts/package_guidance_prompt.md`, filled with the type). The reply names every reference package for that type with its short KB description, cites KB Section 9 and says a site assessment decides which one fits; never one package for the bill, never a bill range.
+  - **Unknown:** the same block asks whether the property is a home or a business (no rows yet), and `keep_one_question` keeps that question over the next missing detail. The answer then brings the packages.
+  - The T13a rows now come only with the block: no longer while the type is unknown, with a settled size (the stated-size rule names the package) or on a contact request. The system prompt has the same rule for every turn.
+  - **The property type** (Adithya's choice after C7 run 1, where "it's for my home" stored no type on the bill turn):
+    - The understand prompt fills `customer_type` from the kind of place.
+    - `customer_type_from_words` backs it up when neither the extractor nor an earlier turn gave one: home, house, flat, villa or apartment → residential; shop, office, store or business → commercial.
+    - It sets nothing when both kinds or neither are named, and it reads only a message about their own place (details, buying interest, a contact request or an answer to the assistant).
+    - It is shown as the understand step's `from_words`.
 - **T12b retrieve addition:** when the message states a size in kW (or `system_size_kw` is new this turn), the KB Section 8 summary chunk joins the context, so a 5 kW question can name HomePro 5 (`add_catalog_for_size`; no package names in code).
 - **T12a understand additions:** the intent `asks_what_is_needed`; `short_answer_details` (a bare amount after a question only about the monthly bill, or yes/no after a question only about roof space, when the extractor missed it); a time of day alone ("4pm", as the message or as the extracted "timeline") is a callback time, never a timeline; `merge_callback_time` ("4pm" then "day after tomorrow" gives "day after tomorrow, 4pm"); `ruled_out` (persisted: details the customer ruled out, "apart from timing", never asked for again); per-turn `new_details`, `declines`, `lead_created_now`, `callback_now`.
 - **City memory (T13a, code: `resolve_city` in `app/agent/leads.py`, decided in understand; replaces T8b's "City confirmation").** Before T13a an asked city became the customer's only when the bot's next question happened to name it.
@@ -363,7 +372,7 @@ Tables are created on startup with `create_all` + `CREATE EXTENSION IF NOT EXIST
 ### 3.12 Observability
 - JSON logs with `request_id, session_id, node, tool, provider, latency_ms, fallback_used`; T12a: every model attempt ("llm call" / "llm call failed": `model`, `use`, `latency_ms`, `tokens`, `failure`) and the skip list ("llm marked down", "llm skipped"), never message text; each reply guard that fires is a "guard" step and a warning.
 - `steps[]` returned to the UI (the "agent steps" panel).
-- Optional LangSmith tracing through env vars.
+- Optional LangSmith tracing through env vars. Off on Render (T13b: `LANGSMITH_TRACING` "false", no key), so no chat text goes to a tracing service; the frontend loads no analytics or monitoring script.
 
 ### 3.13 Config (backend env vars; `backend/.env.example`)
 | Var | Notes |
@@ -484,6 +493,7 @@ One task = one Claude Code session = one `/handoff`.
 | T12b | Mon | Never invent facts (number guard, the same rules for the fallback models, answerable offers, reasons that read naturally); held-out questions (labels, eval, chat); the assignment's edge cases live (`scripts/live_scenarios.py`); "Dehli"; patient offline path; "service areas"; package for a stated size | No reply in the held-out or scenario runs states a number that the KB, a tool or the customer didn't give; results in `docs/EVAL.md`. **Done 2026-10-12:** held-out retrieval rewrite hit@3 6/7 best section and 7/7 any listed section; held-out chat 8/8 after the general fix for unanswered parts (h06 and h07 invented a staff and a policy first); edge cases 11/11 (3 check fixes in the script, re-checked on the recorded replies); slow-Google drill 3/3 on Groq with the lead saved, after the city check moved before the model (run 1 failed: Groq 429 after a tool round) |
 | T12 | Wed | Edge-case pass, live scenario tests, prompt fixes logged | Every scenario in part 5 passes or is documented (T12a + T12b) |
 | T13a | Tue | City memory (an asked city counts as theirs; two in question: ask which), the waking note from one health ping, Vercel prep (`frontend/vercel.json`, DEPLOY.md "T13b steps") | The 3-turn Lucknow chat and a Raipur version save the city without asking again; page tests with a slow fake server. **Done 2026-10-13:** C7 failed its turn-1 check before the fix (no city stored); after it, C7, C7b, C3a, C3b and C6 pass every check live; 45 LLM requests |
+| T13b | Tue | Live site: `CORS_ORIGINS` = the Vercel URL; the bill-turn package rule (a bill alone never picks a package), with the property type from the understand step or the word fallback; production settings (demo mode on by decision, tracing off) | The deploy-config tests pin the CORS value; C7 and C7b list the home packages on the bill turn with a KB tag. **Done 2026-10-13:** C7 run 1 failed (no property type stored on the bill turn); after the extraction fix, C7 and C7b pass every check, turn 2 naming HomeStart 3, HomePro 5 and HomeMax 10 with KB Section 9 (3.2 s and 2.9 s); 26 LLM requests (`docs/EVAL.md` T13b) |
 | T13 | Wed | GitHub Actions CI, deploy backend (Render) + frontend (Vercel), CORS, live smoke test | CI green; the demo flow works on the live URL |
 | T14 | Thu | README (17 sections), `docs/ARCHITECTURE.md`, ZIP, video | Submitted by 20:00 IST |
 
@@ -506,8 +516,8 @@ Rule: no extras until the current task's "Done when" passes.
 8. *(Found in T11, seed data.)* A COLD lead in an unlisted city (Rohit Patel, 31) carries the cap "capped at WARM" although it changes nothing. The template reason then reads "COLD: …; city not in the listed service areas: capped at WARM.", and the LLM sentence was rejected (most likely for naming WARM, another status). Consider recording a cap only when it lowers the score, or wording it "could not be HOT". The dashboard already says "The cap didn't change this score."
 
 ### T13 notes (from T10)
-- **Vercel:** the exact steps are in `docs/DEPLOY.md`, "T13b steps" (T13a). Set `VITE_API_URL` to the Render URL (a trailing slash is fine) and add the Vercel URL to `CORS_ORIGINS` (render.yaml and `PROD_DIFFERS` in `tests/test_deploy_config.py`). Vite reads `VITE_*` at build time, so changing it needs a redeploy.
-- **The demo card in production:** with `CHAT_SHOW_LEAD_SCORE=false` the card shows no score or status, but it still shows the customer's own name, city, checklist and callback state. The Sales view switch (T10c) is on by default and remembered per browser; decide its production default (e.g. off through a `VITE_SALES_VIEW_DEFAULT` setting, or hide the switch), or keep it on for the review and say so in the README.
+- **Vercel:** the exact steps are in `docs/DEPLOY.md`, "T13b steps" (T13a). Set `VITE_API_URL` to the Render URL (a trailing slash is fine) and add the Vercel URL to `CORS_ORIGINS` (render.yaml and `PROD_DIFFERS` in `tests/test_deploy_config.py`). Vite reads `VITE_*` at build time, so changing it needs a redeploy. **Done in T13b** (Vercel by Adithya; `CORS_ORIGINS` in `render.yaml`).
+- **The demo card in production:** with `CHAT_SHOW_LEAD_SCORE=false` the card shows no score or status, but it still shows the customer's own name, city, checklist and callback state. The Sales view switch (T10c) is on by default and remembered per browser; decide its production default (e.g. off through a `VITE_SALES_VIEW_DEFAULT` setting, or hide the switch), or keep it on for the review and say so in the README. **Decided in T13b:** kept on for the review (part 6, "Demo mode on the live site"); the README says so (T14).
 
 ### T11 notes (from T10)
 - **Local dashboard checks:** `python -m scripts.serve_test_branch` already points the sales API (`leads_engine`) at the test branch, so the dashboard shows and writes only test-branch leads. Pass a throwaway `SALES_API_KEY=... python -m scripts.serve_test_branch` to use a known key locally.
@@ -518,13 +528,13 @@ Rule: no extras until the current task's "Done when" passes.
 - **Tool name in a reply:** in the T10 demo run, turn 4 ended with "… the team will confirm it [schedule_callback result]." The model cited the tool result like a KB section. The page shows it as plain text. Fix in `system_prompt.md` (cite only KB sections, never tools) and log it in `prompts/README.md`. **Done in T10b** (`system_prompt.md`, `rag_prompt.md`, and `strip_tool_citations` in finalize as the safety net).
 
 ### T13 note (from T6)
-- Once GitHub Actions CI exists, switch `autoDeployTrigger` in `render.yaml` from `commit` to `checksPass`, so a push that fails CI is not deployed. Add the Vercel URL to `CORS_ORIGINS` (`render.yaml`, and to `PROD_DIFFERS` in `tests/test_deploy_config.py`).
+- Once GitHub Actions CI exists, switch `autoDeployTrigger` in `render.yaml` from `commit` to `checksPass`, so a push that fails CI is not deployed. Add the Vercel URL to `CORS_ORIGINS` (`render.yaml`, and to `PROD_DIFFERS` in `tests/test_deploy_config.py`). **T13b:** the CORS part is done; `checksPass` waits for CI.
 
 ### T14 note (from T6)
 - The README gets the live backend URL and the sleep/wake note: the free service sleeps after 15 idle minutes, and the first request after that waits for Render to wake it and for the app to start (measured 32.5 s in T6; see `docs/DEPLOY.md`). Open `/api/health` a minute before the demo or recording.
 
 ### T13 note (from T8b)
-- **Tracing privacy.** LangSmith tracing is off on Render. Before turning it on with real customers, decide: keep it off in production, or set `LANGSMITH_HIDE_INPUTS=true` and `LANGSMITH_HIDE_OUTPUTS=true` (langsmith 0.14.7 hides only on exactly "true"), since inputs and outputs hold names, phone numbers and emails. Also set `CHAT_SHOW_LEAD_SCORE=false` for production.
+- **Tracing privacy.** LangSmith tracing is off on Render. Before turning it on with real customers, decide: keep it off in production, or set `LANGSMITH_HIDE_INPUTS=true` and `LANGSMITH_HIDE_OUTPUTS=true` (langsmith 0.14.7 hides only on exactly "true"), since inputs and outputs hold names, phone numbers and emails. Also set `CHAT_SHOW_LEAD_SCORE=false` for production. **Decided in T13b:** tracing stays off on Render (`test_tracing_stays_off_on_render`), and no other tracing or monitoring exists; `CHAT_SHOW_LEAD_SCORE` stays on for the demo, and a real launch turns it off (part 6).
 
 ### T13 notes (from T8a)
 - **Cold start and the first chat after waking.** After the next deploy, measure on Render the cold start (first `/api/health` after 15+ idle minutes) and the first `/api/chat` after waking. Locally the first request of a process took 20 s (building the agent, opening the first connections), and the import time grew in T8a (Known limitations). If it is slow, warm the graph up in the background right after startup (build the agent and touch the DB pools in a background thread), so `/api/health/live` still answers fast and the health check never waits for it.
@@ -589,8 +599,9 @@ Rule: no extras until the current task's "Done when" passes.
   - **Image:** python:3.12-slim, only `backend/app`, `backend/requirements.txt` and `prompts/` (no `.env`, PDF, tests or data), non-root user, one uvicorn worker on `$PORT`. Measured locally at `--cpus=0.1 --memory=512m`: startup about 43 s (almost all Python imports: FastAPI about 10 s, LangChain + google-genai about 23 s), memory 102 MiB after startup and 114 MiB after a chat call, `/api/chat` about 6 s. At full CPU, startup is 7 s. **Live on Render** (T6 Phase 2): warm `/api/health` 0.13-0.23 s, warm `/api/chat` 1.0-1.8 s (LLM 0.9-1.2 s), so Render's free CPU bursts well above 0.1 for short work. Cold (after 17 idle minutes): `/api/health` 32.5 s, then `/api/chat` 3.0 s; Render's health checks did not keep the service awake.
   - **Build minutes:** the Hobby workspace includes 500 build pipeline minutes a month. `buildFilter` limits builds to changes in `Dockerfile`, `.dockerignore`, `backend/requirements.txt`, `backend/app/**` and `prompts/**`.
   - Free services sleep after 15 idle minutes and take about a minute to wake (plus about 45 s app start), so the README says so and the UI shows "server waking up".
-- **Frontend:** Vercel (Vite build) with `VITE_API_URL` set.
-- **CORS:** `CORS_ORIGINS` includes the Vercel URL.
+- **Frontend:** Vercel (Vite build) with `VITE_API_URL` set: <https://vantis-sales-agent.vercel.app> (root directory `frontend`, set up by Adithya).
+- **CORS (T13b):** `CORS_ORIGINS` on Render is that one URL, exactly as the browser sends it (`render.yaml`; `tests/test_deploy_config.py` pins it). Vercel's preview URLs and localhost are refused; local checks use `serve_test_branch`, which allows `http://localhost:5173`.
+- **Demo mode on the live site (Adithya's decision, T13b).** The live page is a demo for the reviewers, so `CHAT_SHOW_LEAD_SCORE` stays "true" on Render and the Sales view card (with its switch, on by default) stays on the chat page: it shows what the sales team gets from each chat, including the status and score. **A real launch would turn it off:** `CHAT_SHOW_LEAD_SCORE=false`, and the card off or removed for customers, since it puts the customer's own details next to a score meant for staff.
 - **Ingestion:** run once from the laptop against Neon. The live server never needs the PDF.
 - Deploy a skeleton early (T6) so hosting problems show up on Sunday, not Wednesday.
 

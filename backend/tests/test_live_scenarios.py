@@ -107,6 +107,16 @@ def test_guards_fired_quotes_what_the_city_guard_removed():
         'removed a question about a city it already has: "Is the property in Lucknow?"', "kept one question"]
 
 
+def test_names_every_and_cites_any_checks():
+    check = live.names_every(["Plan A", "Plan B"])
+    assert ok(check, response("1. Plan A: moderate use\n2. plan b: higher use [KB Section 9: Guidance]"))
+    assert not ok(check, response("For that bill, Plan A fits [KB Section 9: Guidance]."))
+    either = live.cites_any(8, 9)
+    assert either[0] == "cites KB Section 8 or 9"
+    assert ok(either, response("Plan A [KB Section 8: Catalog].")) and ok(either, response("Plan A [KB Section 9: G]."))
+    assert not ok(either, response("Plan A [KB Section 10: Locations]."))
+
+
 def test_no_city_question_check():
     _, fn = live.no_city_question("Lucknow")
     assert fn(response("Thanks. What is your monthly bill?"), None)

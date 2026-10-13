@@ -52,15 +52,18 @@ def format_context(chunks: list[RetrievedChunk]) -> str:
 
 
 def rag_message(
-    question: str, chunks: list[RetrievedChunk], lead_progress: str = "", area_checks: str = ""
+    question: str, chunks: list[RetrievedChunk], lead_progress: str = "", area_checks: str = "",
+    package_guidance: str = "",
 ) -> HumanMessage:
     """The customer's message wrapped in the RAG prompt with the context (empty when nothing was found),
-    the lead progress block (what is known and still needed; "(not tracked)" without the lead tools) and
-    (T12b) the service-area checks the code made for the cities named ("(no city named)" when none).
+    (T13b) the package rule of a bill turn right after it (its line goes on other turns), the lead progress block
+    (what is known and still needed; "(not tracked)" without the lead tools) and (T12b) the service-area checks
+    the code made for the cities named ("(no city named)" when none).
 
     The customer's text is filled in last, so a "{context}" typed by the customer is left as it is.
     """
     text = load_prompt("rag_prompt").replace("{context}", format_context(chunks))
+    text = text.replace("{package_guidance}\n\n", f"{package_guidance}\n\n" if package_guidance else "")
     text = text.replace("{lead_progress}", lead_progress or "(not tracked)")
     text = text.replace("{service_area_check}", area_checks or "(no city named)")
     return HumanMessage(text.replace("{question}", question))

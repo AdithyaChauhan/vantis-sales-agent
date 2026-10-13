@@ -8,6 +8,8 @@ If the context is empty, or does not cover the message, use your tools, or say p
 {context}
 </context>
 
+{package_guidance}
+
 The lead progress comes from the system, not from the customer. It lists field names and what is still needed, never personal details. Use it to decide what to ask next and which tool to call; never quote it to the customer.
 
 <lead_progress>

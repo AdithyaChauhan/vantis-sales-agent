@@ -653,3 +653,37 @@ The number guard now records each sentence it removes in the reply's steps (`dat
 - The sentence and its tag stay, and no guard fired.
 - In this run the model also gave turn 2 a search query, so the KB search ran too (9 chunks: 5 guidance rows plus 4 searched). The no-search path is covered by a test with fakes.
 - 25 requests in this round.
+
+## T13b: package choice on a bill turn (live, `live_scenarios --group edge --only …`, `serve_test_branch --port 8001`)
+
+Written by hand on 2026-10-13. The turn-2 message of C7 got HomeStart 3 locally (T13a, above) and HomePro 5 on Render (Adithya's check). KB Sections 8 and 9 give no bill ranges, so one package for a bill is a guess. The fix: on a package turn the reply names every reference package for a home or a business, cites the KB and says a site assessment decides which one fits (PLAN.md part 3.1, T13b). The C7 and C7b turn-2 checks now also need the customer type, all three home packages and a KB Section 8 or 9 tag.
+
+### Run 1 (the rule in place, before the extraction fix): FAIL on turn 2
+
+| Turn | Customer | Reply (short) | Time | Result |
+|---|---|---|---|---|
+| 1 | Do you install in Lucknow? | "Vantis currently covers Lucknow [KB 10]"; asks the bill or system size | 7.5 s | pass |
+| 2 | My bill is about 4000 a month, it's for my home. | The three home packages as a numbered list with their KB profiles; "A site assessment decides which one fits [KB Section 8: Product & Service Catalog]"; asks name and phone | 10.7 s | **FAIL**: customer type not known; KB Section 8 cited, not 9 (the check asked for 9 then) |
+| 3 | I'm Arjun, 9876543210 | saved; offers a callback | 7.6 s | pass |
+
+- **Cause:** the understand step stored no property type on turn 2 (`customer_type` came only on turn 3, from the history). So the turn counted as "type unknown" and got no Section 9 rows. The model still went by "my home": it called `search_knowledge_base` twice and listed the packages from KB Section 8.
+- **Fix (Adithya's choice):**
+  - one line in `lead_extraction_prompt.md`: the kind of place fills `customer_type`;
+  - `customer_type_from_words` as the code fallback when neither the extractor nor an earlier turn gave a type;
+  - the live check now accepts a KB Section 8 or 9 tag, since both describe the packages.
+
+### After the fix: C7 and C7b, once each (Adithya: the smaller proof)
+
+| Scenario | Turn | Customer | Reply (short) | Time | Result |
+|---|---|---|---|---|---|
+| C7 | 1 | Do you install in Lucknow? | "Vantis currently covers Lucknow [KB 10]"; asks the bill | 5.5 s | pass |
+| C7 | 2 | My bill is about 4000 a month, it's for my home. | "For homes, we reference the following packages: 1. HomeStart 3 for moderate residential requirements 2. HomePro 5 for higher residential requirements 3. HomeMax 10 for large residential requirements [KB Section 9: Reference Package Guidance] A site assessment decides which one fits your property."; asks name and phone | 3.2 s | pass |
+| C7 | 3 | I'm Arjun, 9876543210 | saved; offers a callback | 4.0 s | pass |
+| C7b | 1 | Do you install in Raipur? | "Vantis can't confirm service there yet… the team can check it…" [KB 10]; asks the bill or size | 3.9 s | pass |
+| C7b | 2 | My bill is about 4000 a month, it's for my home. | The same three packages and KB Section 9 tag; "A site assessment decides which one fits your needs."; asks name and phone | 2.9 s | pass |
+| C7b | 3 | I'm Arjun, 9876543210 | saved; offers a callback | 4.2 s | pass |
+
+- **Turn 2** got the KB Section 9 rows without a KB search: one answer call. No reply guard fired, and no reply placed the bill in one package or stated a bill range.
+- **Unknown:** whether the customer type on turn 2 came from the extractor or from the word fallback. The script doesn't print the step data (`from_words`).
+- **Not run:** C7 a second time (after run 1 Adithya chose one C7 and one C7b), the "type unknown" path (fakes only), and the other scenarios.
+- **LLM requests:** 26 (run 1: 10, including two search rounds; then 8 and 8), plus 5 query embeddings, against a budget of about 25. All on gemini-3.5-flash-lite; none failed.

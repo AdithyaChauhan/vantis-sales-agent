@@ -1,9 +1,11 @@
 """T12b guards and gates in the agent: own-details questions (D1), the catalog for a stated size (D4), the number
-guard and the one-question guard in finalize. Fake models and search only."""
+guard and the one-question guard in finalize; T13a/T13b: the package guidance and rule on a bill turn. Fake models
+and search only."""
 import pytest
 
-from app.agent.leads import keep_one_question, own_details_question
+from app.agent.leads import customer_type_from_words, keep_one_question, own_details_question, package_case
 from app.agent.welcome import NUMBERS_CONFIRM_TEXT
+from app.core.prompts import load_prompt
 from app.rag.retriever import RetrievedChunk, SearchResult
 from tests.agent_fakes import FAQ, FakeSearch, Scripted, answer, make_graph, run, understood
 
@@ -248,42 +250,169 @@ def test_the_number_guard_step_quotes_each_removed_sentence():
 
 
 # ---------- T13a: the package guidance (KB Section 9) on a turn that gives the monthly bill ----------
+# T13b: a bill alone never picks a package, so the rows come with the package rule, once the property type is known
 
-def test_a_bill_brings_the_package_guidance_so_the_suggestion_keeps_its_number_and_tag():
-    # C7 and C7b turn 2: "That monthly bill fits nicely with our 3 kW residential reference package." was removed
-    # by the number guard, because a details-only turn has no KB search and so no source for "3 kW"
-    reply = ("Plan A could be a starting point for that bill, though 3 kW is not assumed without a site check "
-             "[KB Section 9: Guidance]. Could you share your name and phone number?")
+HOME_BILL = dict(monthly_bill_inr="4000", property_type="house")
+RULE = "<package_guidance>"  # the block from prompts/package_guidance_prompt.md
+
+
+def agent_input(agent: Scripted, call: int = 0) -> str:
+    """The customer's message as the agent got it (rag_prompt.md filled in)."""
+    return str(agent.calls[call][-1].content)
+
+
+def test_a_home_bill_lists_every_home_package_with_the_section_9_tag():
+    # C7 turn 2: the same bill got one package picked by guess (HomeStart 3 locally, HomePro 5 on Render); the reply
+    # now names every home package and leaves the choice to the site assessment
+    reply = ("For a home, Vantis has two reference packages:\n1. Plan A: moderate residential requirement\n"
+             "2. Plan B: higher residential requirement [KB Section 9: Guidance]\n"
+             "A site assessment decides which one fits. Could you share your name and phone number?")
     agent = Scripted(answer(reply))
     search = FakeSearch()
-    graph, _ = make_graph(Scripted(understood(["gives_details"], None, monthly_bill_inr="4000")), agent, search=search)
-    state = run(graph, "My bill is about 4000 a month")
+    graph, _ = make_graph(Scripted(understood(["gives_details"], None, **HOME_BILL)), agent, search=search)
+    state = run(graph, "My bill is about 4000 a month, it is for my home")
     assert search.queries == []  # still no KB search on a details-only turn
-    assert "Moderate residential requirement" in agent.calls[0][-1].content
     assert [c["chunk_id"] for c in state["chunks"]] == ["s09-moderate", "s09-higher"]
-    assert state["reply"] == reply  # the number and the KB tag both stay
+    message = agent_input(agent)
+    assert "Moderate residential requirement" in message and "Property type: home." in message
+    assert message.index("</context>") < message.index(RULE) < message.index("<lead_progress>")
+    assert state["reply"] == reply  # the list and its KB tag stay
     assert not [s for s in state["steps"] if s["node"] == "guard"]
     assert [s["section"] for s in state["sources"]] == ["9"]
+
+
+def test_a_bill_without_the_property_type_asks_home_or_business_first():
+    agent = Scripted(answer("Thanks. Is the solar for a home or a business?"))
+    graph, _ = make_graph(Scripted(understood(["gives_details"], None, monthly_bill_inr="4000")), agent)
+    state = run(graph, "My bill is about 4000 a month")
+    assert state["chunks"] == []  # no package rows while the property type is unknown
+    assert "Property type: unknown." in agent_input(agent)
+
+
+def test_the_property_type_after_the_bill_brings_the_packages():
+    understand = Scripted(understood(["gives_details"], None, monthly_bill_inr="4000"),
+                          understood(["gives_details"], None, **HOME_BILL))
+    agent = Scripted(answer("Is it for a home or a business?"), answer("Thanks."))
+    graph, _ = make_graph(understand, agent)
+    run(graph, "My bill is about 4000 a month")
+    state = run(graph, "home")
+    assert [c["chunk_id"] for c in state["chunks"]] == ["s09-moderate", "s09-higher"]
+    assert "Property type: home." in agent_input(agent, 1)
+
+
+def test_a_business_bill_gets_the_business_rule():
+    agent = Scripted(answer("Thanks."))
+    graph, _ = make_graph(Scripted(understood(["gives_details"], None, monthly_bill_inr="9000", property_type="shop")),
+                          agent)
+    state = run(graph, "The bill is 9000, it is for my shop")
+    assert "Property type: business." in agent_input(agent)
+    assert len(state["chunks"]) == 2
+
+
+@pytest.mark.parametrize("intents, details", [
+    (["gives_details"], dict(HOME_BILL, system_size_kw="5 kW")),  # a settled size: the stated-size rule names it
+    (["contact_request", "gives_details"], HOME_BILL),  # name and phone come first
+    (["existing_customer_issue"], HOME_BILL),  # a support case, not a sale
+])
+def test_no_package_rule_with_a_settled_size_a_contact_request_or_a_support_case(intents, details):
+    agent = Scripted(answer("Thanks."))
+    graph, _ = make_graph(Scripted(understood(intents, None, **details)), agent)
+    state = run(graph, "My bill is 4000 for my home")
+    assert state["chunks"] == []
+    assert RULE not in agent_input(agent) and "{package_guidance}" not in agent_input(agent)
 
 
 def test_no_bill_this_turn_no_guidance():
     agent = Scripted(answer("Thanks."))
     graph, _ = make_graph(Scripted(understood(["gives_details"], None, name="Arjun")), agent)
     assert run(graph, "I am Arjun")["chunks"] == []
-    assert "Moderate residential requirement" not in agent.calls[0][-1].content
+    assert "Moderate residential requirement" not in agent_input(agent) and RULE not in agent_input(agent)
 
 
 def test_a_bill_already_known_does_not_bring_it_again():
-    understand = Scripted(understood(["gives_details"], None, monthly_bill_inr="4000"),
-                          understood(["gives_details"], None, monthly_bill_inr="4000", name="Arjun"))
+    understand = Scripted(understood(["gives_details"], None, **HOME_BILL),
+                          understood(["gives_details"], None, **HOME_BILL, name="Arjun"))
     graph, _ = make_graph(understand, Scripted(answer("Thanks.")))
-    run(graph, "My bill is about 4000 a month")
+    assert len(run(graph, "My bill is about 4000 a month, it is for my home")["chunks"]) == 2
     assert run(graph, "Arjun, and yes, 4000")["chunks"] == []
 
 
 def test_a_bill_on_a_turn_with_a_search_adds_the_guidance_first():
     search = FakeSearch(SearchResult(chunks=[PRICING], mode="hybrid"))
-    graph, _ = make_graph(Scripted(understood(["question", "gives_details"], "Pricing", monthly_bill_inr="4000")),
+    graph, _ = make_graph(Scripted(understood(["question", "gives_details"], "Pricing", **HOME_BILL)),
                           Scripted(answer("It depends.")), search=search)
-    state = run(graph, "My bill is 4000, how much would it cost?")
+    state = run(graph, "My bill is 4000 for my home, how much would it cost?")
     assert [c["chunk_id"] for c in state["chunks"]] == ["s09-moderate", "s09-higher", "s05-pricing"]
+
+
+@pytest.mark.parametrize("state, case", [
+    ({"lead": {"monthly_bill_inr": 4000, "customer_type": "residential"}, "new_details": ["monthly_bill_inr"]}, "home"),
+    ({"lead": {"monthly_bill_inr": 9000, "customer_type": "commercial"}, "new_details": ["monthly_bill_inr"]},
+     "business"),
+    ({"lead": {"monthly_bill_inr": 4000}, "new_details": ["monthly_bill_inr"]}, "unknown"),
+    ({"lead": {"monthly_bill_inr": 4000, "property_type": "other"}, "new_details": ["monthly_bill_inr"]}, "unknown"),
+    ({"lead": {"monthly_bill_inr": 4000, "property_type": "house", "customer_type": "residential"},
+      "new_details": ["customer_type", "property_type"]}, "home"),  # the type given after the bill
+    ({"lead": {"monthly_bill_inr": 4000, "system_size_kw": 5.0}, "new_details": ["monthly_bill_inr"]}, None),
+    ({"lead": {"monthly_bill_inr": 4000}, "new_details": ["monthly_bill_inr"], "support_case": True}, None),
+    ({"lead": {"monthly_bill_inr": 4000}, "new_details": ["monthly_bill_inr"], "contact_request": True}, None),
+    ({"lead": {"customer_type": "residential"}, "new_details": ["customer_type"]}, None),  # no bill yet
+    ({"lead": {"monthly_bill_inr": 4000, "customer_type": "residential"}, "new_details": ["name"]}, None),
+])
+def test_package_case(state, case):
+    assert package_case(state) == case
+
+
+def test_a_bill_turn_without_the_property_type_keeps_the_home_or_business_question():
+    # Without it, keep_one_question keeps the question for the next missing detail (the name) and drops this one
+    state = {"lead": {"monthly_bill_inr": 4000, "city": "Lucknow"}, "new_details": ["monthly_bill_inr"],
+             "intents": ["gives_details"]}
+    reply = "Thanks. Is the solar for a home or a business? Could you share your name and phone number?"
+    assert keep_one_question(reply, state) == ("Thanks. Is the solar for a home or a business?", True)
+    known = {**state, "lead": {**state["lead"], "customer_type": "residential"}}
+    assert keep_one_question(reply, known)[0] == "Thanks. Could you share your name and phone number?"
+
+
+def test_the_prompts_carry_the_package_rule():
+    system = load_prompt("system_prompt")
+    assert "A monthly bill alone never picks a package" in system
+    assert "which reference package fits their monthly bill" not in system  # the offer that invited the guess
+    rule = load_prompt("package_guidance_prompt")
+    assert rule.startswith(RULE) and "Property type: {property}." in rule
+    assert "{package_guidance}" in load_prompt("rag_prompt")
+    assert "fills customer_type: residential for a home" in load_prompt("lead_extraction_prompt")
+
+
+@pytest.mark.parametrize("message, intents, kind", [
+    ("My bill is about 4000 a month, it is for my home.", {"gives_details"}, "residential"),
+    ("home", {"reply_to_assistant"}, "residential"),  # the answer to "a home or a business?"
+    ("We live in a flat in Noida", {"gives_details"}, "residential"),
+    ("It is for our store", {"buying_interest"}, "commercial"),
+    ("The solar is for my office", {"gives_details"}, "commercial"),
+    ("my home office", {"gives_details"}, None),  # both kinds named: not guessed
+    ("My bill is 4000", {"gives_details"}, None),  # neither
+    ("Do you have a package for a business?", {"question"}, None),  # a plain question says nothing about theirs
+])
+def test_customer_type_from_words(message, intents, kind):
+    assert customer_type_from_words(message, intents) == ({"customer_type": kind} if kind else {})
+
+
+def test_a_home_the_extractor_missed_still_brings_the_home_packages():
+    # C7 run 1: "it's for my home" stored no type on the bill turn, so the reply searched twice and cited KB Section 8
+    agent = Scripted(answer("Thanks."))
+    graph, _ = make_graph(Scripted(understood(["gives_details", "buying_interest"], None, monthly_bill_inr="4000")),
+                          agent)
+    state = run(graph, "My bill is about 4000 a month, it's for my home.")
+    assert state["lead"]["customer_type"] == "residential"
+    assert state["steps"][0]["data"]["from_words"] == ["customer_type"]
+    assert len(state["chunks"]) == 2 and "Property type: home." in agent_input(agent)
+
+
+def test_the_words_never_replace_a_type_from_the_extractor_or_an_earlier_turn():
+    understand = Scripted(understood(["gives_details"], None, property_type="shop"),
+                          understood(["gives_details"], None, monthly_bill_inr="9000"))
+    graph, _ = make_graph(understand, Scripted(answer("Thanks.")))
+    first = run(graph, "It is my shop, next to my home")
+    assert first["lead"]["customer_type"] == "commercial" and first["steps"][0]["data"]["from_words"] == []
+    second = run(graph, "The bill is 9000, I mostly work from home")
+    assert second["lead"]["customer_type"] == "commercial" and second["steps"][0]["data"]["from_words"] == []

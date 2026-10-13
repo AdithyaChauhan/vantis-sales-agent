@@ -27,9 +27,9 @@ from langgraph.prebuilt import ToolNode
 
 from app.agent import welcome
 from app.agent.leads import (
-    LeadOps, changed_fields, confirmed_city, drop_known_city_question, fix_callback_claims, is_clock_time,
-    keep_one_question, lead_summary, merge_callback_time, own_details_question, pending_changes, remove_false_claims,
-    resolve_city, ruled_out_details, short_answer_details, status_block,
+    LeadOps, changed_fields, confirmed_city, customer_type_from_words, drop_known_city_question, fix_callback_claims,
+    is_clock_time, keep_one_question, lead_summary, merge_callback_time, own_details_question, package_case,
+    pending_changes, remove_false_claims, resolve_city, ruled_out_details, short_answer_details, status_block,
 )
 from app.agent.state import AgentState
 from app.agent.tools import make_tools, service_area_data, tool_step
@@ -133,6 +133,12 @@ def check_named_cities(names: list[str], areas_fn: Callable[[], ServiceAreas]) -
 def area_checks_text(checks: list[dict]) -> str:
     """The checks for the agent's message: one JSON line per city, the same data the tool returns."""
     return "\n".join(json.dumps(c) for c in checks)
+
+
+def package_guidance(case: str | None) -> str:
+    """The package rule for the agent's message on a bill turn (T13b: prompts/package_guidance_prompt.md with the
+    property type "home", "business" or "unknown"), or "" when the turn is not about packages (`package_case`)."""
+    return load_prompt("package_guidance_prompt").replace("{property}", case) if case else ""
 
 
 def tool_outcome_reply(scratch: list[BaseMessage]) -> str | None:
@@ -245,6 +251,11 @@ def build_graph(deps: AgentDeps):
         area_steps = [{"node": "area_check", "detail": f"{c['city']}: {c['status']}", "data": {"by": "code"}}
                       for c in checks]
         summary = deps.hints_fn().summaries.get(SERVICE_AREA_SECTION) if checks else None
+        # T13b: a home or a business named, with no customer type from the extractor or an earlier turn (C7 run 1:
+        # "it's for my home" stored nothing on the bill turn), like the T12a short answers
+        kind = ({} if clean.get("customer_type") or before.get("customer_type")
+                else customer_type_from_words(str(message), intents))
+        clean.update(kind)
         step = {
             "node": "understand",
             "detail": ("failed, raw message used" if degraded else "intents: " + ", ".join(out["intents"])),
@@ -256,6 +267,7 @@ def build_graph(deps: AgentDeps):
                 "invalid": sorted(errors),
                 "city_source": city_source,
                 "short_answer": sorted(short),
+                "from_words": sorted(kind),
                 "provider": out["provider"],
                 "model": out["model"],
                 "latency_ms": out["latency_ms"],
@@ -266,11 +278,14 @@ def build_graph(deps: AgentDeps):
         if not city and asked:  # two or more cities in question: none is guessed (T13a)
             lead.pop("city", None)
         new_details = changed_fields(before, lead)
-        # T13a: a monthly bill given this turn brings KB Section 9 (which reference package fits which need), so a
-        # package suggestion has its source even on a turn without a KB search (in C7 and C7b the number guard had
-        # to remove "…fits nicely with our 3 kW residential reference package")
-        bill_now = "monthly_bill_inr" in new_details and not support_case
-        guidance = deps.hints_fn().guidance if bill_now else []
+        # T13a: a monthly bill given this turn brings KB Section 9 (which reference package fits which need), so the
+        # packages named have their source even on a turn without a KB search (in C7 and C7b the number guard had to
+        # remove "…fits nicely with our 3 kW residential reference package"). T13b: only once the property type is
+        # known, since the reply then names every package for a home or a business; with the type still unknown it
+        # asks for it first (package_case), and the type given after the bill brings them too
+        packages = package_case({"lead": lead, "new_details": new_details, "support_case": support_case,
+                                 "contact_request": "contact_request" in intents})
+        guidance = deps.hints_fn().guidance if packages in ("home", "business") else []
         return {
             "intents": out["intents"],
             "search_query": out["search_query"],
@@ -334,7 +349,8 @@ def build_graph(deps: AgentDeps):
         return [
             SystemMessage(load_prompt("system_prompt")),
             *persisted[:-1],
-            rag_message(str(current.content), chunks, lead_progress, area_checks_text(state.get("area_checks", []))),
+            rag_message(str(current.content), chunks, lead_progress, area_checks_text(state.get("area_checks", [])),
+                        package_guidance(package_case(state))),
             *state.get("scratch", []),
         ]
 

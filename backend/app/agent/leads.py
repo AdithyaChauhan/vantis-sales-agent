@@ -49,6 +49,10 @@ NOTHING_MORE_LINE = "Nothing more is needed for the lead: answer and offer one n
 # T13a: a city the customer only asked about counts as theirs
 ASKED_CITY_LINE = "City: the one they asked about counts as theirs; never ask for it or confirm it again."
 MAX_CITY_CANDIDATES = 3
+# T13b: the property type's word in the package rule (KB Section 2: homes are residential, shops and offices commercial)
+PROPERTY_OF = {"residential": "home", "commercial": "business"}
+# The details that make a turn a package turn: the bill, or the property type given after it
+PACKAGE_DETAILS = {"monthly_bill_inr", "customer_type", "property_type"}
 # A question that asks for the city, or one that confirms a known city (drop_known_city_question, T13a)
 _CITY_ASK_RE = re.compile(
     r"\b(?:which|what)\s+(?:city|town|location|area)\b|\byour\s+(?:city|town|location)\b|\blocated\b|"
@@ -67,6 +71,12 @@ _QUESTION_RE = re.compile(r"[^.!?]*\?")
 _BARE_AMOUNT_RE = re.compile(r"^\s*(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?\s*(?:k|rs\.?|rupees|/-)?[\s.!]*$", re.I)
 _YES_RE = re.compile(r"^\s*(?:yes|yeah|yep|yup|sure|of course|it does|we do|yes,? it does|yes,? we do)[\s.!]*$", re.I)
 _NO_RE = re.compile(r"^\s*(?:no|nope|nah|naah|it doesn't|we don't|no,? it doesn't|no,? we don't)[\s.!]*$", re.I)
+# T13b: the kind of place a message names, for the customer type when the extractor gave none (Adithya's word lists)
+_HOME_WORDS_RE = re.compile(r"\b(?:home|house|flat|villa|apartment)\b", re.I)
+_BUSINESS_WORDS_RE = re.compile(r"\b(?:shop|office|store|business)\b", re.I)
+# Only a message about their own place: details, buying interest, a contact request or an answer to the assistant
+# (a plain question such as "do you have a package for a business?" says nothing about theirs)
+_OWN_PLACE_INTENTS = {"gives_details", "buying_interest", "contact_request", "reply_to_assistant"}
 # The detail a question asks about, by its words (only a question about one detail is read)
 _TOPIC_OF = {
     "bill": "bill", "roof": "roof", "rooftop": "roof", "kw": "size", "size": "size", "units": "usage",
@@ -113,6 +123,7 @@ _ITEM_WORDS = {
     "phone or email": ("phone", "number", "mobile", "email", "contact"),
     "issue": ("issue", "problem", "happening", "wrong"),
     "project details": ("system", "installed", "size", "details"),
+    "property type": ("home", "house", "business", "property", "shop", "office", "residential", "commercial"),
     **_DETAIL_WORDS,
 }
 
@@ -238,6 +249,19 @@ def short_answer_details(previous: object, message: str, details: dict) -> dict:
     return {}
 
 
+def customer_type_from_words(message: str, intents: set[str]) -> dict:
+    """The customer type from the words of a message about their own place, for when the extractor gave none (T13b,
+    like the T12a short answers): home, house, flat, villa or apartment -> residential; shop, office, store or
+    business -> commercial. Nothing when both kinds or neither are named. In C7 run 1 "it's for my home" stored no
+    type on the bill turn, so that turn could not bring the home packages."""
+    if not intents & _OWN_PLACE_INTENTS:
+        return {}
+    home, business = bool(_HOME_WORDS_RE.search(message)), bool(_BUSINESS_WORDS_RE.search(message))
+    if home == business:
+        return {}
+    return {"customer_type": "residential" if home else "commercial"}
+
+
 def merge_callback_time(old: str | None, new: str | None) -> str | None:
     """The customer's preferred callback time after this message (T12a). A new time replaces the old one,
     except that a day alone keeps the earlier hour and an hour alone keeps the earlier day:
@@ -281,6 +305,24 @@ def own_details_question(message: str) -> bool:
 def ruled_out_details(message: str) -> list[str]:
     """Details the customer rules out in a message: "anything else apart from timing?" -> ["timeline"]."""
     return [_DETAIL_OF_WORD[word.lower()] for word in _EXCEPT_RE.findall(message) if word.lower() in _DETAIL_OF_WORD]
+
+
+def package_case(state: dict) -> str | None:
+    """What the reply does about packages on this turn (T13b). KB Sections 8 and 9 describe the packages by
+    household use and give no bill ranges, so a bill alone never picks one (C7 got HomeStart 3 locally and
+    HomePro 5 on Render for the same message).
+
+    On a turn that gives the monthly bill, or the property type after it, while no system size is settled:
+    "home" or "business" (name every reference package for it) or "unknown" (ask whether it is a home or a
+    business first). None on any other turn, in a support case and on a contact request (name and phone first)."""
+    lead = state.get("lead", {})
+    if not lead.get("monthly_bill_inr") or lead.get("system_size_kw"):
+        return None
+    if state.get("support_case") or state.get("contact_request"):
+        return None
+    if not PACKAGE_DETAILS & set(state.get("new_details", [])):
+        return None
+    return PROPERTY_OF.get(lead.get("customer_type"), "unknown")
 
 
 def next_detail(state: dict, useful: list[str]) -> str | None:
@@ -418,9 +460,12 @@ def drop_known_city_question(reply: str, state: dict) -> tuple[str, list[str]]:
 
 
 def _wanted_item(state: dict) -> str | None:
-    """The detail the reply should ask for next, if any: the support request's next need, the lead's next
-    missing field once the customer showed interest, or after the save the next useful detail."""
+    """The detail the reply should ask for next, if any: whether the property is a home or a business on a bill turn
+    that doesn't know it yet (T13b), the support request's next need, the lead's next missing field once the
+    customer showed interest, or after the save the next useful detail."""
     lead = state.get("lead", {})
+    if package_case(state) == "unknown":
+        return "property type"
     if state.get("support_case") and not state.get("support_request_id"):
         missing = support_missing(lead, state.get("support", {}))
         return missing[0] if missing else None

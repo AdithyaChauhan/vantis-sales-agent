@@ -87,6 +87,10 @@ def test_rag_message():
     assert "What is {context}?" in message.content  # the customer's text is not expanded
     assert "{question}" not in message.content
     assert "<context>\n\n</context>" in rag_message("Hi", []).content  # empty context
+    # T13b: the package rule sits right after the context on a bill turn; on other turns its line goes
+    assert "</context>\n\nThe lead progress" in rag_message("Hi", []).content
+    with_rule = rag_message("Hi", [], package_guidance="<package_guidance>x</package_guidance>").content
+    assert "</context>\n\n<package_guidance>x</package_guidance>\n\nThe lead progress" in with_rule
 
 
 def test_cited_sections():

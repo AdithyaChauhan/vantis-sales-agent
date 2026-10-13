@@ -151,6 +151,18 @@ def cites(section: int) -> Check:
     return f"cites KB Section {section}", lambda r, c: f"[KB Section {section}:" in _reply(r)
 
 
+def cites_any(*sections: int) -> Check:
+    """At least one of `sections` is cited (T13b: KB Sections 8 and 9 both describe the packages)."""
+    label = " or ".join(str(s) for s in sections)
+    return f"cites KB Section {label}", lambda r, c: any(f"[KB Section {s}:" in _reply(r) for s in sections)
+
+
+def names_every(names: list[str]) -> Check:
+    """T13b: the reply names each of `names` (a bill turn lists the packages, it never picks one)."""
+    return (f"names {', '.join(names)}",
+            lambda r, c: all(name.lower() in without_tags(_reply(r)).lower() for name in names))
+
+
 def city_checked(status: str = "listed") -> Check:
     """The city check said `status`: the code's check before the model (T12b) or the model's tool call."""
     def check(response: dict, ctx: Context) -> bool:
@@ -229,14 +241,18 @@ def holdout_scenarios(questions: list[tuple[str, str]]) -> list[Scenario]:
 NEVER_NOT_SERVED = not_mentions(
     r"\b(?:do not|don't|does not|doesn't|cannot|can't|won't)\s+(?:serve|install|cover|operate)",
     "never says Vantis doesn't serve it")
+# KB Section 9's reference packages for a home: expected values, like PACKAGES in tests/test_live_chat.py (T13b)
+HOME_PACKAGES = ["HomeStart 3", "HomePro 5", "HomeMax 10"]
 
 
 def city_memory(sid: str, city: str, status: str) -> Scenario:
-    """T13a: a city the customer only asked about counts as theirs and is never asked for again."""
+    """T13a: a city the customer only asked about counts as theirs and is never asked for again. T13b: the bill turn
+    names every home package with a KB Section 8 or 9 tag (both describe the packages) instead of picking one."""
     return Scenario(sid, "edge", f"city memory: {city} asked about, then bill, then name and phone", [
         Turn(f"Do you install in {city}?", [city_checked(status), city_is(city), NEVER_NOT_SERVED, no_lead(), *COMMON]),
         Turn("My bill is about 4000 a month, it's for my home.",
-             [no_city_question(city), city_is(city), known("monthly_bill_inr"), no_lead(), *COMMON]),
+             [no_city_question(city), city_is(city), known("monthly_bill_inr"), known("customer_type"),
+              names_every(HOME_PACKAGES), cites_any(8, 9), no_lead(), *COMMON]),
         Turn("I'm Arjun, 9876543210", [no_city_question(city), lead_saved(), city_is(city), known("phone"), *COMMON]),
     ])
 

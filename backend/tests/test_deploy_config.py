@@ -10,13 +10,14 @@ LEFT_OUT = {
     "TEST_DATABASE_URL": "tests only",
     "KB_PATH": "ingest only; the PDF is not in the image",
     "LANGSMITH_API_KEY": "tracing is off; set it in the Dashboard if you turn it on",
-    "LANGSMITH_HIDE_INPUTS": "tracing is off on Render; T13 decides the privacy settings",
-    "LANGSMITH_HIDE_OUTPUTS": "tracing is off on Render; T13 decides the privacy settings",
-    "LANGSMITH_HIDE_METADATA": "tracing is off on Render; T13 decides the privacy settings",
+    "LANGSMITH_HIDE_INPUTS": "tracing stays off on Render (T13b); set it to true before turning tracing on",
+    "LANGSMITH_HIDE_OUTPUTS": "tracing stays off on Render (T13b); set it to true before turning tracing on",
+    "LANGSMITH_HIDE_METADATA": "tracing stays off on Render (T13b); set it to true before turning tracing on",
 }
-# Plain values meant to differ from backend/.env.example in production, and why (T13: CORS_ORIGINS)
+# Plain values meant to differ from backend/.env.example in production, and why
 PROD_DIFFERS: dict[str, str] = {
     "CLIENT_IP_HEADER": "Cloudflare sets CF-Connecting-IP on Render; local requests come through no proxy",
+    "CORS_ORIGINS": "the Vercel production URL; local runs use http://localhost:5173",
 }
 
 
@@ -75,3 +76,16 @@ def test_plain_values_match_env_example():
         if "value" not in item or key in PROD_DIFFERS or not example.get(key):
             continue
         assert str(item["value"]) == example[key], f"{key} differs between render.yaml and .env.example"
+
+
+def test_cors_allows_only_the_vercel_production_site():
+    # T13b: read with the backend's own parser, so a trailing slash, a "*", a preview URL or localhost fails here
+    value = env_vars()["CORS_ORIGINS"]["value"]
+    assert Settings(cors_origins=value).cors_origin_list == ["https://vantis-sales-agent.vercel.app"]
+
+
+def test_tracing_stays_off_on_render():
+    # T13b: no chat text goes to LangSmith from the live site
+    variables = env_vars()
+    assert variables["LANGSMITH_TRACING"]["value"] == "false"
+    assert "LANGSMITH_API_KEY" not in variables

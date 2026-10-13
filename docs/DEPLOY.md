@@ -208,11 +208,36 @@ https://vantis-sales-agent.vercel.app
 - **Not included:** Vercel's preview URLs (one per branch or commit, ending in `.vercel.app`) stay blocked on purpose. `http://localhost:5173` is not included either: local checks run `serve_test_branch` on the laptop, which reads `backend/.env`.
 - **Change it in `render.yaml`, not only in the Dashboard.** It is a plain `value` in the Blueprint, and Render's Blueprint docs say a sync "can create new environment variables or modify the values of existing ones", so a Dashboard-only edit could be overwritten on the next sync.
 
-The steps:
+The steps (1 and 2 done in T13b; `test_cors_allows_only_the_vercel_production_site` pins the value):
 1. `render.yaml`: set the `CORS_ORIGINS` value to the URL above.
 2. `backend/tests/test_deploy_config.py`: add `"CORS_ORIGINS"` to `PROD_DIFFERS` with the reason ("the Vercel production URL; local runs use http://localhost:5173"). That test compares `render.yaml` with `backend/.env.example`.
 3. Run the backend tests, commit (`/handoff`) and push.
-4. Auto Sync is on by default: Render applies the Blueprint change on the push and redeploys. Check the service's **Environment** page shows the new value. If the Blueprint's Auto Sync is off, click **Manual Sync** on the Blueprint's page.
+4. Auto Sync is on by default: Render applies the Blueprint change on the push and redeploys (Render's docs: "Each push to the linked branch that modifies your Blueprint file triggers a deploy of any added or modified resources"). To confirm after the push:
+   - **Blueprints** → `vantis-sales-agent` → **Settings**: **Auto Sync** says **Yes**, so there is nothing to click. Only if it says **No** (or the value below hasn't changed a few minutes after the push), click **Manual Sync** on the Blueprint's page.
+   - The service → **Environment**: `CORS_ORIGINS` is exactly `https://vantis-sales-agent.vercel.app`.
+   - The service → **Events**: the newest deploy, started after the push, is live. A push that also changes `backend/app` or `prompts` builds a new image anyway (`buildFilter`).
+   - The two curl checks below.
+
+Check what Render answers the browser (Git Bash). These are the browser's CORS preflights: the CORS middleware answers them before any route, so they use no AI call and don't count toward the chat limit.
+
+```bash
+BASE=https://vantis-sales-agent-api.onrender.com   # your URL from the Render Dashboard, no trailing slash
+curl -s "$BASE/api/health"   # wakes the service first (about 30 s if it was asleep): "status":"ok"
+
+# 1. The Vercel site is allowed
+curl -si -X OPTIONS "$BASE/api/chat" -H "Origin: https://vantis-sales-agent.vercel.app" \
+  -H "Access-Control-Request-Method: POST" -H "Access-Control-Request-Headers: content-type" \
+  | grep -iE "^HTTP|^access-control-allow-origin"
+# → status 200, and: access-control-allow-origin: https://vantis-sales-agent.vercel.app
+
+# 2. Any other site is still refused
+curl -si -X OPTIONS "$BASE/api/chat" -H "Origin: https://example.com" \
+  -H "Access-Control-Request-Method: POST" -H "Access-Control-Request-Headers: content-type" \
+  | grep -iE "^HTTP|^access-control-allow-origin|disallowed"
+# → status 400 and "Disallowed CORS origin", with no access-control-allow-origin line
+```
+
+If the first check still answers 400 while the Environment page shows the new value, the running instance started before the change: **Manual Deploy** → **Deploy latest commit**.
 
 ### 3. Checks after both deploys
 
