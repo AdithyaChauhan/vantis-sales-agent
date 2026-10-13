@@ -9,12 +9,15 @@ Run:
     python -m scripts.live_scenarios --group edge --base-url http://127.0.0.1:8001
     python -m scripts.serve_test_branch --port 8001 --slow-gemini      (restart the server for the drill)
     python -m scripts.live_scenarios --group slow --base-url http://127.0.0.1:8001
+    python -m scripts.live_scenarios --group replay --base-url http://127.0.0.1:8001   (T13c, about 25 model calls)
 
 Groups:
 - holdout: the 8 held-out questions (data/eval/holdout_eval.jsonl), one session each (assignment: unknown info)
 - edge: missing information, invalid information, an existing customer, off-topic then back on topic
 - slow: service failure; the server must run with --slow-gemini, and turns are 65 s apart so Groq's 8K tokens a
   minute can refill
+- replay: C8, chat 1 of Adithya's break-it test on the live site (T13c), without its three retry turns, then the
+  discount question
 
 For each turn it prints the reply and PASS or FAIL for each check, then a markdown table for docs/EVAL.md.
 The number check reads the whole KB (read-only, from DATABASE_URL): a reply may state only numbers the KB, the
@@ -32,7 +35,7 @@ from app.leads.validators import PHONE_INVALID
 from app.rag.answer import LLM_DOWN_REPLY, is_claim, split_sentences, without_tags
 from app.rag.numbers import known_numbers, number_mentions, unsupported
 
-PAUSE_S = {"holdout": 20, "edge": 20, "slow": 65}
+PAUSE_S = {"holdout": 20, "edge": 20, "slow": 65, "replay": 20}
 
 
 @dataclass
@@ -187,6 +190,60 @@ def no_city_question(city: str) -> Check:
     return "doesn't ask for the city again", check
 
 
+# T13c: the words of a question that asks for each detail
+_ASKS_FOR = {
+    "city": r"\b(?:city|town|located|location|where)\b",
+    "monthly_bill_inr": r"\bbill\b",
+    "name": r"\bname\b",
+    "phone": r"\b(?:phone|mobile|number)\b",
+    "customer_type": r"\b(?:home|house)\s+or\s+(?:an?\s+|your\s+)?(?:small\s+)?(?:business|shop|office)\b|"
+                     r"\bresidential\s+or\s+commercial\b|\bkind of (?:property|place)\b",
+}
+_HONEST_RE = re.compile(r"\b(?:can(?:'|’)?t|cannot|unable to)\s+confirm\b|\b(?:don(?:'|’)?t|do not)\s+have\s+"
+                        r"(?:any\s+)?(?:information|details)\b|\bnot sure\b|\bteam can\b", re.I)
+
+
+def _question_sentences(reply: str) -> list[str]:
+    return [without_tags(p) for line in reply.split("\n") for p in split_sentences(line) if without_tags(p).endswith("?")]
+
+
+def no_question_for_known() -> Check:
+    """T13c: no question asks for a detail the lead already has (chat 1 asked "house or small business?" right after
+    "the house is in Kanpur")."""
+    def check(response: dict, ctx: Context) -> bool:
+        known_fields = set(_lead(response).get("known_fields", []))
+        return not any(field in known_fields and re.search(pattern, q, re.I)
+                       for q in _question_sentences(_reply(response)) for field, pattern in _ASKS_FOR.items())
+    return "asks for nothing it already has", check
+
+
+def names_all_or_none(names: list[str]) -> Check:
+    """T13c: the reply names every one of `names` or none of them (chat 1's price answer named only HomePro 5)."""
+    def check(response: dict, ctx: Context) -> bool:
+        named = [n for n in names if n.lower() in without_tags(_reply(response)).lower()]
+        return len(named) in (0, len(names))
+    return f"names all of {', '.join(names)} or none", check
+
+
+def tool_ran_at_most_once(name: str) -> Check:
+    return f"{name} ran at most once", lambda r, c: len(_tool_details(r, name)) <= 1
+
+
+def callback_requested() -> Check:
+    return ("callback request logged",
+            lambda r, c: any(d in ("requested", "updated") for d in _tool_details(r, "schedule_callback"))
+            or _lead(r).get("callback_status") == "requested")
+
+
+def no_policy_on(word: str) -> Check:
+    """T13c: every sentence about `word` (which the KB never mentions) is a question or says it can't be confirmed or
+    that the team can tell; none states a policy either way."""
+    def check(response: dict, ctx: Context) -> bool:
+        sentences = [without_tags(p) for line in _reply(response).split("\n") for p in split_sentences(line)]
+        return all(s.endswith("?") or _HONEST_RE.search(s) for s in sentences if word in s.lower())
+    return f"states no {word} policy", check
+
+
 def support_saved() -> Check:
     return ("support request saved, id in the reply",
             lambda r, c: any(d.startswith("saved") for d in _tool_details(r, "create_support_request"))
@@ -290,6 +347,30 @@ EDGE = [
     ]),
     city_memory("C7", "Lucknow", "listed"),
     city_memory("C7b", "Raipur", "unverified"),
+]
+
+# T13c: chat 1 from Adithya's break-it test on the live site (13 Oct, 13:26-13:33 IST), without the three retry turns
+# ("house", "home", "home" after model failures), then the discount question from chat 2
+KNOWN = no_question_for_known()
+REPLAY = [
+    Scenario("C8", "replay", "chat 1 of the break-it test, then a discount", [
+        Turn("solar lagwana hai ghar par. kitna kharcha hoga",
+             [names_all_or_none(HOME_PACKAGES), no_amounts(), team_confirms(), KNOWN, no_lead(), *COMMON]),
+        Turn("my bill is 6k",
+             [known("monthly_bill_inr"), known("customer_type"), names_every(HOME_PACKAGES), cites_any(8, 9), KNOWN,
+              no_lead(), *COMMON]),
+        Turn("I'm Ravi, my number is 12345",
+             [not_known("phone"), mentions(r"phone|number|mobile", "asks for the phone again"), no_lead(),
+              no_saved_claim(), KNOWN, *COMMON]),
+        Turn("sorry, 9812345678",
+             [known("phone"), tool_ran_at_most_once("create_lead"), mentions(r"\bcity\b|\bwhere\b", "asks for the city"),
+              no_lead(), no_saved_claim(), KNOWN, *COMMON]),
+        Turn("actually the house is in Kanpur",
+             [lead_saved(), city_is("Kanpur"), known("customer_type"), KNOWN, *COMMON]),
+        Turn("call me tomorrow 5pm", [callback_requested(), known("intent_level"), KNOWN, *COMMON]),
+        Turn("can I get 20% discount?",
+             [no_policy_on("discount"), mentions(r"\bteam\b|\bsales\b", "offers the sales team"), KNOWN, *COMMON]),
+    ]),
 ]
 
 SLOW = [
@@ -405,14 +486,14 @@ def scenarios_for(group: str) -> list[Scenario]:
         from scripts.eval_retrieval import HOLDOUT_QUESTIONS, load_questions
 
         return holdout_scenarios([(q.id, q.question) for q in load_questions(HOLDOUT_QUESTIONS)])
-    return EDGE if group == "edge" else SLOW
+    return {"edge": EDGE, "slow": SLOW, "replay": REPLAY}[group]
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run one group against the server; print every reply, its checks and a markdown table."""
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Live T12b scenarios against a running serve_test_branch.")
-    parser.add_argument("--group", choices=("holdout", "edge", "slow"), required=True)
+    parser.add_argument("--group", choices=("holdout", "edge", "slow", "replay"), required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--pause", type=float, default=None, help="seconds between turns (default: by group)")
     parser.add_argument("--only", default=None, help="run one scenario id (e.g. C3a)")

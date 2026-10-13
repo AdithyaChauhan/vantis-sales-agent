@@ -39,6 +39,13 @@ _PROMISE_RE = re.compile(
 # "service areas" (T12b). Only text outside [KB Section ...] tags is changed, so the label stays exact.
 _TAG_OR_TEXT_RE = re.compile(r"(\[KB Section \d+(?::[^\[\]]*)?\])|([^\[]+|\[)")
 _REFERENCE_AREA_RE = re.compile(r"\breference\s+(?:service\s+)?(?:locations?|areas?)\b", re.IGNORECASE)
+# T13c: topics the KB never covers. A reply states no policy on them either way ("Vantis doesn't offer a specific
+# discount rate" answered "can I get 20% discount?"); it says it can't confirm and offers the sales team
+_UNCOVERED_RE = re.compile(r"\b(?:discounts?|coupons?|cashback|promo(?:tion)?s?|brands?|"
+                           r"(?:special|current|seasonal|festive|festival|ongoing)\s+offers?)\b", re.IGNORECASE)
+_CANT_CONFIRM_RE = re.compile(r"\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\s+confirm\b|"
+                              r"\b(?:don(?:'|’)?t|do not)\s+have\s+(?:any\s+)?(?:information|details)\b|"
+                              r"\bnot sure\b", re.IGNORECASE)
 
 
 def citation_label(chunk: RetrievedChunk) -> str:
@@ -150,6 +157,48 @@ def soften_promises(reply: str) -> tuple[str, int]:
     if count:
         logger.warning("reply promised a human action; softened", extra={"changed": count})
     return changed, count
+
+
+def _uncovered_topics(sentence: str, chunks: list[RetrievedChunk]) -> list[str]:
+    """The uncovered-topic words a sentence uses that no chunk of this turn mentions ("discount" with no KB text on
+    discounts)."""
+    found = []
+    for match in _UNCOVERED_RE.finditer(sentence):
+        word = r"\s+".join(re.escape(part) for part in match.group(0).lower().rstrip("s").split())
+        if not any(re.search(rf"\b{word}s?\b", c.content, re.IGNORECASE) for c in chunks):
+            found.append(match.group(0))
+    return found
+
+
+def remove_uncovered_policies(reply: str, chunks: list[RetrievedChunk], honest: str) -> tuple[str, list[str]]:
+    """A sentence that states something about discounts, coupons, cashback, promotions, special offers or brands,
+    when this turn's KB context never mentions that word, is replaced by `honest` (one line saying it can't be
+    confirmed, with the sales team; T13c). Questions and sentences that already say it can't be confirmed stay.
+    Returns (reply, the removed sentences). The system prompt asks for this; this is the net."""
+    lines, removed, replaced = [], [], False
+    for line in reply.split("\n"):
+        kept, dropped_last = [], False
+        for piece in split_sentences(line):
+            text = without_tags(piece)
+            if not text:  # tags alone follow the sentence before them
+                if piece.strip() and not dropped_last:
+                    kept.append(piece.strip())
+                continue
+            dropped_last = (not text.endswith("?") and not _CANT_CONFIRM_RE.search(text)
+                            and bool(_uncovered_topics(text, chunks)))
+            if dropped_last:
+                removed.append(text)
+                if not replaced:
+                    kept.append(honest)
+                    replaced = True
+            elif piece.strip():
+                kept.append(piece.strip())
+        indent = re.match(r"[ \t]*", line).group(0)
+        lines.append(indent + " ".join(kept) if kept else "")
+    if not removed:
+        return reply, []
+    logger.warning("reply stated a policy the KB doesn't cover; replaced", extra={"removed": len(removed)})
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip(), removed
 
 
 def plain_service_area_words(reply: str) -> tuple[str, int]:

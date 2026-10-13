@@ -48,6 +48,13 @@ SAVED_FALLBACK_TEXT = (
 )
 SUPPORT_SAVED_FALLBACK_TEXT = "I've saved your support request (id {id}); the Vantis team can follow up on it."
 CALLBACK_TIME_ASK = "What time would suit you for the call?"
+# T13c: what replaces a sentence that stated a policy on something the KB doesn't cover, such as discounts, offers or
+# brands (app/rag/answer.py, remove_uncovered_policies): never a policy either way
+UNCOVERED_TEXT = "I can't confirm that from the information I have; the Vantis sales team can tell you."
+# T13c: the reply when the all-or-none package guard (app/agent/packages.py) would leave nothing
+PACKAGES_FIT_TEXT = (
+    "Which reference package fits depends on your property and electricity use; a site assessment decides it."
+)
 STILL_NEEDED_ASK = "Could you share your {items}? Then I can pass your details to the sales team."
 SUPPORT_STILL_NEEDED_ASK = "Could you share your {items}? Then I can pass your request to the Vantis team."
 READY_TO_PASS_ASK = "Shall I pass your details to the sales team so they can follow up?"

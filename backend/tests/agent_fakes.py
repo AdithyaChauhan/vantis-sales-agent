@@ -86,9 +86,11 @@ class FakeSearch:
 
 
 def make_graph(
-    understand_llm, agent_llm, final_llm=None, search=None, small_to_big=False, checkpointer=None, ops=None
+    understand_llm, agent_llm, final_llm=None, search=None, small_to_big=False, checkpointer=None, ops=None,
+    agent_llm_without_create=None,
 ):
-    """The real graph with fakes. Returns (graph, search). ops: the leads database (lead tools on)."""
+    """The real graph with fakes. Returns (graph, search). ops: the leads database (lead tools on).
+    agent_llm_without_create: the model for the rest of a turn after create_lead could not save (T13c)."""
     search = search or FakeSearch()
     tools = make_tools(search, lambda: AREAS, lambda: HINTS, ops)
     deps = AgentDeps(
@@ -102,6 +104,7 @@ def make_graph(
         checkpointer=checkpointer or InMemorySaver(),
         small_to_big=small_to_big,
         ops=ops,
+        agent_llm_without_create=agent_llm_without_create,
     )
     return build_graph(deps), search
 

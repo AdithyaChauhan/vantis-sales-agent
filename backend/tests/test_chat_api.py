@@ -11,7 +11,7 @@ from app.main import app
 from app.rag.answer import LLM_DOWN_REPLY
 from tests.agent_fakes import FakeSearch, Scripted, answer, make_graph, understood
 
-CITED = "We offer Plan A [KB Section 8: Catalog]."
+CITED = "We offer Plan A and Plan B [KB Section 8: Catalog]."  # T13c: both fake packages (all or none)
 
 
 @pytest.fixture
@@ -338,8 +338,8 @@ def test_a_failed_lead_write_is_a_friendly_503_and_the_chat_carries_on(client, u
     details = {"name": "Rahul Sharma", "phone": "9876543210", "city": "Lucknow", "monthly_bill_inr": "4000"}
     graph, _ = make_graph(
         Scripted(understood(["gives_details"], None, **details), understood(["question"], "catalog")),
-        Scripted(tool_call("create_lead", {}), answer("We offer Plan A [KB Section 8: Catalog]."),
-                 answer("We offer Plan A [KB Section 8: Catalog].")),
+        Scripted(tool_call("create_lead", {}), answer(CITED),
+                 answer(CITED)),
         ops=LeadOps(engine=None, areas_fn=lambda: AREAS),
     )
     use_agent(graph=graph)

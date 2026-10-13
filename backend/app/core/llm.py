@@ -13,6 +13,10 @@ over a model that failed recently (SKIPS), so a slow Google day costs seconds, n
 Offline scripts (eval, seed; T12b) use the patient path instead: offline_understand_llm() and offline_reason_llm()
 (30 s per call, no skip list, the whole chain retried after a timeout, 429 or 5xx) and Embedder.embed_queries
 (batched, with HTTP retries like ingest). Only the chat stays fail-fast.
+
+Tracing (T13c, on the laptop only): every model attempt, skipped model and query embedding is its own LangSmith run
+(langsmith's traceable), nested in the graph step that made it. With LANGSMITH_TRACING off (tests, Render) traceable
+just calls the function.
 """
 import contextvars
 import logging
@@ -34,6 +38,8 @@ from langchain_core.messages import BaseMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 
 from app.core.config import Settings, get_settings
 
@@ -79,6 +85,9 @@ QUEUE_WARN_S = 0.5
 # tokens too) for 60 s, a server error for 120 s.
 SKIP_SECONDS = {"timeout": 60, "429": 60, "5xx": 120}
 _TIMEOUT_ERRORS = (TimeoutError, httpx.TimeoutException, groq.APITimeoutError, ModelTimeoutError)
+# A provider's error type or code is logged only when it looks like an identifier ("tool_use_failed",
+# "INVALID_ARGUMENT"), so no message text (which can quote the customer) ever reaches the log (T13c)
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 _deadline_pool = ThreadPoolExecutor(max_workers=DEADLINE_WORKERS, thread_name_prefix="llm-deadline")
 
@@ -124,6 +133,32 @@ def failure_kind(exc: BaseException) -> str | None:
     return None
 
 
+def error_detail(exc: BaseException) -> dict:
+    """The provider's HTTP status and its error type or code, from the error or one it was raised from, never the
+    message text (T13c: Groq's "400 Bad Request" on understand showed no cause). Groq keeps them in the JSON body
+    ({"error": {"type", "code"}}); google-genai has `code` (the status) and `status` (e.g. INVALID_ARGUMENT).
+    {} when no error in the chain came from a provider."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        status = getattr(exc, "status_code", None)  # Groq (and httpx)
+        if isinstance(status, int):
+            body = getattr(exc, "body", None)
+            error = body.get("error") if isinstance(body, dict) else None
+            found = {"error_status": status}
+            if isinstance(error, dict):
+                found |= {f"error_{key}": str(error[key]) for key in ("type", "code")
+                          if error.get(key) and _IDENTIFIER_RE.match(str(error[key]))}
+            return found
+        code = getattr(exc, "code", None)  # google-genai
+        if isinstance(code, int):
+            status_name = getattr(exc, "status", None)
+            ok = isinstance(status_name, str) and _IDENTIFIER_RE.match(status_name)
+            return {"error_status": code, **({"error_type": status_name} if ok else {})}
+        exc = exc.__cause__ or exc.__context__
+    return {}
+
+
 def failures_before_skip(use: str, kind: str) -> int:
     """How many failures in a row of one model and use open its skip window.
 
@@ -139,33 +174,46 @@ def failures_before_skip(use: str, kind: str) -> int:
     return 1
 
 
+def skip_scope(use: str, kind: str) -> str | None:
+    """Which uses a failure's window covers (T13c): a timeout only the use that timed out (None: every use).
+
+    A timeout says the call was slow for that job; a 429 or 5xx says the model itself is out of quota or failing.
+    In the Render logs of 13 Oct (08:00-08:01 UTC) one understand timeout on the main model skipped it for the
+    answer too, and one on the fast model left the answer with no model at all, though that call answered 3 s later.
+    """
+    return use if kind == "timeout" else None
+
+
 class SkipList:
     """Models that failed recently and are skipped until their window ends (in memory, one process, like
-    the rate limiter). The window is per model, for every use; the count of failures in a row is per model
-    and use, and a success of that use resets it."""
+    the rate limiter). A timeout's window covers its use only, a 429's or 5xx's every use (skip_scope); the
+    count of failures in a row is per model and use, and a success of that use resets it."""
 
     def __init__(self, clock: Callable[[], float] = time.monotonic):
         self._clock = clock
-        self._until: dict[str, float] = {}  # model key -> clock time the skip ends
+        # (model key, use or None for every use) -> clock time the skip ends
+        self._until: dict[tuple[str, str | None], float] = {}
         self._streak: dict[tuple[str, str], int] = {}  # (model key, use) -> failures in a row
         self._lock = threading.Lock()
 
-    def left(self, key: str) -> float:
-        """Seconds until the model may be tried again (0: try it now)."""
+    def left(self, key: str, use: str) -> float:
+        """Seconds until the model may be tried again for this use (0: try it now)."""
         with self._lock:
-            return max(0.0, self._until.get(key, 0.0) - self._clock())
+            until = max(self._until.get((key, None), 0.0), self._until.get((key, use), 0.0))
+            return max(0.0, until - self._clock())
 
     def failed(self, key: str, use: str, kind: str) -> bool:
         """Count a timeout, 429 or 5xx; open the model's window once enough happened in a row. True if it opened."""
+        scope = skip_scope(use, kind)
         with self._lock:
             streak = self._streak.get((key, use), 0) + 1
             if streak < failures_before_skip(use, kind):
                 self._streak[(key, use)] = streak
                 return False
             self._streak[(key, use)] = 0
-            self._until[key] = self._clock() + SKIP_SECONDS[kind]
+            self._until[(key, scope)] = self._clock() + SKIP_SECONDS[kind]
         logger.warning("llm marked down", extra={"model": key, "use": use, "skip_reason": kind,
-                                                 "skip_s": SKIP_SECONDS[kind]})
+                                                 "skip_s": SKIP_SECONDS[kind], "skip_scope": scope or "all"})
         return True
 
     def succeeded(self, key: str, use: str) -> None:
@@ -187,7 +235,7 @@ class NoSkips(SkipList):
     """The offline scripts' skip list: never skips a model. They wait and retry instead (patient), because a
     script has no customer waiting and a skipped model would only make the next retry fail at once."""
 
-    def left(self, key: str) -> float:
+    def left(self, key: str, use: str) -> float:
         return 0.0
 
     def failed(self, key: str, use: str, kind: str) -> bool:
@@ -218,6 +266,35 @@ def patient(chain: Runnable, waits: tuple[float, ...] = OFFLINE_WAITS_S,
         raise AssertionError("unreachable")
 
     return RunnableLambda(call, name="patient")
+
+
+# ---------- tracing (T13c) ----------
+
+def note_failure(exc: BaseException) -> None:
+    """Add why a call failed (timeout, 429, 5xx or the error's type, plus error_detail) to the current LangSmith run's
+    metadata. Does nothing when tracing is off."""
+    run = get_current_run_tree()
+    if run is not None:
+        run.add_metadata({"failure": failure_kind(exc) or type(exc).__name__, **error_detail(exc)})
+
+
+def _embedding_inputs(inputs: dict) -> dict:
+    return {"text": inputs.get("text")}
+
+
+def _embedding_outputs(vector: Any) -> dict:
+    return {"dimensions": len(vector) if isinstance(vector, list) else None}
+
+
+@traceable(run_type="embedding", name="query embedding", process_inputs=_embedding_inputs,
+           process_outputs=_embedding_outputs)
+def _traced_embedding(embed: Callable[[], list[float]], text: str) -> list[float]:
+    """embed(), as its own LangSmith run (the question, the vector's length, the failure reason)."""
+    try:
+        return embed()
+    except Exception as exc:
+        note_failure(exc)
+        raise
 
 
 # ---------- embeddings ----------
@@ -259,14 +336,18 @@ class Embedder:
         return list(self._query_cache(text))
 
     def _embed_query_uncached(self, text: str) -> tuple[float, ...]:
-        """One attempt, cut off after QUERY_TIMEOUT_S; skipped after 2 failures in a row (T12a)."""
+        """One attempt, cut off after QUERY_TIMEOUT_S; skipped after 2 failures in a row (T12a). Traced as its own
+        run when tracing is on (T13c)."""
         key = f"gemini-embed:{self.model}"
-        left = SKIPS.left(key)
+        left = SKIPS.left(key, "embed")
         if left:
             logger.info("llm skipped", extra={"model": key, "use": "embed", "skip_left_s": round(left)})
             raise EmbeddingError(f"query embedding skipped for {round(left)} s")
         try:
-            vector = call_with_deadline(lambda: self._embed([query_text(text)], QUERY_HTTP)[0], QUERY_TIMEOUT_S)
+            vector = _traced_embedding(
+                lambda: call_with_deadline(lambda: self._embed([query_text(text)], QUERY_HTTP)[0], QUERY_TIMEOUT_S),
+                text, langsmith_extra={"name": f"embed: {key}", "metadata": {"model": key, "use": "embed",
+                                                                            "deadline_s": QUERY_TIMEOUT_S}})
         except Exception as exc:
             kind = failure_kind(exc)
             if kind:
@@ -327,6 +408,11 @@ GEMINI_MIN_TIMEOUT_S = 10
 GEMINI_CHAT_HTTP = types.HttpOptions(
     timeout=GEMINI_MIN_TIMEOUT_S * 1000, retry_options=types.HttpRetryOptions(attempts=1)
 )
+# Automatic function calling off (T13c). google-genai runs it by default and logs "AFC is enabled with max remote
+# calls: 10" on every call. It can only run Python functions passed as tools, and LangChain passes function
+# declarations, so it never ran anything; turned off, the SDK makes exactly one request per call and the
+# graph's ToolNode stays the only thing that runs tools.
+AFC_OFF = types.AutomaticFunctionCallingConfig(disable=True)
 # Wall-clock deadlines per use (T12a). Understand and the reason are small calls (the main model answered
 # understand in at most 1.9 s in T10b, so 4 s is twice that); an answer is longer and may call tools. Groq is
 # the answer's last resort, so it gets more room.
@@ -352,7 +438,7 @@ class LLMReply:
 
 class GeminiChat(ChatGoogleGenerativeAI):
     """ChatGoogleGenerativeAI that sends our timeout and retry rules (request_http, by default
-    GEMINI_CHAT_HTTP) with every request.
+    GEMINI_CHAT_HTTP) and automatic function calling off (AFC_OFF, T13c) with every request.
 
     bind_tools() drops bound http_options and with_structured_output() rejects them, so they are added
     here, where every call (plain, tools, structured output) builds its request. This relies on a private
@@ -363,6 +449,7 @@ class GeminiChat(ChatGoogleGenerativeAI):
 
     def _prepare_request(self, messages, **kwargs):
         kwargs.setdefault("http_options", self.request_http)
+        kwargs.setdefault("automatic_function_calling", AFC_OFF)
         return super()._prepare_request(messages, **kwargs)
 
 
@@ -411,12 +498,49 @@ def tokens_of(result: Any) -> int | None:
     return usage.get("total_tokens")
 
 
+def _attempt_inputs(inputs: dict) -> dict:
+    """An attempt run's input in LangSmith: the prompt messages (not the model object or the config)."""
+    return {"messages": inputs.get("messages")}
+
+
+def _attempt_outputs(result: Any) -> dict:
+    """An attempt run's output in LangSmith: the answer (structured: the parsed value) and its total tokens."""
+    if isinstance(result, dict) and "parsed" in result:
+        parsed = result["parsed"]
+        output = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
+    else:
+        output = result
+    return {"output": output, "tokens": tokens_of(result)}
+
+
+@traceable(name="llm attempt", process_inputs=_attempt_inputs, process_outputs=_attempt_outputs)
+def _attempt(candidate: Candidate, messages: Any, config: RunnableConfig | None = None) -> Any:
+    """One model's attempt, cut off at its deadline; raises on any failure, including unparsable structured output.
+
+    With tracing on (T13c) it is a LangSmith run named "<use>: <model key>", with the deadline in its metadata and,
+    when it fails, the reason (note_failure); the provider's own run (prompt, output, tokens) nests inside it."""
+    try:
+        result = call_with_deadline(lambda: candidate.model.invoke(messages, config), candidate.seconds)
+        if isinstance(result, dict) and "parsed" in result and result["parsed"] is None:
+            raise LLMError("structured output could not be parsed")
+    except Exception as exc:
+        note_failure(exc)
+        raise
+    return result
+
+
+@traceable(name="llm skipped")
+def _skipped(key: str, use: str, left_s: int) -> dict:
+    """A model passed over because of its skip window, as a LangSmith run, so a trace shows why it was not tried."""
+    return {"skipped_for_s": left_s}
+
+
 def model_chain(candidates: list[Candidate], skips: SkipList | None = None) -> Runnable:
     """Try the candidates in order, one attempt each with its own deadline, and return the first answer.
 
-    A model inside its skip window is passed over at once; a timeout, 429 or 5xx counts towards opening its
-    window (failures_before_skip). Unparsable structured output goes to the next model without counting.
-    Raises LLMError when every candidate failed or was skipped (with none configured, when called).
+    A model inside its skip window for this use is passed over at once; a timeout, 429 or 5xx counts towards
+    opening its window (failures_before_skip, skip_scope). Unparsable structured output goes to the next model
+    without counting. Raises LLMError when every candidate failed or was skipped (with none configured, when called).
     """
 
     def call(messages, config: RunnableConfig) -> Any:
@@ -425,21 +549,21 @@ def model_chain(candidates: list[Candidate], skips: SkipList | None = None) -> R
             raise LLMError("no LLM configured: set GOOGLE_API_KEY and/or GROQ_API_KEY + FALLBACK_MODEL")
         first_error: Exception | None = None
         for c in candidates:
-            left = skip_list.left(c.key)
+            run = {"name": f"{c.use}: {c.key}", "metadata": {"model": c.key, "use": c.use, "deadline_s": c.seconds}}
+            left = skip_list.left(c.key, c.use)
             if left:
                 logger.info("llm skipped", extra={"model": c.key, "use": c.use, "skip_left_s": round(left)})
+                _skipped(c.key, c.use, round(left), langsmith_extra={**run, "name": f"{run['name']} (skipped)"})
                 first_error = first_error or LLMError(f"{c.key} skipped for {round(left)} s")
                 continue
             start = time.perf_counter()
             try:
-                result = call_with_deadline(lambda c=c: c.model.invoke(messages, config), c.seconds)
-                if isinstance(result, dict) and "parsed" in result and result["parsed"] is None:
-                    raise LLMError("structured output could not be parsed")
+                result = _attempt(c, messages, config=config, langsmith_extra=run)
             except Exception as exc:
                 kind = failure_kind(exc)
                 logger.warning("llm call failed", extra={
                     "model": c.key, "use": c.use, "failure": kind or type(exc).__name__,
-                    "latency_ms": round((time.perf_counter() - start) * 1000),
+                    "latency_ms": round((time.perf_counter() - start) * 1000), **error_detail(exc),
                 })
                 if kind:
                     skip_list.failed(c.key, c.use, kind)
@@ -453,7 +577,8 @@ def model_chain(candidates: list[Candidate], skips: SkipList | None = None) -> R
             return result
         raise LLMError(f"every model failed or was skipped ({type(first_error).__name__})") from first_error
 
-    return RunnableLambda(call, name="model_chain")
+    use = candidates[0].use if candidates else "none"
+    return RunnableLambda(call, name=f"model_chain:{use}")
 
 
 def _gemini(model: str, settings: Settings, use: str, seconds: float, tools=None, schema=None) -> Candidate:

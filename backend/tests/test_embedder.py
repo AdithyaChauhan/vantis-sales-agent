@@ -154,10 +154,10 @@ def test_one_failure_does_not_skip_the_embedder_but_two_in_a_row_do():
     key = "gemini-embed:fake-model"
     with pytest.raises(EmbeddingError):
         embedder.embed_query("first")
-    assert llm.SKIPS.left(key) == 0  # one blip costs one fallback, not the whole window
+    assert llm.SKIPS.left(key, "embed") == 0  # one blip costs one fallback, not the whole window
     with pytest.raises(EmbeddingError):
         embedder.embed_query("second")
-    assert llm.SKIPS.left(key) > 0  # two in a row: skipped for a while
+    assert llm.SKIPS.left(key, "embed") > 0  # two in a row: skipped for a while
     with pytest.raises(EmbeddingError, match="skipped"):
         embedder.embed_query("third")
     assert len(client.calls) == 2  # the skipped query never reached the API
@@ -170,7 +170,7 @@ def test_a_success_resets_the_embedders_count():
             embedder.embed_query(text)
         except EmbeddingError:
             pass
-    assert llm.SKIPS.left("gemini-embed:fake-model") == 0
+    assert llm.SKIPS.left("gemini-embed:fake-model", "embed") == 0
 
 
 def test_embedder_without_key_raises(monkeypatch):

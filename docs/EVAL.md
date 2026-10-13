@@ -687,3 +687,34 @@ Written by hand on 2026-10-13. The turn-2 message of C7 got HomeStart 3 locally 
 - **Unknown:** whether the customer type on turn 2 came from the extractor or from the word fallback. The script doesn't print the step data (`from_words`).
 - **Not run:** C7 a second time (after run 1 Adithya chose one C7 and one C7b), the "type unknown" path (fakes only), and the other scenarios.
 - **LLM requests:** 26 (run 1: 10, including two search rounds; then 8 and 8), plus 5 query embeddings, against a budget of about 25. All on gemini-3.5-flash-lite; none failed.
+
+## T13c: chat 1 of Adithya's break-it test, replayed with tracing (live, `live_scenarios --group replay`, `serve_test_branch --port 8001`)
+
+Written by hand on 2026-10-13. Chat 1 on the live site (13:26–13:33 IST) without its three retry turns ("house", "home", "home" after model failures), then chat 2's discount question, in one session (scenario C8). Server: `LANGSMITH_TRACING=true LANGSMITH_PROJECT=vantis-t13c-replay python -m scripts.serve_test_branch --port 8001`. The table was built from the LangSmith traces (each turn's understand run, its model attempt, the tool runs and finalize's output). The phone number is masked; name and city are the replay's own test values.
+
+| Turn | Customer | What the AI pulled out (understand) | What code added | State after | Tools and results | Reply (short) | Time |
+|---|---|---|---|---|---|---|---|
+| 1 | solar lagwana hai ghar par. kitna kharcha hoga | intents buying_interest, question; query "Pricing reference packages and cost estimation"; customer_type residential, property_type house, intent interested, requirement | the search found one home package row (HomeMax 10) and one business row; **the 3 missing KB Section 9 rows joined the context** (`added_package_rows` 3) | home, house, interested; missing: city, name, phone | none (KB search in code: 4 chunks) | cost depends on size, equipment, site and more, a consultation sets the price [KB 5]; home reference options 1. HomeStart 3 2. HomePro 5 3. HomeMax 10 [KB 9]; asks the city | 6.4 s |
+| 2 | my bill is 6k | gives_details, buying_interest; bill "6k" (type and intent repeated) | bill validated as 6000; a package turn for a home, so the KB Section 9 rows and the package rule joined the context | + bill 6000; missing: city, name, phone | none | the three home packages with their KB descriptions [KB 9]; a site assessment decides; asks the city | 3.0 s |
+| 3 | I'm Ravi, my number is 12345 | gives_details; name, phone "12345" | phone rejected by the validator, never stored | + name; missing: city, phone | none | the validator's message (not a 10-digit Indian mobile number); asks for the phone again | 2.5 s |
+| 4 | sorry, 9812345678 | reply_to_assistant, gives_details; phone | phone valid (stored as +91 98xxxxxx78); **after create_lead's "missing: city", the next model call had no create_lead** (`create_lead_offered: false`) | + phone; missing: city | create_lead → `{"saved": false, "missing": ["city"]}`, **once** | "Could you please let me know which city your property is in?" | 4.4 s |
+| 5 | actually the house is in Kanpur | gives_details, reply_to_assistant; city Kanpur | city check in code: Kanpur listed; city_source stated | + city; **lead 1 saved: 63 WARM** | create_lead → saved (8 fields) | "Vantis currently covers Kanpur [KB 10]. I have saved your details, and the sales team can follow up with you. What time would suit you best for a callback?" | 4.4 s |
+| 6 | call me tomorrow 5pm | buying_interest, contact_request; callback_time "tomorrow 5pm" | the T12a callback guard rewrote the callback sentence to what was logged | callback requested; score unchanged (63 WARM) | schedule_callback → logged, requested, "tomorrow 5pm" | "I've logged a callback request for tomorrow 5pm; the team will confirm it." + asks about usable roof space | 4.2 s |
+| 7 | can I get 20% discount? | question; query "Pricing discounts and offers" | none; no guard fired (no chunk mentions discounts, and the reply stated no policy) | unchanged | none (KB search in code: 4 chunks) | "I can't confirm any discounts from the information I have, and the Vantis team can confirm it after a consultation [KB 5]"; asks the timeline | 3.7 s |
+
+**Expected, and seen:**
+- No question asked for something already given: `no_question_for_known` passed on all 7 turns, and C8 passed every check (7 of 7 turns).
+- The lead saved on the Kanpur turn.
+- Ravi's intent counts as interested: 63 WARM = intent 15 + bill 20 + Kanpur listed 20 + phone 6 + property partly known 2. On the live site it was 48 with the intent unknown.
+
+**What this run did not show:**
+- Google was healthy (every call answered by gemini-3.5-flash-lite, 1.0–2.0 s), so the extractor itself gave the home type and "interested" on turn 1.
+- These new code paths did not fire live, and are covered by the tests with fake models only: `from_words` (place words), `intent_from_chat`, the type guard (`dropped`), the all-or-none package guard and the discount guard.
+- Also covered by tests only: the skip-by-job change, Groq's error code in the log and the 08:00 sequence (`tests/test_llm.py`).
+- Turn 4 (one create_lead, then a call without it) and turn 1 (the missing package rows) are the new code paths this run did exercise.
+
+**Also checked:**
+- The server log had no "AFC is enabled" line.
+- Calls: 18 model calls (7 understand, 10 answer, 1 lead reason after turn 5), none failed or skipped, plus the query embeddings. Budget was about 40.
+- LangSmith shows each turn as the graph steps (understand, retrieve, agent, tools, finalize), with `model_chain:<use>` → `<use>: gemini:<model>` (model, use, deadline; output and tokens) → the provider's own run nested in them, and an `embed: …` run inside retrieve.
+- "How I answered" on the "12345" turn: 2 steps, understand ("intents: gives_details") and the model call ("gemini", 1.0 s). Both have a label and a detail, so the 2 "empty" steps in Adithya's copy were the closed panel. Not changed.

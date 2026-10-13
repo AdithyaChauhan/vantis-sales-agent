@@ -13,6 +13,7 @@ from app.rag.answer import (
     format_context,
     pick_sources,
     is_claim,
+    remove_uncovered_policies,
     soften_promises,
     strip_tool_citations,
     strip_unsourced_citations,
@@ -270,3 +271,51 @@ def test_every_model_reads_the_checklist_last_and_offers_stay_answerable():
     system = load_prompt("system_prompt")
     assert "what each part covers" not in system  # an offer the KB can't answer (T12a run 3)
     assert "never \"reference locations\"" in system
+
+
+# ---------- T13c: no policy, either way, on what the KB doesn't cover ----------
+
+HONEST = "I can't confirm that from the information I have; the Vantis sales team can tell you."
+PRICE_CHUNK = RetrievedChunk("s05-pricing", 5, "Pricing", 2, "prose", "There is no single fixed price.")
+
+
+def test_a_discount_policy_the_kb_never_states_is_replaced():
+    # Chat 2: "can I get 20% discount?" got "Vantis doesn't offer a specific discount rate"; the KB never mentions one
+    reply = ("Vantis doesn't offer a specific discount rate [KB Section 5: Pricing]. Prices depend on your site. "
+             "Would you like a callback?")
+    kept, removed = remove_uncovered_policies(reply, [PRICE_CHUNK], HONEST)
+    assert kept == f"{HONEST} Prices depend on your site. Would you like a callback?"
+    assert removed == ["Vantis doesn't offer a specific discount rate."]
+
+
+@pytest.mark.parametrize("sentence", [
+    "Yes, you can get a 10% discount on your first order.",
+    "We have a festive offer running this month.",
+    "Vantis uses only Tier-1 panel brands.",
+    "There are no coupons or cashback deals.",
+])
+def test_either_way_is_a_policy(sentence):
+    kept, removed = remove_uncovered_policies(sentence, [PRICE_CHUNK], HONEST)
+    assert (kept, removed) == (HONEST, [sentence])
+
+
+@pytest.mark.parametrize("reply", [
+    "I can't confirm discounts from the information I have; the Vantis sales team can tell you.",
+    "I don't have any information on brands, but the team can check.",
+    "Would you like the sales team to tell you about any discounts?",  # a question states no policy
+    "Prices depend on your site and the team confirms them after an assessment.",  # no uncovered topic
+])
+def test_honest_sentences_and_questions_stay(reply):
+    assert remove_uncovered_policies(reply, [PRICE_CHUNK], HONEST) == (reply, [])
+
+
+def test_a_topic_the_context_covers_is_left_alone():
+    chunk = RetrievedChunk("s05-offers", 5, "Pricing", 2, "prose", "Seasonal discounts may apply in some cities.")
+    reply = "Seasonal discounts may apply in some cities [KB Section 5: Pricing]."
+    assert remove_uncovered_policies(reply, [chunk], HONEST) == (reply, [])
+
+
+def test_two_policy_sentences_give_one_honest_line():
+    reply = "We don't offer discounts. Our brand partners are confidential.\nAnything else?"
+    kept, removed = remove_uncovered_policies(reply, [], HONEST)
+    assert kept == f"{HONEST}\nAnything else?" and len(removed) == 2

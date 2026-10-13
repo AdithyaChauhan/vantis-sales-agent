@@ -122,3 +122,45 @@ def test_no_city_question_check():
     assert fn(response("Thanks. What is your monthly bill?"), None)
     assert not fn(response("Thanks. Is the property in Lucknow?"), None)
     assert not fn(response("Which city is your home in?"), None)
+
+
+# ---------- T13c: the replay group (C8, chat 1 of the break-it test) ----------
+
+def test_no_question_for_known_check():
+    _, fn = live.no_question_for_known()
+    home = {"id": None, "known_fields": ["customer_type", "city"]}
+    assert not fn(response("Thanks! Is it for a house or a small business?", lead=home), None)  # chat 1
+    assert not fn(response("Which city is your home in?", lead=home), None)
+    assert fn(response("Could you share your name and phone number?", lead=home), None)
+    assert fn(response("Is it for a home or a business?", lead={"known_fields": ["city"]}), None)
+    assert not fn(response("Could you share your phone number?", lead={"known_fields": ["phone"]}), None)
+
+
+def test_names_all_or_none_check():
+    _, fn = live.names_all_or_none(live.HOME_PACKAGES)
+    assert fn(response("Prices depend on a site assessment."), None)
+    assert fn(response("HomeStart 3, HomePro 5 and HomeMax 10 are the home packages."), None)
+    assert not fn(response("For higher use, the HomePro 5 is a reference option."), None)  # chat 1, turn 1
+
+
+def test_tool_count_callback_and_policy_checks():
+    create = {"node": "tool", "name": "create_lead", "detail": "missing: city", "data": {}}
+    assert ok(live.tool_ran_at_most_once("create_lead"), response("", steps=[create]))
+    assert not ok(live.tool_ran_at_most_once("create_lead"), response("", steps=[create, create]))  # chat 1
+    callback = {"node": "tool", "name": "schedule_callback", "detail": "requested", "data": {}}
+    assert ok(live.callback_requested(), response("", steps=[callback]))
+    assert not ok(live.callback_requested(), response("", lead={"callback_status": None}))
+    _, policy = live.no_policy_on("discount")
+    assert not policy(response("Vantis doesn't offer a specific discount rate."), None)  # chat 2
+    assert policy(response("I can't confirm a discount; the Vantis sales team can tell you."), None)
+    assert policy(response("Would you like the team to tell you about discounts?"), None)
+
+
+def test_the_replay_group_is_chat_1_then_the_discount():
+    [c8] = live.scenarios_for("replay")
+    assert [t.message for t in c8.turns] == [
+        "solar lagwana hai ghar par. kitna kharcha hoga", "my bill is 6k", "I'm Ravi, my number is 12345",
+        "sorry, 9812345678", "actually the house is in Kanpur", "call me tomorrow 5pm", "can I get 20% discount?"]
+    assert all(any(name == "asks for nothing it already has" for name, _ in t.checks) for t in c8.turns)
+    ids = [s.id for s in live.EDGE + live.SLOW + live.REPLAY]
+    assert len(ids) == len(set(ids))

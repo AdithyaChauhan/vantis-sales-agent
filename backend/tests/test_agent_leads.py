@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.agent import welcome
 from app.agent.leads import (
-    ASKED_CITY_LINE, ASKED_WHAT_LINE, INTEREST_LINE, SAVED_INFO_LINE, LeadOps, card_fields, confirmed_city,
+    ASKED_CITY_LINE, ASKED_WHAT_LINE, INTEREST_LINE, SAVED_INFO_LINE, LeadOps, card_fields, chat_intent, confirmed_city,
     details_named, drop_known_city_question, fix_callback_claims, is_clock_time, merge_callback_time,
     remove_false_claims, resolve_city, ruled_out_details, short_answer_details, status_block,
 )
@@ -790,3 +790,52 @@ def test_the_city_guard_keeps_the_removed_sentence_in_its_step(ops):
     [guard] = [s for s in state["steps"] if s["detail"] == "removed a question about a city it already has"]
     assert guard["data"]["removed"] == ["Is the property in Lucknow?"]
     assert state["reply"] == "Thanks! " + welcome.STILL_NEEDED_ASK.format(items="name and phone number")
+
+
+# ---------- T13c: create_lead once a turn when it can't save; the intent from the chat ----------
+
+def test_create_lead_is_offered_once_a_turn_when_it_cannot_save(ops):
+    # Chat 1, "sorry, 9812345678": create_lead ran twice in one turn, "missing: city" both times (13.4 s)
+    understand_llm = Scripted(understood(["gives_details"], None, name="Ravi", phone="9812345678",
+                                         monthly_bill_inr="6000"))
+    agent = Scripted(tool_call("create_lead", {}), tool_call("create_lead", {}, "c2"))  # it would call it again
+    without_create = Scripted(answer("Thanks, Ravi. Which city is the house in?"))
+    graph, _ = make_graph(understand_llm, agent, ops=ops, agent_llm_without_create=without_create)
+    state = run(graph, "sorry, 9812345678")
+    assert (len(agent.calls), len(without_create.calls)) == (1, 1)
+    assert [s["detail"] for s in state["steps"] if s["node"] == "tool"] == ["missing: city"]
+    first, second = [s for s in state["steps"] if s["node"] == "agent"]
+    assert "create_lead_offered" not in first["data"] and second["data"]["create_lead_offered"] is False
+    assert state["reply"] == "Thanks, Ravi. Which city is the house in?" and count(ops.engine, Lead) == 0
+
+
+def test_without_the_second_model_the_turn_goes_on_as_before(ops):
+    understand_llm = Scripted(understood(["gives_details"], None, name="Ravi", phone="9812345678"))
+    agent = Scripted(tool_call("create_lead", {}), answer("Which city is it in?"))
+    graph, _ = make_graph(understand_llm, agent, ops=ops)
+    assert run(graph, "Ravi, 9812345678")["reply"] == "Which city is it in?" and len(agent.calls) == 2
+
+
+@pytest.mark.parametrize("lead, intents, callback_time, expected", [
+    ({}, {"buying_interest"}, None, {"intent_level": "interested"}),
+    ({}, {"contact_request"}, None, {"intent_level": "interested"}),
+    ({}, {"gives_details"}, "tomorrow 5pm", {"intent_level": "interested"}),  # a callback request
+    ({}, {"question"}, None, {}),  # only a question: still unknown
+    ({"intent_level": "ready"}, {"buying_interest"}, None, {}),  # the extractor's value is never replaced
+    ({"intent_level": "exploring"}, {"contact_request"}, "5pm", {}),
+])
+def test_chat_intent(lead, intents, callback_time, expected):
+    assert chat_intent(lead, intents, callback_time) == expected
+
+
+def test_a_callback_request_makes_an_unknown_intent_interested_and_the_score_counts_it(ops):
+    # Chat 1: Ravi scored 48 with the intent unknown after asking the price and asking for a callback
+    understand_llm = Scripted(understood(["gives_details", "contact_request"], None, name="Ravi", phone="9812345678",
+                                         city="Kanpur", monthly_bill_inr="6000", callback_time="tomorrow 5pm"))
+    agent = Scripted(tool_call("create_lead", {}), answer("Saved. I'll note the callback."))
+    graph, _ = make_graph(understand_llm, agent, ops=ops)
+    state = run(graph, "Ravi, 9812345678, Kanpur, bill 6000, call me tomorrow 5pm")
+    assert state["lead"]["intent_level"] == "interested" and state["steps"][0]["data"]["intent_from_chat"] is True
+    lead = service.get_lead(ops.engine, state["lead_id"])
+    intent = next(r for r in lead.score_breakdown["rules"] if r["rule"] == "intent")
+    assert (lead.intent_level, intent["points"]) == ("interested", 15)

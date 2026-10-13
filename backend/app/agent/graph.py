@@ -12,7 +12,6 @@ state; finalize saves new details of an existing lead once (if the update_lead t
 """
 import json
 import logging
-import re
 import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
@@ -27,10 +26,12 @@ from langgraph.prebuilt import ToolNode
 
 from app.agent import welcome
 from app.agent.leads import (
-    LeadOps, changed_fields, confirmed_city, customer_type_from_words, drop_known_city_question, fix_callback_claims,
-    is_clock_time, keep_one_question, lead_summary, merge_callback_time, own_details_question, package_case,
-    pending_changes, remove_false_claims, resolve_city, ruled_out_details, short_answer_details, status_block,
+    LeadOps, changed_fields, chat_intent, confirmed_city, drop_known_city_question, fix_callback_claims, is_clock_time,
+    keep_one_question, lead_summary, merge_callback_time, own_details_question, package_case, passing_place_kinds,
+    pending_changes, place_type, remove_false_claims, resolve_city, ruled_out_details, short_answer_details,
+    status_block,
 )
+from app.agent.packages import SIZE_RE, add_all_packages, all_or_no_packages, reference_packages
 from app.agent.state import AgentState
 from app.agent.tools import make_tools, service_area_data, tool_step
 from app.agent.understand import KbHints, Understanding, load_kb_hints, understand
@@ -39,10 +40,10 @@ from app.core.db import get_engine
 from app.core.llm import LLMError, chat_llm, provider_of, query_embedder, reply_text, tokens_of, understand_llm
 from app.leads import service
 from app.core.prompts import load_prompt
-from app.leads.schemas import LeadData
+from app.leads.schemas import CUSTOMER_TYPE_OF, LeadData
 from app.rag.answer import (
-    LLM_DOWN_REPLY, normalize_citations, pick_sources, plain_service_area_words, rag_message, retrieve_step,
-    soften_promises, strip_tool_citations, strip_unsourced_citations, tidy_citations,
+    LLM_DOWN_REPLY, normalize_citations, pick_sources, plain_service_area_words, rag_message, remove_uncovered_policies,
+    retrieve_step, soften_promises, strip_tool_citations, strip_unsourced_citations, tidy_citations,
 )
 from app.rag.chunker import CATALOG_SECTION, SERVICE_AREA_SECTION, SUMMARY_SECTIONS
 from app.rag.numbers import remove_unsupported_numbers
@@ -63,9 +64,6 @@ NO_SEARCH_TRIGGERS = {"gives_details", "contact_request", "asks_what_is_needed"}
 # city turn, which Groq's 8K tokens a minute could not carry in the slow-Google drill); not for these intents alone
 MAX_CITY_CHECKS = 3
 NO_CITY_CHECK_INTENTS = {"greeting", "thanks_or_bye", "off_topic"}
-# A system size in the message ("5kW", "3 kW"): the catalog summary joins the context, so the reply can name the
-# package of that size (T12b; T5 answered "How much does a 5kW system cost?" without naming HomePro 5)
-_SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:kw|kwp|kilowatts?)\b", re.IGNORECASE)
 
 
 @dataclass
@@ -81,6 +79,9 @@ class AgentDeps:
     tools: list[BaseTool]
     checkpointer: BaseCheckpointSaver | None = None
     ops: LeadOps | None = None  # the leads database for the lead tools; None: no lead tools (T8a)
+    # T13c: every tool but create_lead, for the rest of a turn in which create_lead said details are missing (chat 1
+    # called it twice in one turn, "missing: city" both times); None: agent_llm stays
+    agent_llm_without_create: Runnable | None = None
     # Off: in the T8a eval it was not needed for q01 and added the whole catalog to 5 unrelated
     # questions (docs/EVAL.md). Kept switchable so the eval keeps measuring it.
     small_to_big: bool = False
@@ -102,10 +103,11 @@ def add_table_summaries(chunks: list[dict], summaries: dict[int, dict]) -> list[
 def add_catalog_for_size(
     chunks: list[dict], message: str, new_details: list[str], summaries: dict[int, dict]
 ) -> list[dict]:
-    """When the customer mentions a system size this turn, add the KB Section 8 summary chunk (every package with
-    its kW, read from the KB) if it is not in the context yet, so a 5 kW question can name the 5 kW package (T12b)."""
+    """When the customer mentions a system size this turn ("5kW", "3 kW"), add the KB Section 8 summary chunk (every
+    package with its kW, read from the KB) if it is not in the context yet, so a 5 kW question can name the 5 kW
+    package (T12b; T5 answered "How much does a 5kW system cost?" without naming HomePro 5)."""
     summary = summaries.get(CATALOG_SECTION)
-    if not summary or not (_SIZE_RE.search(message) or "system_size_kw" in new_details):
+    if not summary or not (SIZE_RE.search(message) or "system_size_kw" in new_details):
         return chunks
     if any(c["chunk_id"] == summary["chunk_id"] for c in chunks):
         return chunks
@@ -158,6 +160,19 @@ def tool_outcome_reply(scratch: list[BaseMessage]) -> str | None:
     if any("callback request" in line for line in lines):  # the callback is logged: no need to ask for a time
         lines = [line.replace(" What time would suit you for a callback?", "") for line in lines]
     return " ".join(lines) or None
+
+
+def create_lead_refused(scratch: list[BaseMessage]) -> bool:
+    """True when create_lead ran this turn and saved nothing (details missing or invalid). The rest of the turn then
+    goes without it (T13c: chat 1 called it twice in one turn, "missing: city" both times, and the turn took 13.4 s)."""
+    for message in scratch:
+        if isinstance(message, ToolMessage) and message.name == "create_lead":
+            try:
+                if json.loads(str(message.content)).get("saved") is False:
+                    return True
+            except (ValueError, AttributeError):
+                continue
+    return False
 
 
 def _dedupe(chunks: list[dict]) -> list[dict]:
@@ -251,11 +266,23 @@ def build_graph(deps: AgentDeps):
         area_steps = [{"node": "area_check", "detail": f"{c['city']}: {c['status']}", "data": {"by": "code"}}
                       for c in checks]
         summary = deps.hints_fn().summaries.get(SERVICE_AREA_SECTION) if checks else None
+        # T13c: the kind of place only with confidence (place_type). A new type from the extractor is dropped when this
+        # message names that kind of place only in passing ("I work from home") and no confident words: the bot asks
+        words = place_type(str(message), previous)
+        new_type, dropped = clean.get("customer_type"), []
+        if (new_type and new_type != before.get("customer_type") and not words
+                and new_type in passing_place_kinds(str(message))):
+            dropped = ["customer_type"] + (["property_type"] if CUSTOMER_TYPE_OF.get(clean.get("property_type"))
+                                           == new_type else [])
+            for name in dropped:
+                clean.pop(name)
         # T13b: a home or a business named, with no customer type from the extractor or an earlier turn (C7 run 1:
         # "it's for my home" stored nothing on the bill turn), like the T12a short answers
-        kind = ({} if clean.get("customer_type") or before.get("customer_type")
-                else customer_type_from_words(str(message), intents))
+        kind = {} if clean.get("customer_type") or before.get("customer_type") else words
         clean.update(kind)
+        # T13c: buying interest or a callback request counts as "interested" while the intent is unknown
+        intent = chat_intent({**before, **clean}, intents, callback_time)
+        clean.update(intent)
         step = {
             "node": "understand",
             "detail": ("failed, raw message used" if degraded else "intents: " + ", ".join(out["intents"])),
@@ -268,6 +295,8 @@ def build_graph(deps: AgentDeps):
                 "city_source": city_source,
                 "short_answer": sorted(short),
                 "from_words": sorted(kind),
+                "dropped": dropped,
+                "intent_from_chat": bool(intent),
                 "provider": out["provider"],
                 "model": out["model"],
                 "latency_ms": out["latency_ms"],
@@ -326,12 +355,17 @@ def build_graph(deps: AgentDeps):
         chunks = found
         if chunks and deps.small_to_big:
             chunks = add_table_summaries(chunks, deps.hints_fn().summaries)
+        with_summaries = len(chunks)
         if chunks:
             message = str(state["messages"][-1].content)
             chunks = add_catalog_for_size(chunks, message, state.get("new_details", []), deps.hints_fn().summaries)
+            with_summaries = len(chunks)
+            if not state.get("support_case"):  # T13c: part of the package list found: all of it joins
+                chunks = add_all_packages(chunks, deps.hints_fn().guidance, state.get("lead", {}), message)
         step = retrieve_step(result)
         step["data"]["latency_ms"] = round((time.perf_counter() - start) * 1000)
-        step["data"]["added_summaries"] = len(chunks) - len(found)
+        step["data"]["added_summaries"] = with_summaries - len(found)
+        step["data"]["added_package_rows"] = len(chunks) - with_summaries
         return {
             # a city check's KB Section 10 summary stays first, so it is that answer's source (T12b, as T10b)
             "chunks": _dedupe(state.get("chunks", []) + chunks),
@@ -357,6 +391,10 @@ def build_graph(deps: AgentDeps):
     def agent_node(state: AgentState) -> dict:
         rounds = state.get("tool_rounds", 0)
         llm = deps.agent_llm if rounds < MAX_TOOL_ROUNDS else deps.final_llm
+        offer_create = True
+        if (llm is deps.agent_llm and deps.agent_llm_without_create is not None
+                and create_lead_refused(state.get("scratch", []))):  # T13c: create_lead once a turn when it can't save
+            llm, offer_create = deps.agent_llm_without_create, False
         start = time.perf_counter()
         try:
             message = llm.invoke(agent_messages(state))
@@ -373,6 +411,8 @@ def build_graph(deps: AgentDeps):
         step = {"node": "agent", "detail": detail,
                 "data": {"provider": provider, "model": message.response_metadata.get("model_name"),
                          "latency_ms": latency_ms, "tokens": tokens_of(message), "tool_calls": calls}}
+        if not offer_create:
+            step["data"]["create_lead_offered"] = False
         return {
             "scratch": [message],
             "tool_rounds": rounds + (1 if calls else 0),
@@ -440,6 +480,11 @@ def build_graph(deps: AgentDeps):
                 if removed:
                     steps.append({"node": "guard", "detail": f"removed {removed} KB tag(s) not backed by this "
                                                              "turn's sources", "data": {"removed": removed}})
+                # T13c: no policy, either way, on what the KB doesn't cover (discounts, offers, brands)
+                reply, uncovered = remove_uncovered_policies(reply, chunks, welcome.UNCOVERED_TEXT)
+                if uncovered:
+                    steps.append({"node": "guard", "detail": "replaced a policy the KB doesn't cover",
+                                  "data": {"removed": uncovered}})
                 # T12b: no number, duration, amount or percentage that nothing in the conversation gave (KB Section 16)
                 allowed = ([c.content for c in chunks]
                            + [str(m.content) for m in scratch if isinstance(m, ToolMessage)]
@@ -449,6 +494,14 @@ def build_graph(deps: AgentDeps):
                 if numbers:  # the removed sentences go into the step (not the log), so each one can be checked
                     steps.append({"node": "guard", "detail": f"removed {len(numbers)} number(s) no source gave",
                                   "data": {"removed": cut, "numbers": numbers}})
+                # T13c: with no size settled, every reference package of a kind or none (the packages the customer
+                # named in this message always stay)
+                reply, partial = all_or_no_packages(reply, reference_packages(deps.hints_fn().guidance),
+                                                    state.get("lead", {}), str(state["messages"][-1].content),
+                                                    welcome.PACKAGES_FIT_TEXT)
+                if partial:
+                    steps.append({"node": "guard", "detail": "removed a partial list of reference packages",
+                                  "data": {"removed": partial}})
                 reply, fixed = remove_false_claims(reply, state) if deps.ops is not None else (reply, False)
                 if fixed:
                     steps.append({"node": "guard", "detail": "removed a claim that details were saved (no lead "
@@ -472,6 +525,13 @@ def build_graph(deps: AgentDeps):
                 reply, trimmed = keep_one_question(reply, state)
                 if trimmed:
                     steps.append({"node": "guard", "detail": "kept one question", "data": {}})
+                # T13c: never a blank bubble. The number guard removes a sentence with a count no source gave ("8 steps",
+                # "7 kW") without a replacement, so a reply made only of such sentences came out empty
+                if not reply.strip():
+                    logger.warning("reply empty after the guards; the fixed line replaced it")
+                    reply = welcome.NUMBERS_CONFIRM_TEXT
+                    steps.append({"node": "guard", "detail": "nothing was left after the guards; the fixed line "
+                                                             "replaced it", "data": {}})
                 reply = tidy_citations(reply, chunks)
                 sources = pick_sources(reply, chunks) if chunks else []
         if deps.ops is not None:
@@ -535,8 +595,9 @@ def build_agent(
     ops = LeadOps(engine=leads_engine or engine, areas_fn=get_service_areas, reason_now=False)
     tools = make_tools(search_fn, get_service_areas, hints_fn, ops)
     deps = AgentDeps(
-        understand_llm=understand_llm(Understanding),  # main, fast, Groq: 5 s each (T10b)
+        understand_llm=understand_llm(Understanding),  # main, Groq, fast: 4 s each (T12a)
         agent_llm=chat_llm(main_model, tools=tools),
+        agent_llm_without_create=chat_llm(main_model, tools=[t for t in tools if t.name != "create_lead"]),
         final_llm=chat_llm(main_model),
         search_fn=search_fn,
         areas_fn=get_service_areas,

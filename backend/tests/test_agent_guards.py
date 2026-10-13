@@ -2,10 +2,13 @@
 guard and the one-question guard in finalize; T13a/T13b: the package guidance and rule on a bill turn. Fake models
 and search only."""
 import pytest
+from langchain_core.messages import AIMessage
 
-from app.agent.leads import customer_type_from_words, keep_one_question, own_details_question, package_case
+from app.agent.leads import keep_one_question, own_details_question, package_case, passing_place_kinds, place_type
 from app.agent.welcome import NUMBERS_CONFIRM_TEXT
+from app.core.llm import LLMError
 from app.core.prompts import load_prompt
+from app.rag.numbers import remove_unsupported_numbers
 from app.rag.retriever import RetrievedChunk, SearchResult
 from tests.agent_fakes import FAQ, FakeSearch, Scripted, answer, make_graph, run, understood
 
@@ -97,23 +100,36 @@ def test_finalize_removes_an_invented_duration_and_says_the_team_confirms():
     assert any(s["node"] == "guard" and "number" in s["detail"] for s in state["steps"])
 
 
+def test_a_reply_whose_every_sentence_has_an_unsourced_number_is_never_blank():
+    # T13c: a count or a size ("7 kW", "14 panels") is removed without the fixed line, so this reply came out empty
+    reply = "A 7 kW system would suit you [KB Section 8: Catalog]. It needs 14 panels."
+    assert remove_unsupported_numbers(reply, [], NUMBERS_CONFIRM_TEXT)[0] == ""  # the number guard alone
+    graph, _ = make_graph(Scripted(understood(["question"], "system size")), Scripted(answer(reply)))
+    state = run(graph, "What size do I need?")
+    assert state["reply"] == NUMBERS_CONFIRM_TEXT and state["sources"] == []
+    guards = [s for s in state["steps"] if s["node"] == "guard"]
+    assert guards[0]["data"]["removed"] == ["A 7 kW system would suit you.", "It needs 14 panels."]
+    assert guards[-1]["detail"] == "nothing was left after the guards; the fixed line replaced it"
+
+
 def test_a_number_from_an_earlier_reply_may_be_repeated_without_a_search():
     search = FakeSearch(SearchResult(chunks=[PLAN_A], mode="hybrid"))
-    agent = Scripted(answer("Plan A is a 3 kW reference option [KB Section 8: Catalog]."),
-                     answer("Plan A, the 3 kW option, is a starting point; a site assessment sets the size."))
+    # T13c: both fake packages named, since a reply with one of them and no settled size loses it (all or none)
+    agent = Scripted(answer("Plan A is a 3 kW reference option, and Plan B is the other [KB Section 8: Catalog]."),
+                     answer("The 3 kW option is a starting point; a site assessment sets the size."))
     understand = Scripted(understood(["question"], "catalog"), understood(["reply_to_assistant"]))
     graph, _ = make_graph(understand, agent, search=search)
     run(graph, "What do you offer?")
     state = run(graph, "ok, and that one?")
-    assert state["reply"] == "Plan A, the 3 kW option, is a starting point; a site assessment sets the size."
+    assert state["reply"] == "The 3 kW option is a starting point; a site assessment sets the size."
 
 
 def test_finalize_keeps_one_question_the_closing_offer():
-    agent = Scripted(answer("Plan A is a reference option [KB Section 8: Catalog]. Is that helpful? "
+    agent = Scripted(answer("Plan A and Plan B are the reference options [KB Section 8: Catalog]. Is that helpful? "
                             "Would you like a callback from the team?"))
     graph, _ = make_graph(Scripted(understood(["question"], "catalog")), agent)
     state = run(graph, "What do you offer?")
-    assert state["reply"] == ("Plan A is a reference option [KB Section 8: Catalog]. "
+    assert state["reply"] == ("Plan A and Plan B are the reference options [KB Section 8: Catalog]. "
                               "Would you like a callback from the team?")
     assert any(s["detail"] == "kept one question" for s in state["steps"])
 
@@ -380,21 +396,97 @@ def test_the_prompts_carry_the_package_rule():
     rule = load_prompt("package_guidance_prompt")
     assert rule.startswith(RULE) and "Property type: {property}." in rule
     assert "{package_guidance}" in load_prompt("rag_prompt")
-    assert "fills customer_type: residential for a home" in load_prompt("lead_extraction_prompt")
+    extraction = load_prompt("lead_extraction_prompt")
+    assert "fills customer_type: residential for a home" in extraction
+    assert "never from a passing mention" in extraction  # T13c
+    assert "Reference packages, all or none" in system and "Never state a policy either way" in system  # T13c
 
 
-@pytest.mark.parametrize("message, intents, kind", [
-    ("My bill is about 4000 a month, it is for my home.", {"gives_details"}, "residential"),
-    ("home", {"reply_to_assistant"}, "residential"),  # the answer to "a home or a business?"
-    ("We live in a flat in Noida", {"gives_details"}, "residential"),
-    ("It is for our store", {"buying_interest"}, "commercial"),
-    ("The solar is for my office", {"gives_details"}, "commercial"),
-    ("my home office", {"gives_details"}, None),  # both kinds named: not guessed
-    ("My bill is 4000", {"gives_details"}, None),  # neither
-    ("Do you have a package for a business?", {"question"}, None),  # a plain question says nothing about theirs
+# ---------- T13c: the kind of place only with confidence (place_type), and the type guard ----------
+
+HOME_OR_BUSINESS = AIMessage("Thanks! Is the solar for a house or a small business?")
+
+
+@pytest.mark.parametrize("message, previous, kind", [
+    # (a) a short answer to the assistant's own home-or-business question (chat 1: "house", "home", "home")
+    ("house", HOME_OR_BUSINESS, "residential"),
+    ("home", HOME_OR_BUSINESS, "residential"),
+    ("ghar", HOME_OR_BUSINESS, "residential"),
+    ("a small shop in Lucknow", HOME_OR_BUSINESS, "commercial"),
+    ("yes", HOME_OR_BUSINESS, None),
+    ("home", None, None),  # a bare word nobody asked for
+    # (b) clearly their own place
+    ("actually the house is in Kanpur", None, "residential"),  # chat 1: the bot asked "house or small business?" next
+    ("it's for my home", None, "residential"),
+    ("My bill is about 4000 a month, it is for my home.", None, "residential"),
+    ("my flat", None, "residential"),
+    ("We live in a flat in Noida", None, "residential"),
+    ("solar lagwana hai ghar par. kitna kharcha hoga", None, "residential"),  # chat 1, turn 1
+    ("my bungalow in Pune", None, "residential"),
+    ("we have a duplex", None, "residential"),
+    ("it's a 2 BHK in Noida", None, "residential"),
+    ("it's a shop", None, "commercial"),
+    ("It is for our store", None, "commercial"),
+    ("The solar is for my office", None, "commercial"),
+    # not guessed: both kinds, neither, a plain question, a phrase that only looks like one
+    ("my home office", None, None),
+    ("My bill is 4000", None, None),
+    ("Do you have a package for a business?", None, None),
+    ("that's a business decision", None, None),
+    ("main ghar par hoon", None, None),  # "I'm at home", nothing about solar
 ])
-def test_customer_type_from_words(message, intents, kind):
-    assert customer_type_from_words(message, intents) == ({"customer_type": kind} if kind else {})
+def test_place_type(message, previous, kind):
+    assert place_type(message, previous) == ({"customer_type": kind} if kind else {})
+
+
+NEVER = ["I'm at home right now", "my friend's house has solar", "I work from home",
+         "Do you help with a home loan?"]
+
+
+@pytest.mark.parametrize("message", NEVER)
+def test_a_passing_mention_never_gives_the_type(message):
+    # Adithya's "never" list (T13c), also as a short answer to the home-or-business question
+    assert place_type(message, None) == {} and place_type(message, HOME_OR_BUSINESS) == {}
+    assert passing_place_kinds(message) == {"residential"}
+
+
+@pytest.mark.parametrize("message", NEVER)
+def test_the_extractors_type_from_a_passing_mention_is_dropped(message):
+    agent = Scripted(answer("Thanks."))
+    graph, _ = make_graph(Scripted(understood(["gives_details"], None, property_type="house")), agent)
+    state = run(graph, message)
+    assert "customer_type" not in state["lead"] and "property_type" not in state["lead"]
+    assert state["steps"][0]["data"]["dropped"] == ["customer_type", "property_type"]
+
+
+def test_a_place_of_their_own_next_to_a_passing_mention_keeps_the_type():
+    # Adithya (planning): "at home now, it's for my 2BHK" is a home of their own
+    assert place_type("at home now, it's for my 2BHK", None) == {"customer_type": "residential"}
+    graph, _ = make_graph(Scripted(understood(["gives_details"], None, customer_type="residential")),
+                          Scripted(answer("Thanks.")))
+    state = run(graph, "at home now, it's for my 2BHK")
+    assert state["lead"]["customer_type"] == "residential" and state["steps"][0]["data"]["dropped"] == []
+
+
+def test_a_passing_mention_never_drops_a_type_from_an_earlier_turn():
+    understand = Scripted(understood(["gives_details"], None, property_type="shop"),
+                          understood(["gives_details"], None, property_type="shop", monthly_bill_inr="9000"))
+    graph, _ = make_graph(understand, Scripted(answer("Thanks.")))
+    run(graph, "It is for my shop")
+    state = run(graph, "The bill is 9000, I mostly work from home")
+    assert state["lead"]["customer_type"] == "commercial" and state["steps"][0]["data"]["dropped"] == []
+
+
+def test_a_short_answer_counts_when_the_understand_step_failed():
+    # Chat 1: "house" after "house or small business?" came right after a model failure, so no intent was known
+    agent = Scripted(answer("Is the solar for a house or a small business?"), answer("Thanks."))
+    understand = Scripted(understood(["gives_details"], None, monthly_bill_inr="6000"), LLMError("all down"))
+    graph, _ = make_graph(understand, agent)
+    run(graph, "my bill is 6k")
+    state = run(graph, "house")
+    assert state["steps"][0]["detail"] == "failed, raw message used"
+    assert state["lead"]["customer_type"] == "residential" and state["steps"][0]["data"]["from_words"] == [
+        "customer_type"]
 
 
 def test_a_home_the_extractor_missed_still_brings_the_home_packages():

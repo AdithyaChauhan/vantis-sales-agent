@@ -56,7 +56,7 @@ def test_slow_gemini_makes_gemini_hang_so_the_deadline_hands_over(monkeypatch):
     start = time.perf_counter()
     assert chain.invoke([HumanMessage("hi")]).content == "from groq"
     assert time.perf_counter() - start < 1  # cut off at the deadline, not after the hang
-    assert skips.left("gemini:gemini-main") > 0  # later turns go straight to Groq
+    assert skips.left("gemini:gemini-main", "understand") > 0  # later understand calls go straight to Groq
 
 
 def test_the_drill_switch_can_never_reach_render():

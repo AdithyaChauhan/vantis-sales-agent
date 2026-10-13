@@ -71,12 +71,39 @@ _QUESTION_RE = re.compile(r"[^.!?]*\?")
 _BARE_AMOUNT_RE = re.compile(r"^\s*(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?\s*(?:k|rs\.?|rupees|/-)?[\s.!]*$", re.I)
 _YES_RE = re.compile(r"^\s*(?:yes|yeah|yep|yup|sure|of course|it does|we do|yes,? it does|yes,? we do)[\s.!]*$", re.I)
 _NO_RE = re.compile(r"^\s*(?:no|nope|nah|naah|it doesn't|we don't|no,? it doesn't|no,? we don't)[\s.!]*$", re.I)
-# T13b: the kind of place a message names, for the customer type when the extractor gave none (Adithya's word lists)
-_HOME_WORDS_RE = re.compile(r"\b(?:home|house|flat|villa|apartment)\b", re.I)
-_BUSINESS_WORDS_RE = re.compile(r"\b(?:shop|office|store|business)\b", re.I)
-# Only a message about their own place: details, buying interest, a contact request or an answer to the assistant
-# (a plain question such as "do you have a package for a business?" says nothing about theirs)
-_OWN_PLACE_INTENTS = {"gives_details", "buying_interest", "contact_request", "reply_to_assistant"}
+# T13c: the kind of place, only with confidence (place_type). Adithya's word lists; "ghar" is Hindi for home; BHK
+# sizes, bungalow and duplex added in planning. "residential" and "commercial" count only as a short answer.
+_HOME = r"home|house|flat|apartment|villa|ghar|bungalow|duplex|\d+\s*-?\s*bhk"
+_BUSINESS = r"shop|office|store|business"
+_PLACE = rf"(?:{_HOME}|{_BUSINESS})"
+_HOME_RE = re.compile(rf"\b(?:{_HOME}|residential)\b", re.I)
+_BUSINESS_RE = re.compile(rf"\b(?:{_BUSINESS}|commercial)\b", re.I)
+_APOS = "['’]"
+# Passing mentions, never their own place: being somewhere ("I'm at home right now", "I'm at my office"), "at home" or
+# "from home", working from or at a place, a home or business loan, someone else's place ("my friend's house", "dost
+# ke ghar")
+_PASSING_RE = re.compile(
+    rf"\b(?:i{_APOS}?m|i\s+am|we{_APOS}?re|we\s+are)\s+(?:at|in)\s+(?:my\s+|our\s+|the\s+)?{_PLACE}\b|"
+    rf"\b(?:at|from)\s+home\b|"
+    rf"\bwork(?:s|ing)?\s+(?:from|at|in)\s+(?:my\s+|our\s+|the\s+|an?\s+)?{_PLACE}\b|"
+    rf"\b{_PLACE}\s+loans?\b|"
+    rf"\b(?!(?:it|that|this|what|there|here|who|he|she|let){_APOS}s\b)[a-z]+{_APOS}s\s+(?:own\s+)?{_PLACE}\b|"
+    rf"\b[a-z]+\s+(?:ka|ke|ki)\s+ghar\b", re.I)
+# Their own place: "my flat", "mere ghar", "it's for home", "the house is in Kanpur", "we live in a flat", "I have a
+# 3BHK", "it's a shop" (the place word ends the phrase, so "that's a business decision" is not one)
+_OWN_PLACE_RE = re.compile(
+    rf"\b(?:my|our|mera|mere|meri|hamara|hamare|apna|apne)\s+(?:own\s+|new\s+|small\s+)?(?P<a>{_PLACE})\b|"
+    rf"\bfor\s+(?:the\s+)?(?P<b>home)\b|"
+    rf"\b(?:the|this)\s+(?P<c>{_PLACE})\s+is\s+(?:in|at|near|on|located)\b|"
+    rf"\b(?:i|we)\s+(?:live|stay|reside)\s+in\s+(?:an?\s+|my\s+|our\s+|the\s+)?(?P<d>{_PLACE})\b|"
+    rf"\b(?:i|we)\s+(?:have|own|run)\s+(?:an?\s+)(?:small\s+|big\s+|new\s+)?(?P<e>{_PLACE})\b|"
+    rf"\b(?:it|this|that)(?:{_APOS}s|\s+is)\s+(?:an?|my|our)\s+(?:small\s+|big\s+|new\s+)?(?P<f>{_PLACE})"
+    rf"(?=\s*(?:$|[.,!?;)]|\s+(?:in|at|near|on|with|and|so|but)\b))", re.I)
+# "ghar" counts only in a message about solar or installing ("solar lagwana hai ghar par"); "main ghar par hoon" is
+# only "I'm at home"
+_GHAR_RE = re.compile(r"\bghar\b", re.I)
+_SOLAR_WORDS_RE = re.compile(r"\b(?:solar|panels?|lagwa\w*|laga\w*|install\w*)\b", re.I)
+SHORT_ANSWER_WORDS = 6  # "a small shop in Lucknow" is still an answer to the question
 # The detail a question asks about, by its words (only a question about one detail is read)
 _TOPIC_OF = {
     "bill": "bill", "roof": "roof", "rooftop": "roof", "kw": "size", "size": "size", "units": "usage",
@@ -249,17 +276,48 @@ def short_answer_details(previous: object, message: str, details: dict) -> dict:
     return {}
 
 
-def customer_type_from_words(message: str, intents: set[str]) -> dict:
-    """The customer type from the words of a message about their own place, for when the extractor gave none (T13b,
-    like the T12a short answers): home, house, flat, villa or apartment -> residential; shop, office, store or
-    business -> commercial. Nothing when both kinds or neither are named. In C7 run 1 "it's for my home" stored no
-    type on the bill turn, so that turn could not bring the home packages."""
-    if not intents & _OWN_PLACE_INTENTS:
+def _kinds(words: list[str]) -> set[str]:
+    """The customer types the place words name: {"residential"}, {"commercial"}, both or none."""
+    return ({"residential"} if any(_HOME_RE.fullmatch(w.strip()) for w in words) else set()) | (
+        {"commercial"} if any(_BUSINESS_RE.fullmatch(w.strip()) for w in words) else set())
+
+
+def passing_place_kinds(message: str) -> set[str]:
+    """The kinds of place a message names only in passing ("I work from home" -> {"residential"})."""
+    return _kinds([w for m in _PASSING_RE.finditer(message) for w in _HOME_RE.findall(m.group(0))
+                   + _BUSINESS_RE.findall(m.group(0))])
+
+
+def place_type(message: str, previous: object) -> dict:
+    """The customer type from the words of a message, only with confidence (T13c; replaces T13b's word check, which
+    needed the extractor's intents, so it stored nothing when the understand step failed: chat 1's "house", "home",
+    "home" after "house or small business?"). Home words -> residential, shop, office, store or business -> commercial:
+    - (a) a short answer to the assistant's own home-or-business question ("house", "a shop", "ghar"), or
+    - (b) a phrase about their own place: "the house is in Kanpur", "it's for my home", "my flat", "it's a shop",
+      "solar lagwana hai ghar par".
+    Passing mentions are removed first and never count ("I'm at home right now", "my friend's house has solar", "I
+    work from home", "home loan"). Nothing when both kinds or neither are named: the assistant asks instead."""
+    text = _PASSING_RE.sub(" ", message)
+    question = final_question(previous)
+    asked = bool(_HOME_RE.search(question) and _BUSINESS_RE.search(question))
+    if asked and len(re.findall(r"[\w-]+", text)) <= SHORT_ANSWER_WORDS:
+        kinds = _kinds(_HOME_RE.findall(text) + _BUSINESS_RE.findall(text))
+    else:
+        found = [w for m in _OWN_PLACE_RE.finditer(text) for w in m.groups() if w]
+        if _GHAR_RE.search(text) and _SOLAR_WORDS_RE.search(text):
+            found.append("ghar")
+        # the place named in passing elsewhere in the message still counts, so "my home office" names both kinds
+        kinds = _kinds(found) | (_kinds(_HOME_RE.findall(text) + _BUSINESS_RE.findall(text)) if found else set())
+    return {"customer_type": kinds.pop()} if len(kinds) == 1 else {}
+
+
+def chat_intent(lead: dict, intents: set[str], callback_time: str | None) -> dict:
+    """{"intent_level": "interested"} when the extractor left the intent unknown but the chat shows buying interest
+    (BUYING_INTENTS) or a callback request (T13c: chat 1's lead scored 48 with the intent unknown after the customer
+    asked the price and for a callback). "ready" only ever comes from the extractor."""
+    if lead.get("intent_level") or not (intents & BUYING_INTENTS or callback_time):
         return {}
-    home, business = bool(_HOME_WORDS_RE.search(message)), bool(_BUSINESS_WORDS_RE.search(message))
-    if home == business:
-        return {}
-    return {"customer_type": "residential" if home else "commercial"}
+    return {"intent_level": "interested"}
 
 
 def merge_callback_time(old: str | None, new: str | None) -> str | None:

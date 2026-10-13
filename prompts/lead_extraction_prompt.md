@@ -26,7 +26,7 @@ search_query:
 details:
 - Fill only what the customer stated about themselves, in this message or earlier ones. Never guess; leave everything else null.
 - A city the customer only asks about ("do you work in <city>?") is not their city: leave details.city null and put it in asked_city.
-- The kind of place the solar is for fills customer_type: residential for a home of any kind (house, flat, villa), commercial for a shop, office or other business. Set property_type only when they name the kind of building.
+- The kind of place the solar is for fills customer_type: residential for a home of any kind (house, flat, villa), commercial for a shop, office or other business. Fill it only when the message is about their own place, such as "it's for my flat" or "the shop is on the main road", or is a short answer to the assistant's question whether it is a home or a business; never from a passing mention (being at home, working from home, a home loan, someone else's house). If unsure, leave it null. Set property_type only when they name the kind of building, with the same care.
 - Copy phone numbers, email addresses and amounts exactly as the customer wrote them.
 - A short answer fills the detail the assistant just asked about: "around 3,500" after a question about the monthly bill is monthly_bill_inr; "it does" after a question about usable roof space is rooftop_available true.
 - If the customer names a package from the catalog, set system_size_kw to that package's size in kW from the catalog.

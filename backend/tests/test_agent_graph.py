@@ -21,7 +21,9 @@ from tests.agent_fakes import (
     understood,
 )
 
-CITED = "We offer Plan A [KB Section 8: Catalog]."
+# T13c: both fake reference packages (tests/agent_fakes.py GUIDANCE), since a reply with one of them and no
+# settled size loses it (all or none)
+CITED = "We offer Plan A and Plan B [KB Section 8: Catalog]."
 
 
 def nodes(state) -> list[str]:
@@ -228,17 +230,21 @@ def test_lead_details_merge_and_errors_stay_per_turn():
     )
     graph, _ = make_graph(understand_llm, Scripted(answer("Thanks.")))
     first = run(graph, "Lucknow, bill 4k, call 12345")
-    assert first["lead"] == {"city": "Lucknow", "monthly_bill_inr": 4000}
+    # T13c: buying interest with no intent from the extractor counts as "interested"
+    assert first["lead"] == {"city": "Lucknow", "monthly_bill_inr": 4000, "intent_level": "interested"}
     assert set(first["validation_errors"]) == {"phone"}
     second = run(graph, "I'm Rahul Sharma")
-    assert second["lead"] == {"city": "Lucknow", "monthly_bill_inr": 4000, "name": "Rahul Sharma"}
+    assert second["lead"] == {"city": "Lucknow", "monthly_bill_inr": 4000, "intent_level": "interested",
+                              "name": "Rahul Sharma"}
     assert second["validation_errors"] == {}
     assert second["steps"][0]["data"]["details"] == ["name"]
 
 
 def test_small_to_big_is_off_by_default_and_adds_the_summary_when_on():
     off, _ = make_graph(Scripted(understood(["question"], "catalog")), Scripted(answer(CITED)))
-    assert len(run(off, "What do you offer?")["chunks"]) == 2
+    state = run(off, "What do you offer?")
+    # the 2 found, plus (T13c) the KB Section 9 rows, since the found row names only one of the two packages
+    assert len(state["chunks"]) == 4 and state["steps"][1]["data"]["added_package_rows"] == 2
     on, _ = make_graph(Scripted(understood(["question"], "catalog")), Scripted(answer(CITED)), small_to_big=True)
     state = run(on, "What do you offer?")
     assert [c["chunk_id"] for c in state["chunks"]] == ["s08-plan-a", "s15-quote", "s08-table-summary"]
@@ -263,10 +269,11 @@ def test_logs_hold_no_message_text(caplog):
 
 def test_a_kb_tag_outside_this_turns_sources_is_removed():
     # Problem 4 (T12a): KB tags only on facts from this turn's sources (here KB Sections 8 and 15)
-    reply = "We offer Plan A [KB Section 8: Catalog]. Panels follow the maker's warranty [KB Section 11: Warranty]."
+    reply = ("We offer Plan A and Plan B [KB Section 8: Catalog]. Panels follow the maker's warranty "
+             "[KB Section 11: Warranty].")
     graph, _ = make_graph(Scripted(understood(["question"], "Catalog")), Scripted(answer(reply)))
     state = run(graph, "What do you offer?")
-    assert state["reply"] == "We offer Plan A [KB Section 8: Catalog]. Panels follow the maker's warranty."
+    assert state["reply"] == "We offer Plan A and Plan B [KB Section 8: Catalog]. Panels follow the maker's warranty."
     assert [s["section"] for s in state["sources"]] == ["8"]
     assert any(s["node"] == "guard" and s["data"]["removed"] == 1 for s in state["steps"])
 
@@ -284,10 +291,10 @@ def test_a_turn_with_no_sources_has_no_kb_tags():
 
 
 def test_a_kb_tag_on_a_question_is_removed_even_when_the_section_was_found():
-    reply = "We offer Plan A [KB Section 8: Catalog]. Would you like a quote [KB Section 15: FAQ]?"
+    reply = "We offer Plan A and Plan B [KB Section 8: Catalog]. Would you like a quote [KB Section 15: FAQ]?"
     graph, _ = make_graph(Scripted(understood(["question"], "Catalog")), Scripted(answer(reply)))
     state = run(graph, "What do you offer?")
-    assert state["reply"] == "We offer Plan A [KB Section 8: Catalog]. Would you like a quote?"
+    assert state["reply"] == "We offer Plan A and Plan B [KB Section 8: Catalog]. Would you like a quote?"
 
 
 def test_steps_carry_the_model_and_tokens_of_each_call():
