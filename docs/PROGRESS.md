@@ -246,3 +246,13 @@ Adithya pastes the newest entry to the reviewer (Claude chat) after every task.
 - Decisions: keep-warm pings /api/health/live (not /api/health, which wakes Neon) every 10 min 08:00-23:00 IST (Adithya); README says the sales key came with the submission; retrieval numbers quoted as 12 Oct (T12b), eval not re-run; CLAUDE.md otherwise unchanged until Adithya decides whether it ships
 - Open issues: F11 "I have a question about my inverter" opens the support flow; the turn-2 reply said "I don't have information on installation timelines" after the customer gave their own; the keep-warm switch-off command isn't in CLAUDE.md (left unchanged by request); prompts/README's T13d row names is_what_if/reports_problem_now, removed in T13e
 - Next: Adithya pushes, checks the README renders and runs keep-warm once; Neon SQL reset + `seed_demo_leads --main`; video; `git archive` ZIP
+
+## T14b: README Limitations, the last known reply gaps and the chat limit (2026-10-15)
+- Status: done (docs only; no code changes, by request)
+- Changed: README.md Limitations: a follow-up with no place turns "near a city" into the city; a locality and its city can get both "we cover" and "can't confirm"; a customer's own timeline can get "no information on installation timelines"; invented package names; 100 chat messages a day per IP, with when it resets
+- Tests: `cd backend && python -m pytest -q` → 1247 passed, 0 failed (13 live deselected); frontend untouched
+- Also ran: "compact" in the KB: 0 hits in the raw PDF text (pdfplumber, 6 pages) and in all 54 parsed chunks, so the "Compact Residential Package" line went in; read app/agent/packages.py (the guard matches only the KB Section 9 names, so an invented name passes); render.yaml sets 10 a minute and 100 a day, Dockerfile runs 1 worker
+- Prompt changes: none
+- Decisions: the day limit is a 24-hour window from each IP's first message (not midnight); counts live in memory, so a redeploy, restart or sleep resets them (stated in the README)
+- Open issues: the four reply gaps above and F11 stay open; as in T14, run `seed_demo_leads --reset` on the test branch (this pytest emptied it)
+- Next: Adithya pushes; then the T14 steps: Neon reset + `seed_demo_leads --main`, video, `git archive` ZIP

@@ -527,7 +527,12 @@ The dashboard and the sales endpoints need the sales API key. It is **not** in t
 - **An unlisted city is WARM at most.** A strong buyer in an unlisted city can't be HOT until the team verifies the area. That is by design, following KB Section 10.
 - **The locality is not stored.** The understand step reads a locality (a sector or neighbourhood) and uses it for the city check, but the lead keeps only the city.
 - **Known gap (F11).** "I have a question about my inverter" still opens the support flow (it asks for the customer's name) instead of answering first. A prompt rule and a code rule were both tried.
+- **A follow-up can drop the "near".** When a customer says they live near a listed city, a later question that names no place can make the bot treat them as living in that city itself.
+- **A locality can get two answers.** When a customer gives a locality and its city, one reply can say both that we cover the city and that we can't confirm the locality.
+- **A customer's own timeline can get a "no information" reply.** When a customer says when they want the installation, the bot may answer that it has no information on installation timelines.
+- **Invented package names.** The bot once named packages that aren't in the catalog (a "Compact Residential Package"). The package guard only checks the names in the KB, so it doesn't catch a new one.
 - **The guards are English patterns.** They catch the phrasings seen in tests and live runs, not every paraphrase.
+- **100 chat messages a day per IP** (and 10 a minute). People on one network, like an office or a college, share that limit. The count starts at the network's first message and resets 24 hours later, or sooner if the service restarts, redeploys or sleeps.
 - **One server instance.** Rate limits, the skip list, session locks and the replay cache live in memory, which is right for one free instance, not for several.
 - **No retention cleanup.** Conversations, including personal details, stay in Neon with no cleanup yet.
 - **The relevance gate passes on-topic questions the KB doesn't answer** (for example, cleaning a water tank). The prompt and guards make the reply say so.
