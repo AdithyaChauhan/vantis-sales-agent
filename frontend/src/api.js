@@ -10,6 +10,11 @@ const DEFAULT_API_URL = "http://127.0.0.1:8000";
 // Render's free plan sleeps; waking it took about 33 s, and a chat turn can wait on LLM retries.
 export const REQUEST_TIMEOUT_MS = 90_000;
 export const GENERIC_ERROR = "Something went wrong. Please try again.";
+// T13d: a chat message that got no reply at all (a network error, our timeout, or a proxy's 502/503/504 without our
+// JSON) is sent once more after this pause, with the same client_message_id, so the server can answer it with the reply
+// it already made instead of running the turn twice. On 13 Oct a message at 12:01:08 UTC never reached the server.
+export const RETRY_DELAY_MS = 1500;
+const PROXY_STATUSES = [502, 503, 504];
 const RATE_LIMIT_FALLBACK = "You're sending messages a little fast. Please wait a moment and try again.";
 
 /** The full URL for an API path such as "/api/chat", without a double slash. */
@@ -24,13 +29,14 @@ export function apiUrl(path) {
  * 503's detail; the chat keeps its short message).
  */
 export class ApiError extends Error {
-  constructor(kind, message, { status = null, retryAfter = null, field = null, detail = null } = {}) {
+  constructor(kind, message, { status = null, retryAfter = null, field = null, detail = null, noReply = false } = {}) {
     super(message);
     this.kind = kind;
     this.status = status;
     this.retryAfter = retryAfter; // seconds, for 429
     this.field = field; // the first invalid field, for 422
     this.detail = detail;
+    this.noReply = noReply; // T13d: no answer from our API at all (network, timeout, a proxy's error page)
   }
 }
 
@@ -55,7 +61,8 @@ export function errorFrom(response, body) {
   }
   if (response.status === 401) return new ApiError("unauthorized", GENERIC_ERROR, { status: 401, detail });
   if (response.status === 404) return new ApiError("not_found", GENERIC_ERROR, { status: 404, detail });
-  return new ApiError("server", GENERIC_ERROR, { status: response.status, detail });
+  const noReply = PROXY_STATUSES.includes(response.status) && body === null; // not our JSON: a proxy answered
+  return new ApiError("server", GENERIC_ERROR, { status: response.status, detail, noReply });
 }
 
 async function request(path, options = {}) {
@@ -66,7 +73,7 @@ async function request(path, options = {}) {
     try {
       response = await fetch(apiUrl(path), { ...options, signal: controller.signal });
     } catch {
-      throw new ApiError("network", GENERIC_ERROR); // offline, CORS refused, DNS, or our timeout
+      throw new ApiError("network", GENERIC_ERROR, { noReply: true }); // offline, CORS refused, DNS, or our timeout
     }
     const body = await response.json().catch(() => null);
     if (!response.ok || body === null) throw errorFrom(response, body);
@@ -107,18 +114,36 @@ export async function getWelcome() {
   return body;
 }
 
+/** A random id for one chat message (UUID v4), or null where the browser can't make one (then nothing is retried). */
+function newMessageId() {
+  return globalThis.crypto?.randomUUID?.() ?? null;
+}
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * POST /api/chat. Leave sessionId null on the first message; the reply carries the id to send next.
- * Returns {session_id, reply, sources, steps, lead, degraded}.
+ * Returns {session_id, reply, sources, steps, lead, degraded, answered_by}. T13d: each message has its own
+ * client_message_id; when no reply arrived at all it is sent once more with the same id (RETRY_DELAY_MS).
  */
-export async function postChat({ message, sessionId }) {
+export async function postChat({ message, sessionId, clientMessageId = newMessageId() }) {
   const payload = { message, channel: "web" };
   if (sessionId) payload.session_id = sessionId;
-  const body = await request("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  if (clientMessageId) payload.client_message_id = clientMessageId;
+  const send = () =>
+    request("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  let body;
+  try {
+    body = await send();
+  } catch (error) {
+    if (!(error instanceof ApiError) || !error.noReply || !clientMessageId) throw error;
+    await pause(RETRY_DELAY_MS);
+    body = await send(); // once, with the same id: the server sends the reply it made, if it made one
+  }
   if (typeof body.reply !== "string" || typeof body.session_id !== "string") {
     throw new ApiError("server", GENERIC_ERROR);
   }

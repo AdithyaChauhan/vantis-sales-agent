@@ -8,6 +8,7 @@ import re
 from langchain_core.messages import HumanMessage
 
 from app.core.prompts import load_prompt
+from app.rag.keywords import key_words
 from app.rag.retriever import RetrievedChunk, SearchResult
 
 logger = logging.getLogger(__name__)
@@ -18,22 +19,31 @@ _CITATION_RE = re.compile(r"KB Section (\d+)")
 _LABEL_RE = re.compile(r"([ \t]*)\[KB Section (\d+)(?::[^\[\]]*)?\]")  # spaces before it, section number
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")  # "4.5 kW" and "₹2,000" are not split
 # A claim that something was saved or logged: "your details are saved", "I've recorded your bill". Future or
-# conditional wording ("will be saved", "once you share it, I can save it") is not a claim (T12a).
-_SAVED = r"(?:saved|recorded|stored|registered|logged)"
+# conditional wording ("will be saved", "once you share it, I can save it") is not a claim (T12a). T13d: "noted",
+# "made a note", "got your …" and "received your …" too ("I've noted that the house is in Lucknow" and "I've got your
+# name, email, city and monthly bill" were said when nothing was stored); "got it" and "we've got three packages" are not
+_SAVED = r"(?:saved|recorded|stored|registered|logged|noted)"
+_GOT = r"(?:got|received|captured|taken\s+down)\s+(?:all\s+)?(?:of\s+)?your\b|(?:made|taken)\s+(?:a\s+)?note\b"
 # Handing on is a claim only when the sentence names who got it: "I've passed your details to the team"
-# (but "I've shared the steps above" is not).
-_HANDED_ON = r"(?:passed|forwarded|sent|shared)"
+# (but "I've shared the steps above" is not). T13d: also without a subject ("Shared your details with the team"), and
+# the team being notified, informed or alerted ("the team has been notified")
+_HANDED_ON = r"(?:passed|forwarded|sent|shared|notified|informed|alerted)"
 _DONE_BY = r"\b(?:i|we)(?:'ve|’ve| have)?\s+(?:now\s+|just\s+|also\s+|already\s+)?"
 _DONE_TO = r"\b(?:is|are|was|were|has been|have been)\s+(?:now\s+|all\s+|already\s+|successfully\s+)?"
-_SAVED_RE = re.compile(rf"{_DONE_BY}{_SAVED}\b|{_DONE_TO}{_SAVED}\b|^\s*(?:all\s+)?{_SAVED}\b", re.IGNORECASE)
-_HANDED_ON_RE = re.compile(rf"{_DONE_BY}{_HANDED_ON}\b|{_DONE_TO}{_HANDED_ON}\b", re.IGNORECASE)
+_SAVED_RE = re.compile(rf"{_DONE_BY}(?:{_SAVED}\b|{_GOT})|{_DONE_TO}{_SAVED}\b|^\s*(?:all\s+)?{_SAVED}\b",
+                       re.IGNORECASE)
+_HANDED_ON_RE = re.compile(rf"{_DONE_BY}{_HANDED_ON}\b|{_DONE_TO}{_HANDED_ON}\b|^\W*{_HANDED_ON}\b", re.IGNORECASE)
 _TEAM_RE = re.compile(r"\b(?:team|sales|someone|representative|colleague|expert)s?\b", re.IGNORECASE)
 # A thank-you is never a KB fact ("Thank you for your interest ... [KB Section 2]" in the T12a replay)
 _THANKS_RE = re.compile(r"^\W*(?:thanks|thank you)\b", re.IGNORECASE)
 # "The team will follow up" promises a human action that has not happened (KB Section 16); the assistant may
-# only say the team can (T8b rule, slipped on Groq in the T12a replay)
+# only say the team can (T8b rule, slipped on Groq in the T12a replay). T13d: every human action, not only a call
+# ("Vantis will arrange support" in Adithya's live chat). "will confirm" stays: our own callback texts say the team
+# will confirm a logged request.
 _PROMISE_RE = re.compile(
-    r"(\s+will|'ll|’ll)(\s+(?:follow up|call|contact|reach out|get in touch|get back))\b", re.IGNORECASE
+    r"(\s+will|'ll|’ll)(\s+(?:follow up|call|contact|reach out|get in touch|get back|arrange|send|visit|schedule|"
+    r"book|assign|dispatch|fix|repair|replace|inspect|look into|take care of|sort out|handle|resolve|help|assist|"
+    r"set up|connect|coordinate|organi[sz]e|provide|process|raise))\b", re.IGNORECASE
 )
 # KB Section 10's own words ("Reference Locations", "Reference service area") are office terms; the customer reads
 # "service areas" (T12b). Only text outside [KB Section ...] tags is changed, so the label stays exact.
@@ -43,6 +53,24 @@ _REFERENCE_AREA_RE = re.compile(r"\breference\s+(?:service\s+)?(?:locations?|are
 # discount rate" answered "can I get 20% discount?"); it says it can't confirm and offers the sales team
 _UNCOVERED_RE = re.compile(r"\b(?:discounts?|coupons?|cashback|promo(?:tion)?s?|brands?|"
                            r"(?:special|current|seasonal|festive|festival|ongoing)\s+offers?)\b", re.IGNORECASE)
+# T13d: the KB never says a Vantis service is free. "A free consultation" (Groq, live check of 13 Oct) loses the word;
+# a sentence that says something is free, at no cost, complimentary or muft is replaced by the honest line
+_FREE_WORDS = r"(?:free|complimentary|no-cost|muft)"
+_SERVICE_NOUNS = (r"(?:consultations?|site\s+(?:assessments?|visits?|surveys?|inspections?)|assessments?|visits?|"
+                  r"surveys?|inspections?|quotes?|quotations?|estimates?|installations?|maintenance|servicing|"
+                  r"check-?ups?|checks?|calls?|advice|evaluations?|support|services?|demos?)")
+_FREE_BEFORE_NOUN_RE = re.compile(rf"\b(?P<article>an?\s+)?(?<![-\w]){_FREE_WORDS}\s+(?=(?P<noun>{_SERVICE_NOUNS})\b)",
+                                  re.IGNORECASE)
+_FREE_CLAIM_RE = re.compile(
+    r"\b(?:is|are|was|will\s+be|comes?|be)\s+(?:completely\s+|totally\s+|absolutely\s+|also\s+)?"
+    r"(?:free|complimentary)\b(?![-\w])|"
+    r"\bfree\s+of\s+(?:any\s+)?(?:cost|charge)\b|\bat\s+no\s+(?:extra\s+|additional\s+)?(?:cost|charge)\b|"
+    r"\bfor\s+free\b|\bwithout\s+any\s+(?:extra\s+)?(?:cost|charge)\b|\bcosts?\s+(?:you\s+)?nothing\b|"
+    r"\bmuft\b", re.IGNORECASE)
+_KB_SAYS_FREE_RE = re.compile(r"\bfree\b(?![-\w])|\bcomplimentary\b|\bno\s+cost\b|\bwithout\s+charge\b", re.I)
+# T13d: a reply that uses this turn's chunks but cites none gets the tag of the chunk it shares most key words with,
+# only when at least this many are shared (so a source chip shows; Groq often leaves the tag out)
+MIN_SHARED_FOR_TAG = 3
 _CANT_CONFIRM_RE = re.compile(r"\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\s+confirm\b|"
                               r"\b(?:don(?:'|’)?t|do not)\s+have\s+(?:any\s+)?(?:information|details)\b|"
                               r"\bnot sure\b", re.IGNORECASE)
@@ -115,6 +143,11 @@ def strip_unsourced_citations(reply: str, chunks: list[RetrievedChunk]) -> tuple
     chunks (every tag when there are none, e.g. a validation message), and any tag on a question, a thank-you or
     a "saved" or "logged" sentence, which are never KB facts. Returns (reply, tags removed).
 
+    T13d: tags standing alone after such a sentence ("…which option fits best? [KB Section 8: …]") belong to the facts
+    before it, so they move to the end of the last factual sentence or list line (also on an earlier line) when their
+    section is in this turn's chunks; they are removed only when no fact comes before them. The assignment's Q1 and
+    Q2 (S01, S02 in the audit) lost their source chips because the model cited after its closing question.
+
     The prompts ask for this; this is the safety net, and it logs a warning so a slipping prompt shows.
     """
     sections = {c.section_no for c in chunks}
@@ -132,22 +165,39 @@ def strip_unsourced_citations(reply: str, chunks: list[RetrievedChunk]) -> tuple
 
         return _LABEL_RE.sub(one, text)
 
-    lines = []
+    lines: list[list[str]] = []
+    indents: list[str] = []
+    last_fact: tuple[int, int] | None = None  # (line, piece) of the last factual sentence so far
+    moved = 0
     for line in reply.split("\n"):
         kept, facts = [], True
         for piece in split_sentences(line):
             bare = without_tags(piece)
             if bare:  # a sentence; tags alone take the verdict of the sentence before them
                 facts = not (bare.endswith("?") or is_claim(bare) or _THANKS_RE.match(bare))
+            elif not facts and last_fact is not None:  # tags alone after a question: back to the last fact
+                tags = keep_tags(piece, True).strip()
+                if tags:
+                    i, j = last_fact
+                    target = lines[i] if i < len(lines) else kept
+                    target[j] = f"{target[j]} {tags}"
+                    moved += 1
+                continue
             piece = keep_tags(piece, facts).strip()
             if piece:
                 kept.append(piece)
-        indent = re.match(r"[ \t]*", line).group(0)  # keeps a list item's indentation
-        lines.append(indent + " ".join(kept) if kept else "")
-    if not removed:
+                if bare and facts:
+                    last_fact = (len(lines), len(kept) - 1)
+        indents.append(re.match(r"[ \t]*", line).group(0))  # keeps a list item's indentation
+        lines.append(kept)
+    if not removed and not moved:
         return reply, 0
-    logger.warning("reply cited KB sections without support from this turn; removed", extra={"removed": removed})
-    return "\n".join(lines).strip(), removed
+    if removed:
+        logger.warning("reply cited KB sections without support from this turn; removed", extra={"removed": removed})
+    if moved:
+        logger.info("KB tags after a question moved to the facts before it", extra={"moved": moved})
+    text = "\n".join(indent + " ".join(kept) if kept else "" for indent, kept in zip(indents, lines))
+    return text.strip(), removed
 
 
 def soften_promises(reply: str) -> tuple[str, int]:
@@ -199,6 +249,77 @@ def remove_uncovered_policies(reply: str, chunks: list[RetrievedChunk], honest: 
         return reply, []
     logger.warning("reply stated a policy the KB doesn't cover; replaced", extra={"removed": len(removed)})
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip(), removed
+
+
+def remove_free_claims(reply: str, chunks: list[RetrievedChunk], honest: str) -> tuple[str, list[str]]:
+    """No claim that a Vantis service is free (T13d: the KB never says so; Groq wrote "a free consultation" twice in the
+    live check of 13 Oct). "free", "complimentary" or "muft" before a service ("a free consultation") is dropped from
+    the sentence; a sentence that says something is free, at no cost or costs nothing is replaced by `honest` once.
+    Nothing changes when this turn's chunks say something is free. Questions stay. Returns (reply, the removed
+    words or sentences)."""
+    if any(_KB_SAYS_FREE_RE.search(c.content) for c in chunks):
+        return reply, []
+    removed: list[str] = []
+
+    def drop_word(match: re.Match) -> str:
+        removed.append(match.group(0).strip())
+        noun = match.group("noun")
+        if match.group("article"):  # "a free assessment" -> "an assessment"
+            article = "an " if noun[0].lower() in "aeiou" else "a "
+            return article[0].upper() + article[1:] if match.group("article")[0].isupper() else article
+        return ""
+
+    lines, replaced = [], False
+    for line in reply.split("\n"):
+        kept = []
+        for piece in split_sentences(line):
+            text = without_tags(piece)
+            if text and not text.endswith("?") and _FREE_CLAIM_RE.search(text):
+                removed.append(text)
+                if not replaced:
+                    kept.append(honest)
+                    replaced = True
+                continue
+            if text and not text.endswith("?"):
+                piece = _FREE_BEFORE_NOUN_RE.sub(drop_word, piece)
+                piece = re.sub(r"^(\s*)([a-z])", lambda m: m.group(1) + m.group(2).upper(), piece)
+            if piece.strip():
+                kept.append(piece.strip())
+        indent = re.match(r"[ \t]*", line).group(0)
+        lines.append(indent + " ".join(kept) if kept else "")
+    if not removed:
+        return reply, []
+    logger.warning("reply said a Vantis service is free; removed", extra={"removed": len(removed)})
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip(), removed
+
+
+def add_missing_tag(reply: str, chunks: list[RetrievedChunk], skip: tuple[str, ...] = ()) -> tuple[str, str | None]:
+    """When a reply cites no KB section but clearly uses this turn's chunks, add the tag of the chunk it shares the most
+    key words with (at least MIN_SHARED_FOR_TAG), after the sentence that shares the most with it (T13d: Groq often
+    leaves the tag out, so no source chip showed). Questions, claims, thank-yous and the fixed lines in `skip` are never
+    tagged. Returns (reply, the tag added or None)."""
+    if not chunks or _LABEL_RE.search(reply):
+        return reply, None
+    lines = [split_sentences(line) for line in reply.split("\n")]
+    best = None  # (shared, line, piece, chunk)
+    for i, pieces in enumerate(lines):
+        for j, piece in enumerate(pieces):
+            text = without_tags(piece)
+            if (not text or text.endswith("?") or is_claim(text) or _THANKS_RE.match(text)
+                    or any(text == fixed or text in fixed for fixed in skip)):
+                continue
+            words = key_words(text)
+            for chunk in chunks:
+                shared = len(words & key_words(chunk.content))
+                if shared >= MIN_SHARED_FOR_TAG and (best is None or shared > best[0]):
+                    best = (shared, i, j, chunk)
+    if best is None:
+        return reply, None
+    _, i, j, chunk = best
+    tag = citation_label(chunk)
+    lines[i][j] = f"{lines[i][j].rstrip()} {tag}"
+    logger.info("reply cited no KB section; added the best-matching one", extra={"section": chunk.section_no})
+    return "\n".join(" ".join(pieces) for pieces in lines), tag
 
 
 def plain_service_area_words(reply: str) -> tuple[str, int]:

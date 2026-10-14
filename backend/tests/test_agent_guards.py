@@ -79,7 +79,8 @@ def test_a_size_in_the_message_adds_the_catalog_summary():
     state = run(graph, "How much does a 5kW system cost?")
     context = agent.calls[0][-1].content
     assert "Plan B 5 kW" in context  # the KB Section 8 summary (tests/agent_fakes.py)
-    assert [c["chunk_id"] for c in state["chunks"]] == ["s05-pricing", "s08-table-summary"]
+    # T13d: the understand step adds it (also without a search), so it comes before the search's chunks
+    assert [c["chunk_id"] for c in state["chunks"]] == ["s08-table-summary", "s05-pricing"]
 
 
 def test_no_size_no_catalog():
@@ -247,13 +248,20 @@ def test_tool_outcome_reply_says_what_was_written():
     assert tool_outcome_reply([city]) is None and tool_outcome_reply([]) is None
 
 
-def test_a_model_failure_after_only_a_lookup_is_still_try_again():
+def test_a_model_failure_after_only_a_lookup_gets_the_safety_net_with_that_city():
+    """T13d: never "I'm having trouble": the city the model checked with the tool is said in fixed words, with its
+    source (the lookup wrote nothing, so the turn is not a tool outcome)."""
     from app.rag.answer import LLM_DOWN_REPLY
     from tests.agent_fakes import tool_call
 
     agent = Scripted(tool_call("check_service_area", {"city": "Pune"}), RuntimeError("down"))
     graph, _ = make_graph(Scripted(understood(["question"], "areas")), agent)
-    assert run(graph, "Do you install there?")["reply"] == LLM_DOWN_REPLY
+    state = run(graph, "Do you install there?")
+    assert state["reply"] != LLM_DOWN_REPLY
+    assert state["reply"].startswith("I can't confirm service in Pune yet") and "[KB Section 10: Locations]" in state[
+        "reply"]
+    assert (state["answered_by"], state["degraded"]) == ("knowledge_base", True)
+    assert [s["section"] for s in state["sources"]] == ["10"]
 
 
 def test_the_number_guard_step_quotes_each_removed_sentence():
@@ -334,7 +342,10 @@ def test_no_package_rule_with_a_settled_size_a_contact_request_or_a_support_case
     agent = Scripted(answer("Thanks."))
     graph, _ = make_graph(Scripted(understood(intents, None, **details)), agent)
     state = run(graph, "My bill is 4000 for my home")
-    assert state["chunks"] == []
+    # T13d: a size stated this turn brings the KB Section 8 summary (so the 5 kW package can be named), never the
+    # Section 9 rows of the bill rule
+    sized = "system_size_kw" in details and "existing_customer_issue" not in intents
+    assert [c["chunk_id"] for c in state["chunks"]] == (["s08-table-summary"] if sized else [])
     assert RULE not in agent_input(agent) and "{package_guidance}" not in agent_input(agent)
 
 

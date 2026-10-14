@@ -100,7 +100,8 @@ def make_tools(
             return _json({"saved": True, "lead_id": state["lead_id"], "note": note}), {}
         result = service.create_lead(
             ops.engine, lead, session_id=state.get("session_id") or None, llm=ops.reason_llm,
-            areas=areas(), reason_now=ops.reason_now,
+            areas=areas(), reason_now=ops.reason_now, callback_time=state.get("callback_time"),
+            call_requested=bool(state.get("call_requested")),
         )
         ops.calls.append("create")
         if result.lead is None:
@@ -122,7 +123,7 @@ def make_tools(
         pending = False
         if changes:
             result = service.update_lead(ops.engine, lead_id, changes, llm=ops.reason_llm, areas=areas(),
-                                         reason_now=ops.reason_now)
+                                         reason_now=ops.reason_now, call_requested=bool(state.get("call_requested")))
             ops.calls.append("update")
             pending = result.lead.reason_source == "template" and not ops.reason_now
             content = {"saved": True, "fields_saved": sorted(changes)}

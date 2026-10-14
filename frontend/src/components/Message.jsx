@@ -59,7 +59,12 @@ export default function Message({ message }) {
             <p className="visually-hidden">Vantis assistant:</p>
             <ReplyText text={message.text} />
           </div>
-          <StepsPanel steps={message.steps ?? []} elapsedMs={message.elapsedMs} degraded={message.degraded} />
+          <StepsPanel
+            steps={message.steps ?? []}
+            elapsedMs={message.elapsedMs}
+            degraded={message.degraded}
+            answeredBy={message.answeredBy}
+          />
         </div>
         <SourceChips sources={message.sources} />
         <MessageTime at={message.at} />

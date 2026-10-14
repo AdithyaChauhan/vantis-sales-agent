@@ -10,6 +10,7 @@ Run:
     python -m scripts.serve_test_branch --port 8001 --slow-gemini      (restart the server for the drill)
     python -m scripts.live_scenarios --group slow --base-url http://127.0.0.1:8001
     python -m scripts.live_scenarios --group replay --base-url http://127.0.0.1:8001   (T13c, about 25 model calls)
+    python -m scripts.live_scenarios --group t13d --base-url http://127.0.0.1:8001     (T13d, about 25 model calls)
 
 Groups:
 - holdout: the 8 held-out questions (data/eval/holdout_eval.jsonl), one session each (assignment: unknown info)
@@ -18,6 +19,8 @@ Groups:
   minute can refill
 - replay: C8, chat 1 of Adithya's break-it test on the live site (T13c), without its three retry turns, then the
   discount question
+- t13d: the assignment's Q1 and Q2 keep their sources, "5 kW for my house" names its package, a what-if is not a fault,
+  a Hindi business word, a call request is ready, "just exploring" is COLD, and no third ask after two skipped ones
 
 For each turn it prints the reply and PASS or FAIL for each check, then a markdown table for docs/EVAL.md.
 The number check reads the whole KB (read-only, from DATABASE_URL): a reply may state only numbers the KB, the
@@ -35,7 +38,7 @@ from app.leads.validators import PHONE_INVALID
 from app.rag.answer import LLM_DOWN_REPLY, is_claim, split_sentences, without_tags
 from app.rag.numbers import known_numbers, number_mentions, unsupported
 
-PAUSE_S = {"holdout": 20, "edge": 20, "slow": 65, "replay": 20}
+PAUSE_S = {"holdout": 20, "edge": 20, "slow": 65, "replay": 20, "t13d": 20}
 
 
 @dataclass
@@ -262,6 +265,46 @@ def not_down() -> Check:
     return "not 'try again'", lambda r, c: _reply(r) != LLM_DOWN_REPLY
 
 
+def kb_grounded() -> Check:
+    """T13d: the reply cites a KB section and the API returns its source."""
+    return ("KB-grounded (a tag and a source)",
+            lambda r, c: "[KB Section " in _reply(r) and bool(r.get("sources")))
+
+
+def lead_status(status: str) -> Check:
+    """The lead's status in the demo panel (serve_test_branch turns CHAT_SHOW_LEAD_SCORE on)."""
+    return f"lead status {status}", lambda r, c: _lead(r).get("status") == status
+
+
+def customer_type_is(kind: str) -> Check:
+    return f"customer type {kind}", lambda r, c: _lead(r).get("customer_type") == kind
+
+
+def not_a_support_case() -> Check:
+    """T13d: a what-if is a question: no existing_customer_issue intent left, and no support request asked for."""
+    def check(response: dict, ctx: Context) -> bool:
+        understand = next((s for s in response.get("steps", []) if s.get("node") == "understand"), {})
+        return "existing_customer_issue" not in understand.get("data", {}).get("intents", [])
+    return "a what-if, not a support case", check
+
+
+def understand_failed() -> Check:
+    return ("understand failed (raw message used)",
+            lambda r, c: any(s.get("node") == "understand" and s.get("detail") == "failed, raw message used"
+                             for s in r.get("steps", [])))
+
+
+def no_ask_once_parked() -> Check:
+    """T13d: after two skipped questions about their details, the reply asks for none (passes while not parked)."""
+    def check(response: dict, ctx: Context) -> bool:
+        understand = next((s for s in response.get("steps", []) if s.get("node") == "understand"), {})
+        if understand.get("data", {}).get("skipped_asks", 0) < 2:
+            return True
+        return not any(re.search(pattern, q, re.I) for q in _question_sentences(_reply(response))
+                       for pattern in _ASKS_FOR.values())
+    return "no question for details after two skipped ones", check
+
+
 def answered_by_groq() -> Check:
     def check(response: dict, ctx: Context) -> bool:
         providers = [s["data"].get("provider") for s in response.get("steps", []) if s.get("node") == "agent"]
@@ -373,6 +416,40 @@ REPLAY = [
     ]),
 ]
 
+# T13d: Adithya's live findings and the assignment's own example questions
+T13D = [
+    Scenario("D1", "t13d", "assignment Q1 keeps its source", [
+        Turn("What solar systems do you provide?", [not_down(), cites(8), kb_grounded(), *COMMON]),
+    ]),
+    Scenario("D2", "t13d", "assignment Q2 keeps its sources, no price", [
+        Turn("How much does a 5kW system cost?", [not_down(), kb_grounded(), no_amounts(), *COMMON]),
+    ]),
+    Scenario("D3", "t13d", "5 kW for my house names its package", [
+        Turn("I want a 5 kW system for my house", [mentions(r"HomePro\s*5", "names HomePro 5"), cites(8), *COMMON]),
+    ]),
+    Scenario("D4", "t13d", "a Hinglish what-if is a question, not a fault", [
+        Turn("agar inverter kharab ho jaye to kya karna padega", [not_a_support_case(), not_down(), *COMMON]),
+    ]),
+    Scenario("D5", "t13d", "a Hindi business word", [
+        Turn("meri dukan Lucknow mein hai, uske liye solar lagwana hai", [customer_type_is("commercial"), *COMMON]),
+    ]),
+    Scenario("D6", "t13d", "a call request is ready intent", [
+        Turn("Can someone from Vantis call me?", [mentions(r"name|phone|number", "asks for name and phone"), *COMMON]),
+        Turn("Neha Gupta, 9876500003, my house is in Noida",
+             [lead_saved(), known("intent_level"), lead_status("WARM"), *COMMON]),
+    ]),
+    Scenario("D7", "t13d", "just exploring is COLD", [
+        Turn("Just exploring solar for now, maybe next year", [no_lead(), *COMMON]),
+        Turn("I'm Vikram Rao, 9876500004, house in Kanpur, bill around 3000",
+             [lead_saved(), lead_status("COLD"), *COMMON]),
+    ]),
+    Scenario("D8", "t13d", "no third ask after two skipped questions", [
+        Turn("I want rooftop solar for my home", [no_lead(), *COMMON]),
+        Turn("What warranty do you give on the panels?", [no_ask_once_parked(), *COMMON]),
+        Turn("And how long does an installation usually take?", [no_ask_once_parked(), *COMMON]),
+    ]),
+]
+
 SLOW = [
     Scenario("C4", "slow", "service failure: Gemini forced down (--slow-gemini), lead saved on Groq", [
         Turn("Do you install in Kanpur? I'd like a 3 kW system for my house.",
@@ -380,6 +457,11 @@ SLOW = [
         Turn("I'd like it installed next month.", [not_down(), answered_by_groq(), no_lead(), *COMMON]),
         Turn("Rohan Verma, 9876500002",
              [not_down(), lead_saved(), city_is("Kanpur"), known("name"), known("phone"), *COMMON]),
+    ]),
+    # T13d (Adithya): understand fails in the drill (Groq is kept for answers), so a Hinglish question without a "?"
+    # must still be searched on its raw words and answered from the KB
+    Scenario("C4b", "slow", "a Hinglish question without '?' while understand fails", [
+        Turn("subsidy milti hai kya sarkar se", [understand_failed(), not_down(), kb_grounded(), *COMMON]),
     ]),
 ]
 
@@ -486,14 +568,14 @@ def scenarios_for(group: str) -> list[Scenario]:
         from scripts.eval_retrieval import HOLDOUT_QUESTIONS, load_questions
 
         return holdout_scenarios([(q.id, q.question) for q in load_questions(HOLDOUT_QUESTIONS)])
-    return {"edge": EDGE, "slow": SLOW, "replay": REPLAY}[group]
+    return {"edge": EDGE, "slow": SLOW, "replay": REPLAY, "t13d": T13D}[group]
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run one group against the server; print every reply, its checks and a markdown table."""
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Live T12b scenarios against a running serve_test_branch.")
-    parser.add_argument("--group", choices=("holdout", "edge", "slow", "replay"), required=True)
+    parser.add_argument("--group", choices=("holdout", "edge", "slow", "replay", "t13d"), required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--pause", type=float, default=None, help="seconds between turns (default: by group)")
     parser.add_argument("--only", default=None, help="run one scenario id (e.g. C3a)")

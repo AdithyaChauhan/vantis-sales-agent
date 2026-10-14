@@ -50,6 +50,9 @@ services:
         value: gemini-3.5-flash-lite
       - key: LLM_MODEL_FAST
         value: gemini-3.1-flash-lite
+      # standard sends nothing; priority needs a Tier 2/3 paid Gemini project (backend/.env.example)
+      - key: GEMINI_SERVICE_TIER
+        value: standard
       - key: EMBEDDING_MODEL
         value: gemini-embedding-2
       - key: EMBEDDING_DIM
@@ -58,6 +61,9 @@ services:
         value: "0.63"
       - key: FALLBACK_MODEL
         value: openai/gpt-oss-120b
+      # a second Groq model for answers, with its own per-model limits (backend/.env.example)
+      - key: FALLBACK_MODEL_2
+        value: openai/gpt-oss-20b
       # The Vercel production site only, exactly as the browser sends it in the Origin header (docs/DEPLOY.md,
       # "T13b steps"): no trailing slash, no preview URLs, no localhost
       - key: CORS_ORIGINS

@@ -40,10 +40,10 @@ def test_response_shape(client, use_agent):
     response = post(client, "What do you offer?")
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"session_id", "reply", "sources", "steps", "lead", "degraded"}
+    assert set(body) == {"session_id", "reply", "sources", "steps", "lead", "degraded", "answered_by"}
     assert uuid.UUID(body["session_id"])  # a new id when none was given
     assert body["reply"] == CITED
-    assert body["lead"] is None and body["degraded"] is False
+    assert body["lead"] is None and body["degraded"] is False and body["answered_by"] == "model"
     assert [s["section"] for s in body["sources"]] == ["8"]
     assert set(body["sources"][0]) == {"section", "title", "page", "snippet"}
     assert [s["node"] for s in body["steps"]] == ["understand", "retrieve", "agent"]
@@ -78,7 +78,10 @@ def test_llm_failure_is_200_and_degraded(client, use_agent):
     response = post(client, "What do you offer?")
     assert response.status_code == 200
     body = response.json()
-    assert (body["reply"], body["degraded"], body["sources"]) == (LLM_DOWN_REPLY, True, [])
+    # T13d: the safety net answers, never "I'm having trouble": a question about the offer gets the KB Section 8 list
+    assert (body["degraded"], body["answered_by"]) == (True, "knowledge_base")
+    assert [s["section"] for s in body["sources"]] == ["8"] and body["reply"] != LLM_DOWN_REPLY
+    assert body["reply"].startswith("1. Plan A 3 kW\n2. Plan B 5 kW [KB Section 8: Catalog]")
 
 
 @pytest.mark.parametrize(
@@ -350,3 +353,65 @@ def test_a_failed_lead_write_is_a_friendly_503_and_the_chat_carries_on(client, u
     assert "saved" not in failed.text.lower()  # never a claim that the lead was saved
     later = post(client, "What do you offer?", session_id=session_id)
     assert later.status_code == 200 and later.json()["degraded"] is False
+
+
+# ---------- T13d: a message sent again because no reply arrived ----------
+
+def test_a_repeated_message_id_gets_the_saved_reply_without_a_second_turn(client):
+    agent = StateAgent()
+    calls = []
+    original = agent.invoke
+
+    def counting(payload, config):
+        calls.append(payload["messages"][0].content)
+        return original(payload, config)
+
+    agent.invoke = counting
+    app.dependency_overrides[get_agent] = lambda: agent
+    message_id = str(uuid.uuid4())
+    first = post(client, "Rakesh Sharma, 9876543210", client_message_id=message_id).json()
+    again = post(client, "Rakesh Sharma, 9876543210", client_message_id=message_id).json()  # no session yet either
+    assert again == first and len(calls) == 1
+    same_session = post(client, "hi", session_id=first["session_id"], client_message_id=message_id).json()
+    assert same_session == first and len(calls) == 1
+    other = post(client, "hi", session_id=str(uuid.uuid4()), client_message_id=message_id).json()
+    assert other["session_id"] != first["session_id"] and len(calls) == 2  # another session never gets this reply
+    post(client, "hi", session_id=first["session_id"], client_message_id=str(uuid.uuid4()))
+    assert len(calls) == 3  # a new id is a new message
+
+
+def test_a_repeat_that_arrives_mid_turn_waits_and_gets_the_same_reply(client):
+    agent = StateAgent(delay=0.3)
+    app.dependency_overrides[get_agent] = lambda: agent
+    session_id, message_id = str(uuid.uuid4()), str(uuid.uuid4())
+    replies = []
+
+    def send():
+        replies.append(post(client, "hi", session_id=session_id, client_message_id=message_id).json())
+
+    threads = [threading.Thread(target=send) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert replies[0] == replies[1] and agent.max_active == 1
+
+
+@pytest.mark.parametrize("bad", ["not-a-uuid", "00000000-0000-0000-0000-000000000000",
+                                 "6fa459ea-ee8a-3ca4-894e-db77e160355e"])  # nil and a version-3 UUID
+def test_only_a_random_uuid_is_a_message_id(client, bad):
+    app.dependency_overrides[get_agent] = lambda: StateAgent()
+    response = post(client, "hi", client_message_id=bad)
+    assert response.status_code == 422 and "client_message_id" in response.json()["errors"]
+
+
+def test_saved_replies_expire_and_stay_few():
+    clock = [0.0]
+    replies = chat_api.RecentReplies(max_items=2, ttl_s=10, clock=lambda: clock[0])
+    reply = chat_api.ChatResponse(session_id="s", reply="r", sources=[], steps=[], degraded=False)
+    for name in ("a", "b", "c"):
+        replies.put(name, reply)
+    assert replies.get("a", None) is None and replies.get("c", None) == reply  # the oldest went
+    clock[0] = 11
+    assert replies.get("c", None) is None  # too old
+    assert replies.get(None, None) is None

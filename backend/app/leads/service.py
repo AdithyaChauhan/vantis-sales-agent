@@ -97,12 +97,16 @@ def create_lead(
     llm: Runnable | None = None,
     areas: ServiceAreas | None = None,
     reason_now: bool = True,
+    callback_time: str | None = None,
+    call_requested: bool = False,
 ) -> CreateLeadResult:
     """Validate, score and save a lead. Saves nothing (and lists what is missing) until the minimum is there.
 
     A second call with the same session_id updates that session's lead instead of creating another, even
     when two calls race (the UNIQUE session_id constraint decides). reason_now=False saves the template
-    reason, so a caller can have the LLM write it after replying (refresh_reason).
+    reason, so a caller can have the LLM write it after replying (refresh_reason). callback_time (T13d): when the
+    customer already asked to be called at a time, the recommended action names it from the start; call_requested
+    (T13d): they asked for a call without a time.
     """
     if channel not in CHANNELS:
         raise ValueError(f"channel must be one of {CHANNELS}")
@@ -110,7 +114,7 @@ def create_lead(
         with Session(engine) as session:
             existing_id = session.scalar(select(Lead.id).where(Lead.session_id == session_id))
         if existing_id is not None:
-            updated = update_lead(engine, existing_id, raw, llm=llm, areas=areas)
+            updated = update_lead(engine, existing_id, raw, llm=llm, areas=areas, call_requested=call_requested)
             return CreateLeadResult(lead=updated.lead, errors=updated.errors)
 
     data, errors = LeadData.from_raw(raw)
@@ -138,7 +142,7 @@ def create_lead(
         score_breakdown=breakdown,
         reason=reason,
         reason_source=reason_source,
-        recommended_action=recommended_action(breakdown, data),
+        recommended_action=recommended_action(breakdown, data, callback_time, call_requested),
     )
     try:
         with Session(engine, expire_on_commit=False) as session, session.begin():
@@ -153,7 +157,7 @@ def create_lead(
         logger.info("lead create raced for one session; updating the existing lead")
         with Session(engine) as session:
             existing_id = session.scalar(select(Lead.id).where(Lead.session_id == session_id))
-        updated = update_lead(engine, existing_id, raw, llm=llm, areas=areas)
+        updated = update_lead(engine, existing_id, raw, llm=llm, areas=areas, call_requested=call_requested)
         return CreateLeadResult(lead=updated.lead, errors=updated.errors)
     _log("lead created", row)
     return CreateLeadResult(lead=view, errors=errors)
@@ -167,8 +171,10 @@ def update_lead(
     llm: Runnable | None = None,
     areas: ServiceAreas | None = None,
     reason_now: bool = True,
+    call_requested: bool = False,
 ) -> UpdateLeadResult:
-    """Merge new valid details into a lead, re-check the city if it changed, re-score and save.
+    """Merge new valid details into a lead, re-check the city if it changed, re-score and save. call_requested (T13d):
+    the customer asked for a call without a time, so the action says to call them.
 
     The reason is rewritten only when the score or the status changed (saves LLM quota); with
     reason_now=False the template is saved and refresh_reason writes the LLM reason later.
@@ -209,7 +215,7 @@ def update_lead(
         row.lead_status = breakdown["lead_status"]
         row.score_breakdown = breakdown
         row.reason, row.reason_source = reason, reason_source
-        row.recommended_action = recommended_action(breakdown, data, callback_time)
+        row.recommended_action = recommended_action(breakdown, data, callback_time, call_requested)
         session.flush()
         session.refresh(row)
         view = LeadView.model_validate(row)

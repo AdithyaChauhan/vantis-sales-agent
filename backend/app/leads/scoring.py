@@ -8,6 +8,7 @@ from app.leads.schemas import LeadData
 HOT_MIN = 75
 WARM_MIN = 45
 CAPPED_MAX = HOT_MIN - 1  # a capped lead is at most WARM, and its score at most 74
+COLD_MAX = WARM_MIN - 1  # T13d: the exploring cap keeps a lead COLD, and its score at most 44
 
 INTENT_POINTS = {"ready": 25, "interested": 15, "exploring": 5, None: 0}
 REQUIREMENT_POINTS = {"clear": 20, "vague": 10, "none": 0}
@@ -33,12 +34,22 @@ TIMELINE_LABELS = {
 CAP_LABELS = {
     "unverified_location": "City not in the listed service areas: capped at WARM",
     "outside_catalog": "Requirement outside the reference packages: capped at WARM",
+    "exploring": "Only exploring, with no timeline under 3 months: capped at COLD",
 }
+# The highest score each cap allows (T13d: a cap now has its own limit)
+CAP_MAX = {"unverified_location": CAPPED_MAX, "outside_catalog": CAPPED_MAX, "exploring": COLD_MAX}
+# A timeline under 3 months: an exploring lead with one is not capped (the assignment's Cold: "exploratory intent")
+NEAR_TIMELINES = ("lt_1m", "1_3m")
 
 HOT_ACTION = "Contact the lead within 1 hour and offer a site assessment."
 WARM_ACTION = "Follow up within 24 hours."
 COLD_ACTION = "Add to the nurture list, share product information and follow up in 30 days."
 COLD_AFTER_CALLBACK = "Add to the nurture list and share product information."
+# T13d: a COLD lead with ready intent asked to be contacted (or is ready to buy): a call, never "follow up in 30 days"
+# (audit S21: "can someone call me?" plus details was saved with "follow up in 30 days")
+COLD_READY_ACTION = "Call the customer within 24 hours: they asked to be contacted or are ready to buy."
+# T13d (Adithya): the customer asked to be called but gave no time: whatever the status, the action starts with this
+CALL_REQUESTED_ACTION = "Call the customer within 24 hours; they asked for a call."
 
 # What keeps a lead from the next status, in a few words for the reason (T12a). Labels only: never a name,
 # contact detail or amount. Signals that more details can't change (a city not on the KB list, renting or
@@ -57,9 +68,10 @@ CONTACT_GAPS = {"Phone given": "no email", "Email given": "no phone number"}  # 
 CAP_CAUSES = {
     "unverified_location": "city not in the listed service areas",
     "outside_catalog": "requirement outside the reference packages",
+    "exploring": "only exploring, no timeline under 3 months",
 }
 # The rule a cap's cause belongs to, so a reason never names it twice (T12b); outside_catalog has no rule of its own
-CAP_RULES = {"unverified_location": "location", "outside_catalog": "catalog"}
+CAP_RULES = {"unverified_location": "location", "outside_catalog": "catalog", "exploring": "intent"}
 GAP_ORDER = ["timeline", "requirement", "intent", "location", "contact", "property"]  # ties: timeline first
 
 
@@ -131,13 +143,21 @@ def score_lead(lead: LeadData, location_status: str) -> dict:
         _property(lead),
     ]
     raw_score = sum(r["points"] for r in rules)
-    caps = []
-    if raw_score > CAPPED_MAX:  # a cap that would change nothing is not recorded (T12a)
-        if location_status == "unverified":
-            caps.append({"rule": "unverified_location", "label": CAP_LABELS["unverified_location"]})
-        if lead.requirement_outside_catalog:
-            caps.append({"rule": "outside_catalog", "label": CAP_LABELS["outside_catalog"]})
-    lead_score = min(raw_score, CAPPED_MAX) if caps else raw_score
+    applies = []
+    if location_status == "unverified":
+        applies.append("unverified_location")
+    if lead.requirement_outside_catalog:
+        applies.append("outside_catalog")
+    # T13d (the assignment's Cold: "exploratory intent"): only exploring stays COLD without a timeline under 3 months.
+    # "Just exploring, maybe next year" plus details scored WARM 56 in the audit (S22)
+    if lead.intent_level == "exploring" and lead.timeline_bucket not in NEAR_TIMELINES:
+        applies.append("exploring")
+    # Only the caps that lower the score are recorded (T12a), and of those the strictest (T13d): a lead that the
+    # exploring cap keeps at 44 does not also list the 74 caps
+    lowering = [rule for rule in applies if raw_score > CAP_MAX[rule]]
+    limit = min((CAP_MAX[rule] for rule in lowering), default=None)
+    caps = [{"rule": rule, "label": CAP_LABELS[rule]} for rule in lowering if CAP_MAX[rule] == limit]
+    lead_score = min(raw_score, limit) if limit is not None else raw_score
     return {
         "rules": rules,
         "raw_score": raw_score,
@@ -212,19 +232,28 @@ def next_status_gap(breakdown: dict) -> tuple[str, list[str]] | None:
     return None if gap is None else (gap[0], [label for _, label in gap[1]])
 
 
-def recommended_action(breakdown: dict, lead: LeadData, callback_time: str | None = None) -> str:
+def recommended_action(breakdown: dict, lead: LeadData, callback_time: str | None = None,
+                       call_requested: bool = False) -> str:
     """Fixed next step for the sales team, from the status (plus the gaps for a WARM lead).
 
     A callback time the customer asked for replaces the status's own timing (T12a), so the action never says
-    "within 24 hours" next to "the day after tomorrow".
+    "within 24 hours" next to "the day after tomorrow". T13d: a call they asked for without a time starts the action
+    with CALL_REQUESTED_ACTION, whatever the status.
     """
     status = breakdown["lead_status"]
     call = f"Call {callback_time.strip().rstrip('.!?')}, as requested" if callback_time else None
+    asked = call is None and call_requested
     if status == "HOT":
+        if asked:
+            return f"{CALL_REQUESTED_ACTION} Offer a site assessment."
         return f"{call}, and offer a site assessment." if call else HOT_ACTION
     if status == "COLD":
-        return f"{call}. {COLD_AFTER_CALLBACK}" if call else COLD_ACTION
-    parts = [f"{call}." if call else WARM_ACTION]
+        if call:
+            return f"{call}. {COLD_AFTER_CALLBACK}"
+        if asked:
+            return CALL_REQUESTED_ACTION
+        return COLD_READY_ACTION if lead.intent_level == "ready" else COLD_ACTION
+    parts = [f"{call}." if call else CALL_REQUESTED_ACTION if asked else WARM_ACTION]
     rules = {r["rule"]: r for r in breakdown["rules"]}
     if rules["location"]["value"] == "unverified":
         parts.append(f"Verify service availability for {lead.city}.")
@@ -241,7 +270,8 @@ def recommended_action(breakdown: dict, lead: LeadData, callback_time: str | Non
 def missing_for_creation(lead: LeadData) -> list[str]:
     """What must still be asked before a lead is saved (empty list = ready to save).
 
-    Name, AND phone or email, AND city, AND some need (requirement, bill, usage, size or property type).
+    Name, AND phone or email, AND city, AND some need (requirement, bill, usage, size, property type, or T13d: whether
+    it is a home or a business; audit S19: "for my home" with name, phone and city saved nothing).
     """
     missing = []
     if not lead.name:
@@ -250,9 +280,8 @@ def missing_for_creation(lead: LeadData) -> list[str]:
         missing.append("phone or email")
     if not lead.city:
         missing.append("city")
-    has_need = any(
-        (lead.requirement, lead.monthly_bill_inr, lead.monthly_units_kwh, lead.system_size_kw, lead.property_type)
-    )
+    has_need = any((lead.requirement, lead.monthly_bill_inr, lead.monthly_units_kwh, lead.system_size_kw,
+                    lead.property_type, lead.customer_type))
     if not has_need:
         missing.append("requirement, monthly bill, usage, system size or property type")
     return missing

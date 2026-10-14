@@ -9,6 +9,9 @@ understand ─┬─ only a greeting ─► welcome ─┐
 Every external piece (LLMs, search, service areas, KB hints, leads database, checkpointer) comes in
 through AgentDeps, so tests run the real graph with fakes. The lead tools (T8b) read the draft from the
 state; finalize saves new details of an existing lead once (if the update_lead tool did not already).
+
+T13d: when every answer model failed (and the last try too), the agent node only marks the turn; finalize then saves a
+ready lead the model didn't save and answers from this turn's KB chunks (app/agent/fallback.py), never "try again".
 """
 import json
 import logging
@@ -25,14 +28,18 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from app.agent import welcome
+from app.agent.fallback import fallback_reply
 from app.agent.leads import (
-    LeadOps, changed_fields, chat_intent, confirmed_city, drop_known_city_question, fix_callback_claims, is_clock_time,
-    keep_one_question, lead_summary, merge_callback_time, own_details_question, package_case, passing_place_kinds,
-    pending_changes, place_type, remove_false_claims, resolve_city, ruled_out_details, short_answer_details,
-    status_block,
+    LeadOps, add_saved_line, changed_fields, chat_intent, confirmed_city, drop_detail_questions,
+    drop_known_city_question, fix_callback_claims, is_clock_time, keep_one_question, lead_summary, merge_callback_time,
+    own_details_question, package_case, passing_place_kinds, pending_changes, place_type, remove_false_claims,
+    resolve_city, ruled_out_details, save_ready_lead, short_answer_details, skipped_asks, status_block,
 )
 from app.agent.packages import SIZE_RE, add_all_packages, all_or_no_packages, reference_packages
 from app.agent.state import AgentState
+from app.agent.text_details import (
+    asks_to_be_called, asks_what_is_offered, details_from_text, is_go_ahead, is_what_if, reports_problem_now,
+)
 from app.agent.tools import make_tools, service_area_data, tool_step
 from app.agent.understand import KbHints, Understanding, load_kb_hints, understand
 from app.core.config import get_settings
@@ -42,13 +49,14 @@ from app.leads import service
 from app.core.prompts import load_prompt
 from app.leads.schemas import CUSTOMER_TYPE_OF, LeadData
 from app.rag.answer import (
-    LLM_DOWN_REPLY, normalize_citations, pick_sources, plain_service_area_words, rag_message, remove_uncovered_policies,
-    retrieve_step, soften_promises, strip_tool_citations, strip_unsourced_citations, tidy_citations,
+    add_missing_tag, normalize_citations, pick_sources, plain_service_area_words, rag_message, remove_free_claims,
+    remove_uncovered_policies, retrieve_step, soften_promises, strip_tool_citations, strip_unsourced_citations,
+    tidy_citations,
 )
 from app.rag.chunker import CATALOG_SECTION, SERVICE_AREA_SECTION, SUMMARY_SECTIONS
 from app.rag.numbers import remove_unsupported_numbers
 from app.rag.retriever import RetrievedChunk, SearchResult, search
-from app.services.service_areas import ServiceAreas, get_service_areas
+from app.services.service_areas import ServiceAreas, get_service_areas, lookalike_place
 
 logger = logging.getLogger(__name__)
 
@@ -143,13 +151,14 @@ def package_guidance(case: str | None) -> str:
     return load_prompt("package_guidance_prompt").replace("{property}", case) if case else ""
 
 
-def tool_outcome_reply(scratch: list[BaseMessage]) -> str | None:
-    """What this turn's tools wrote, in fixed words, for when the model fails after them (T12b): in the slow-Google
-    drill Groq ran out of tokens on the call after a tool round, and "try again" after a saved lead is false.
-    None when no tool wrote anything (the reply is then the usual "try again")."""
+def tool_outcome_reply(scratch: list[BaseMessage], written: list[dict] = ()) -> str | None:
+    """What this turn wrote, in fixed words: the tools' results in `scratch` plus `written` (T13d: the code's own save in
+    finalize, as artifacts of the same shape). For when the model fails after them (T12b: in the slow-Google drill Groq
+    ran out of tokens on the call after a tool round, and "try again" after a saved lead is false) and for a lead the
+    code saved after the model answered. None when nothing was written."""
     lines = []
-    for message in scratch:
-        artifact = message.artifact if isinstance(message, ToolMessage) and isinstance(message.artifact, dict) else {}
+    artifacts = [m.artifact for m in scratch if isinstance(m, ToolMessage) and isinstance(m.artifact, dict)]
+    for artifact in artifacts + list(written):
         if artifact.get("kind") == "lead" and artifact.get("created"):
             lines.append(welcome.SAVED_FALLBACK_TEXT)
         elif artifact.get("kind") == "callback":
@@ -184,6 +193,20 @@ def _dedupe(chunks: list[dict]) -> list[dict]:
     return unique
 
 
+def tool_area_checks(scratch: list[BaseMessage]) -> list[dict]:
+    """The service-area results of this turn's check_service_area calls (the JSON line before the context)."""
+    checks = []
+    for message in scratch:
+        if isinstance(message, ToolMessage) and message.name == "check_service_area":
+            try:
+                data = json.loads(str(message.content).split("\n\n", 1)[0])
+            except ValueError:
+                continue
+            if data.get("status") in ("listed", "unverified"):
+                checks.append({**data, "by": "tool"})
+    return checks
+
+
 def _tool_chunks(scratch: list[BaseMessage], name: str) -> list[dict]:
     """The KB chunks (artifacts) of this turn's results from the tool `name`."""
     return [c for m in scratch if isinstance(m, ToolMessage) and m.name == name for c in (m.artifact or [])]
@@ -205,15 +228,44 @@ def build_graph(deps: AgentDeps):
         message = state["messages"][-1].content
         history = state["messages"][:-1]
         previous = state["messages"][-2] if len(state["messages"]) > 1 else None
+        from_text: dict = {}
         try:
             out = understand(deps.understand_llm, deps.hints_fn(), message, history)
             degraded = False
-        except LLMError as exc:  # carry on with the raw message as the search query
+        except LLMError as exc:
+            # T13d: the KB search always runs on the raw message (Hinglish questions rarely end in "?": "subsidy milti
+            # hai kya sarkar se"), and the details are read in code, so a failed turn keeps the phone, email, city, bill
+            # and size it was given (and the name, from clear patterns only)
             logger.warning("understand failed, using the raw message: %s", type(exc).__name__)
-            out = {"intents": ["question"], "search_query": message, "details": {}, "asked_city": None, "cities": [],
-                   "callback_time": None, "issue": None, "project_details": None, "declines": False,
-                   "provider": None, "model": None, "latency_ms": None, "tokens": None}
+            try:
+                areas = deps.areas_fn()
+            except Exception:  # the list can't be read: listed cities aren't found in the words
+                areas = None
+            from_text = details_from_text(str(message), areas)
+            asks_call = asks_to_be_called(str(message))  # a request to be called is ready intent (T13d)
+            out = {"intents": ["question"] + (["gives_details"] if from_text else [])
+                   + (["contact_request"] if asks_call else []), "search_query": message,
+                   "details": from_text, "asked_city": None, "cities": [], "callback_time": None, "issue": None,
+                   "project_details": None, "declines": False, "provider": None, "model": None, "latency_ms": None,
+                   "tokens": None}
             degraded = True
+        # T13d: a what-if ("agar inverter kharab ho jaye to kya karna padega") is a question, not a fault: only a problem
+        # the customer has now opens a support request
+        what_if = ("existing_customer_issue" in out["intents"] and is_what_if(str(message))
+                   and not reports_problem_now(str(message)))
+        if what_if:
+            kept = [i for i in out["intents"] if i != "existing_customer_issue"]
+            out = {**out, "intents": kept + ([] if "question" in kept else ["question"]), "issue": None,
+                   "search_query": out["search_query"] or str(message)}
+        # T13d: a listed city used only inside another place's name or as a landmark ("Greater Noida", "Lucknow ke paas
+        # ek gaon") is that other place, never the listed city, whatever the extractor wrote
+        def place(name):
+            return (lookalike_place(str(message), str(name)) or name) if name else name
+
+        if out["details"].get("city") or out["asked_city"] or out.get("cities"):
+            out = {**out, "details": {**out["details"], **({"city": place(out["details"]["city"])}
+                                                          if out["details"].get("city") else {})},
+                   "asked_city": place(out["asked_city"]), "cities": [place(n) for n in out.get("cities", [])]}
         short = short_answer_details(previous, str(message), out["details"])  # a bare "3500" or "yes" (T12a)
         data, errors = LeadData.from_raw({**out["details"], **short})
         clean = data.model_dump(exclude_none=True)
@@ -297,6 +349,8 @@ def build_graph(deps: AgentDeps):
                 "from_words": sorted(kind),
                 "dropped": dropped,
                 "intent_from_chat": bool(intent),
+                "from_text": sorted(from_text),
+                "what_if": what_if,
                 "provider": out["provider"],
                 "model": out["model"],
                 "latency_ms": out["latency_ms"],
@@ -315,6 +369,22 @@ def build_graph(deps: AgentDeps):
         packages = package_case({"lead": lead, "new_details": new_details, "support_case": support_case,
                                  "contact_request": "contact_request" in intents})
         guidance = deps.hints_fn().guidance if packages in ("home", "business") else []
+        # T13d: a size stated this message brings the KB Section 8 summary even without a KB search ("I want a 5 kW
+        # system for my house" gives details only, so it never searched and the reply couldn't name HomePro 5); so does
+        # a question about what Vantis offers, with or without the understand step (on 13 Oct the raw search for "What
+        # solar systems do you provide?" found only Section 1)
+        summaries = deps.hints_fn().summaries
+        catalog = [] if support_case else add_catalog_for_size([], str(message), new_details, summaries)
+        offer = not support_case and not catalog and asks_what_is_offered(str(message))
+        if offer and summaries.get(CATALOG_SECTION):
+            catalog = [summaries[CATALOG_SECTION]]
+        # T13d: questions about their details the customer skipped in a row; a detail, a contact request, "what else do
+        # you need" or a clear buying signal lets the assistant ask again
+        invited = (bool(intents & {"contact_request", "asks_what_is_needed"}) or is_go_ahead(str(message))
+                   or (lead.get("intent_level") == "ready" and before.get("intent_level") != "ready"))
+        skipped = skipped_asks(state, previous, new_details, invited)
+        step["data"].update({"catalog_for_size": bool(catalog) and not offer, "catalog_for_offer": bool(catalog) and offer,
+                             "skipped_asks": skipped})
         return {
             "intents": out["intents"],
             "search_query": out["search_query"],
@@ -332,7 +402,10 @@ def build_graph(deps: AgentDeps):
             "contact_request": "contact_request" in intents,
             "degraded": degraded,
             "area_checks": checks,
-            "chunks": ([summary] if summary else []) + guidance,
+            "chunks": ([summary] if summary else []) + guidance + catalog,
+            "skipped_asks": skipped,
+            "ever_declined": bool(state.get("ever_declined")) or bool(out["declines"]),
+            "call_requested": bool(state.get("call_requested")) or "contact_request" in intents,
             "steps": state["steps"] + [step] + area_steps,
         }
 
@@ -356,12 +429,9 @@ def build_graph(deps: AgentDeps):
         if chunks and deps.small_to_big:
             chunks = add_table_summaries(chunks, deps.hints_fn().summaries)
         with_summaries = len(chunks)
-        if chunks:
+        if chunks and not state.get("support_case"):  # T13c: part of the package list found: all of it joins
             message = str(state["messages"][-1].content)
-            chunks = add_catalog_for_size(chunks, message, state.get("new_details", []), deps.hints_fn().summaries)
-            with_summaries = len(chunks)
-            if not state.get("support_case"):  # T13c: part of the package list found: all of it joins
-                chunks = add_all_packages(chunks, deps.hints_fn().guidance, state.get("lead", {}), message)
+            chunks = add_all_packages(chunks, deps.hints_fn().guidance, state.get("lead", {}), message)
         step = retrieve_step(result)
         step["data"]["latency_ms"] = round((time.perf_counter() - start) * 1000)
         step["data"]["added_summaries"] = with_summaries - len(found)
@@ -396,23 +466,34 @@ def build_graph(deps: AgentDeps):
                 and create_lead_refused(state.get("scratch", []))):  # T13c: create_lead once a turn when it can't save
             llm, offer_create = deps.agent_llm_without_create, False
         start = time.perf_counter()
+        messages = agent_messages(state)
+        message, last_try = None, False
         try:
-            message = llm.invoke(agent_messages(state))
+            message = llm.invoke(messages)
         except Exception as exc:
             logger.warning("agent call failed: %s", type(exc).__name__)
-            done = tool_outcome_reply(state.get("scratch", []))  # never "try again" after a save (T12b)
-            detail = "LLM failed; the reply says what the tools did" if done else "LLM failed"
-            step = {"node": "agent", "detail": detail, "data": {"provider": None, "latency_ms": None}}
-            return {"reply": done or LLM_DOWN_REPLY, "degraded": True, "steps": state["steps"] + [step]}
+            # T13d: when no tool wrote anything, one last try (a paused model whose pause ends soon, or the main model
+            # with a longer deadline) inside the turn's 40 s, before finalize falls back to the safety net
+            if getattr(llm, "last_try", None) is not None and tool_outcome_reply(state.get("scratch", [])) is None:
+                try:
+                    message, last_try = llm.last_try.invoke(messages), True
+                except Exception as again:
+                    logger.warning("last try failed: %s", type(again).__name__)
+        if message is None:  # finalize says what was saved, or answers from the KB chunks (T13d)
+            step = {"node": "agent", "detail": "LLM failed", "data": {"provider": None, "latency_ms": None}}
+            return {"model_failed": True, "degraded": True, "steps": state["steps"] + [step]}
         latency_ms = round((time.perf_counter() - start) * 1000)
         provider = provider_of(message)
         calls = [c["name"] for c in getattr(message, "tool_calls", [])]
-        detail = f"{provider}, {latency_ms} ms" + (f", calls {', '.join(calls)}" if calls else "")
+        detail = ("last try: " if last_try else "") + f"{provider}, {latency_ms} ms" + (
+            f", calls {', '.join(calls)}" if calls else "")
         step = {"node": "agent", "detail": detail,
                 "data": {"provider": provider, "model": message.response_metadata.get("model_name"),
                          "latency_ms": latency_ms, "tokens": tokens_of(message), "tool_calls": calls}}
         if not offer_create:
             step["data"]["create_lead_offered"] = False
+        if last_try:
+            step["data"]["last_try"] = True
         return {
             "scratch": [message],
             "tool_rounds": rounds + (1 if calls else 0),
@@ -420,7 +501,7 @@ def build_graph(deps: AgentDeps):
         }
 
     def route_after_agent(state: AgentState) -> str:
-        if state.get("reply"):
+        if state.get("reply") or state.get("model_failed"):
             return "finalize"
         last = state["scratch"][-1]
         return "tools" if getattr(last, "tool_calls", None) else "finalize"
@@ -457,97 +538,160 @@ def build_graph(deps: AgentDeps):
             return {"reply": text, "steps": state["steps"] + [step]}
         return node
 
+    def model_reply(state: dict, chunks: list[RetrievedChunk], steps: list[dict]) -> str:
+        """The agent's last message as the reply, through the safety nets (T12a-T13d). `state` already holds this turn's
+        code-side save. Each guard that fires adds a step, so a slipping prompt shows."""
+        reply = strip_tool_citations(normalize_citations(reply_text(state["scratch"][-1])), tool_names)
+        if not reply:
+            return ""
+        # KB tags only on facts from this turn's sources, and no "saved" claim while no lead exists (T12a)
+        reply, removed = strip_unsourced_citations(reply, chunks)
+        if removed:
+            steps.append({"node": "guard", "detail": f"removed {removed} KB tag(s) not backed by this "
+                                                     "turn's sources", "data": {"removed": removed}})
+        # T13c: no policy, either way, on what the KB doesn't cover (discounts, offers, brands)
+        reply, uncovered = remove_uncovered_policies(reply, chunks, welcome.UNCOVERED_TEXT)
+        if uncovered:
+            steps.append({"node": "guard", "detail": "replaced a policy the KB doesn't cover",
+                          "data": {"removed": uncovered}})
+        # T13d: nothing is free unless the KB says so (Groq wrote "a free consultation" twice on 13 Oct)
+        reply, free = remove_free_claims(reply, chunks, welcome.UNCOVERED_TEXT)
+        if free:
+            steps.append({"node": "guard", "detail": "removed a claim that a service is free",
+                          "data": {"removed": free}})
+        # T12b: no number, duration, amount or percentage that nothing in the conversation gave (KB Section 16)
+        scratch = state.get("scratch", [])
+        allowed = ([c.content for c in chunks]
+                   + [str(m.content) for m in scratch if isinstance(m, ToolMessage)]
+                   + [str(m.content) for m in state["messages"]]  # the customer's and earlier replies
+                   + list(state.get("validation_errors", {}).values()))
+        reply, numbers, cut = remove_unsupported_numbers(reply, allowed, welcome.NUMBERS_CONFIRM_TEXT)
+        if numbers:  # the removed sentences go into the step (not the log), so each one can be checked
+            steps.append({"node": "guard", "detail": f"removed {len(numbers)} number(s) no source gave",
+                          "data": {"removed": cut, "numbers": numbers}})
+        # T13c: with no size settled, every reference package of a kind or none (the packages the customer
+        # named in this message always stay)
+        reply, partial = all_or_no_packages(reply, reference_packages(deps.hints_fn().guidance),
+                                            state.get("lead", {}), str(state["messages"][-1].content),
+                                            welcome.PACKAGES_FIT_TEXT)
+        if partial:
+            steps.append({"node": "guard", "detail": "removed a partial list of reference packages",
+                          "data": {"removed": partial}})
+        reply, fixed = remove_false_claims(reply, state) if deps.ops is not None else (reply, False)
+        if fixed:
+            steps.append({"node": "guard", "detail": "removed a claim that details were saved (no lead "
+                                                     "yet)", "data": {}})
+        reply, matched = fix_callback_claims(reply, state) if deps.ops is not None else (reply, False)
+        if matched:
+            steps.append({"node": "guard", "detail": "the callback sentence now says what was logged",
+                          "data": {}})
+        reply, softened = soften_promises(reply)
+        if softened:
+            steps.append({"node": "guard", "detail": "a promise that the team will act became 'can'",
+                          "data": {}})
+        reply, plain = plain_service_area_words(reply)
+        if plain:
+            steps.append({"node": "guard", "detail": "'reference locations' became 'service areas'",
+                          "data": {}})
+        reply, city_asks = drop_known_city_question(reply, state)
+        if city_asks:  # the removed sentences are kept in the step, so each removal can be checked (T13a)
+            steps.append({"node": "guard", "detail": "removed a question about a city it already has",
+                          "data": {"removed": city_asks}})
+        reply, parked = drop_detail_questions(reply, state)
+        if parked:  # T13d: the customer skipped two questions about their details in a row
+            steps.append({"node": "guard", "detail": "removed a question for details after two skipped ones",
+                          "data": {"removed": parked}})
+        reply, trimmed = keep_one_question(reply, state)
+        if trimmed:
+            steps.append({"node": "guard", "detail": "kept one question", "data": {}})
+        # T13d: a reply that used this turn's chunks without citing any gets the best-matching chunk's tag, so its
+        # source chip shows (Groq often leaves the tag out); never on the fixed lines the guards put in
+        fixed_lines = (welcome.UNCOVERED_TEXT, welcome.NUMBERS_CONFIRM_TEXT, welcome.PACKAGES_FIT_TEXT)
+        reply, tag = add_missing_tag(reply, chunks, skip=fixed_lines)
+        if tag:
+            steps.append({"node": "guard", "detail": "added the KB tag the reply left out", "data": {"tag": tag}})
+        # T13c: never a blank bubble. The number guard removes a sentence with a count no source gave ("8 steps",
+        # "7 kW") without a replacement, so a reply made only of such sentences came out empty
+        if not reply.strip():
+            logger.warning("reply empty after the guards; the fixed line replaced it")
+            reply = welcome.NUMBERS_CONFIRM_TEXT
+            steps.append({"node": "guard", "detail": "nothing was left after the guards; the fixed line "
+                                                     "replaced it", "data": {}})
+        return reply
+
     def finalize_node(state: AgentState) -> dict:
-        reply = state.get("reply") or ""
-        sources: list[dict] = []
-        degraded = state["degraded"]
-        update: dict = {}
         steps = list(state["steps"])
-        if not reply:  # the agent's last message is the answer
-            reply = strip_tool_citations(normalize_citations(reply_text(state["scratch"][-1])), tool_names)
-            if not reply:
-                reply, degraded = LLM_DOWN_REPLY, True
-            else:
-                # The service-area summary first: a section's first chunk is its source, and for a city
-                # answer the KB Section 10 summary supports it, not whichever row the search found (T10b)
-                scratch = state.get("scratch", [])
-                found = (_tool_chunks(scratch, "check_service_area") + state["chunks"]
-                         + _tool_chunks(scratch, "search_knowledge_base"))
-                chunks = [RetrievedChunk(**c) for c in _dedupe(found)]
-                # The safety nets (T12a): KB tags only on facts from this turn's sources, and no "saved"
-                # claim while no lead exists. Each one that fires is a step, so a slipping prompt shows.
-                reply, removed = strip_unsourced_citations(reply, chunks)
-                if removed:
-                    steps.append({"node": "guard", "detail": f"removed {removed} KB tag(s) not backed by this "
-                                                             "turn's sources", "data": {"removed": removed}})
-                # T13c: no policy, either way, on what the KB doesn't cover (discounts, offers, brands)
-                reply, uncovered = remove_uncovered_policies(reply, chunks, welcome.UNCOVERED_TEXT)
-                if uncovered:
-                    steps.append({"node": "guard", "detail": "replaced a policy the KB doesn't cover",
-                                  "data": {"removed": uncovered}})
-                # T12b: no number, duration, amount or percentage that nothing in the conversation gave (KB Section 16)
-                allowed = ([c.content for c in chunks]
-                           + [str(m.content) for m in scratch if isinstance(m, ToolMessage)]
-                           + [str(m.content) for m in state["messages"]]  # the customer's and earlier replies
-                           + list(state.get("validation_errors", {}).values()))
-                reply, numbers, cut = remove_unsupported_numbers(reply, allowed, welcome.NUMBERS_CONFIRM_TEXT)
-                if numbers:  # the removed sentences go into the step (not the log), so each one can be checked
-                    steps.append({"node": "guard", "detail": f"removed {len(numbers)} number(s) no source gave",
-                                  "data": {"removed": cut, "numbers": numbers}})
-                # T13c: with no size settled, every reference package of a kind or none (the packages the customer
-                # named in this message always stay)
-                reply, partial = all_or_no_packages(reply, reference_packages(deps.hints_fn().guidance),
-                                                    state.get("lead", {}), str(state["messages"][-1].content),
-                                                    welcome.PACKAGES_FIT_TEXT)
-                if partial:
-                    steps.append({"node": "guard", "detail": "removed a partial list of reference packages",
-                                  "data": {"removed": partial}})
-                reply, fixed = remove_false_claims(reply, state) if deps.ops is not None else (reply, False)
-                if fixed:
-                    steps.append({"node": "guard", "detail": "removed a claim that details were saved (no lead "
-                                                             "yet)", "data": {}})
-                reply, matched = fix_callback_claims(reply, state) if deps.ops is not None else (reply, False)
-                if matched:
-                    steps.append({"node": "guard", "detail": "the callback sentence now says what was logged",
-                                  "data": {}})
-                reply, softened = soften_promises(reply)
-                if softened:
-                    steps.append({"node": "guard", "detail": "a promise that the team will act became 'can'",
-                                  "data": {}})
-                reply, plain = plain_service_area_words(reply)
-                if plain:
-                    steps.append({"node": "guard", "detail": "'reference locations' became 'service areas'",
-                                  "data": {}})
-                reply, city_asks = drop_known_city_question(reply, state)
-                if city_asks:  # the removed sentences are kept in the step, so each removal can be checked (T13a)
-                    steps.append({"node": "guard", "detail": "removed a question about a city it already has",
-                                  "data": {"removed": city_asks}})
-                reply, trimmed = keep_one_question(reply, state)
-                if trimmed:
-                    steps.append({"node": "guard", "detail": "kept one question", "data": {}})
-                # T13c: never a blank bubble. The number guard removes a sentence with a count no source gave ("8 steps",
-                # "7 kW") without a replacement, so a reply made only of such sentences came out empty
-                if not reply.strip():
-                    logger.warning("reply empty after the guards; the fixed line replaced it")
-                    reply = welcome.NUMBERS_CONFIRM_TEXT
-                    steps.append({"node": "guard", "detail": "nothing was left after the guards; the fixed line "
-                                                             "replaced it", "data": {}})
-                reply = tidy_citations(reply, chunks)
-                sources = pick_sources(reply, chunks) if chunks else []
+        update: dict = {}
+        written: list[dict] = []  # what the code wrote this turn, shaped like the tools' artifacts
         if deps.ops is not None:
-            changes = pending_changes(state.get("lead", {}), state.get("lead_saved", {}))
-            if state.get("lead_id") and changes:  # new details the update_lead tool did not save this turn
+            # T13d: a lead with nothing required missing is saved here when the model didn't call create_lead (its
+            # call failed, or it asked again for a detail it had); the tool stays the normal path
+            saved = save_ready_lead(state, deps.ops)
+            if saved:
+                update.update(saved)
+                written.append({"kind": "lead", "created": True})
+                detail = "lead saved (create_lead was not called)"
+                if saved.get("callback_now"):
+                    written.append({"kind": "callback", "time": saved["callback_logged"],
+                                    "updated": saved["callback_now"] == "updated"})
+                    detail += "; callback request logged"
+                steps.append({"node": "save", "detail": detail, "data": {"lead_id": saved["lead_id"]}})
+        view = {**state, **update}
+        scratch = state.get("scratch", [])
+        # The service-area summary first: a section's first chunk is its source, and for a city answer the KB
+        # Section 10 summary supports it, not whichever row the search found (T10b)
+        found = _dedupe(_tool_chunks(scratch, "check_service_area") + state["chunks"]
+                        + _tool_chunks(scratch, "search_knowledge_base"))
+        chunks = [RetrievedChunk(**c) for c in found]
+        degraded = state["degraded"]
+        outcome = tool_outcome_reply(scratch, written)
+
+        def safety_net() -> tuple[str, str]:
+            """T13d: no model answered: the KB sentences, the city checks, what was saved and one question, instead of
+            "I'm having trouble right now". A city the model checked with the tool counts like one the code checked."""
+            checks = list(state.get("area_checks", [])) + [c for c in tool_area_checks(scratch)
+                                                            if c not in state.get("area_checks", [])]
+            text, extra, sections = fallback_reply({**view, "area_checks": checks}, found, outcome)
+            update.update(extra)
+            detail = ("no model answered: reply from KB Section" + ("s " if len(sections) > 1 else " ")
+                      + ", ".join(map(str, sections))) if sections else "no model answered: reply in fixed words"
+            steps.append({"node": "fallback", "detail": detail, "data": {"llm": False, "sections": sections}})
+            return text, "knowledge_base" if "[KB Section" in text else ("tools" if outcome else "fixed")
+
+        if state.get("model_failed"):  # every answer model failed, and the last try too
+            reply, answered_by = safety_net()
+        elif state.get("reply"):  # a fixed reply: welcome, closing, redirect
+            reply, answered_by = (outcome, "tools") if written else (state["reply"], "fixed")
+        else:
+            reply = model_reply(view, chunks, steps)
+            answered_by = "model"
+            if not reply:  # an empty answer is no answer
+                degraded = True
+                reply, answered_by = safety_net()
+            elif update.get("lead_created_now") and outcome:  # saved in code after the model answered
+                reply = add_saved_line(reply, outcome)
+        reply = tidy_citations(reply, chunks)
+        sources = pick_sources(reply, chunks) if chunks and answered_by != "fixed" else []
+        if deps.ops is not None:
+            changes = pending_changes(view.get("lead", {}), view.get("lead_saved", {}))
+            # new details the update_lead tool did not save this turn; T13d: or a call asked for (with no time) after the
+            # save, so the action says to call them
+            asked_now = (state.get("contact_request") and not view.get("callback_time")
+                         and not update.get("lead_created_now"))
+            if view.get("lead_id") and (changes or asked_now):
                 start = time.perf_counter()
-                result = service.update_lead(deps.ops.engine, state["lead_id"], changes,
-                                             llm=deps.ops.reason_llm, reason_now=deps.ops.reason_now)
+                result = service.update_lead(deps.ops.engine, view["lead_id"], changes,
+                                             llm=deps.ops.reason_llm, reason_now=deps.ops.reason_now,
+                                             call_requested=bool(view.get("call_requested")))
                 deps.ops.calls.append("sync")
                 if result.lead.reason_source == "template" and not deps.ops.reason_now:
-                    update["reason_pending"] = state["lead_id"]
-                update["lead_saved"] = dict(state["lead"])
-                steps.append({"node": "sync", "detail": "saved: " + ", ".join(sorted(changes)),
+                    update["reason_pending"] = view["lead_id"]
+                update["lead_saved"] = dict(view["lead"])
+                steps.append({"node": "sync", "detail": ("saved: " + ", ".join(sorted(changes))) if changes
+                              else "the action now says to call them",
                               "data": {"latency_ms": round((time.perf_counter() - start) * 1000)}})
-            update["lead_summary"] = lead_summary({**state, **update}, deps.ops.engine)
-        return {"reply": reply, "sources": sources, "degraded": degraded, "steps": steps,
+            update["lead_summary"] = lead_summary({**view, **update}, deps.ops.engine)
+        return {"reply": reply, "sources": sources, "degraded": degraded, "steps": steps, "answered_by": answered_by,
                 "messages": [AIMessage(reply)], **update}
 
     graph = StateGraph(AgentState)

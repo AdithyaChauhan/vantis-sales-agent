@@ -13,6 +13,7 @@ from typing import Callable
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
 from sqlalchemy import Engine
+from sqlalchemy.exc import DBAPIError
 
 from app.agent import welcome
 from app.leads import service
@@ -46,6 +47,12 @@ NOTHING_LEFT_LINE = ("The customer asked what else you need: nothing else is nee
 SAVED_INFO_LINE = ("The customer only asked for information or said no: answer and offer one next step related to "
                    "it; do not ask for these details.")
 NOTHING_MORE_LINE = "Nothing more is needed for the lead: answer and offer one next step."
+# T13d: after one skipped question about their details the assistant may ask once more; after two it stops asking
+# until they give a detail, ask to be contacted, ask what is needed or show a clear new buying signal (Adithya's live
+# chat: the city was asked 4 times while the customer kept asking other things)
+MAX_SKIPPED_ASKS = 2
+SKIPPED_LINE = ("The customer skipped your last two questions about their details: answer what they ask and offer one "
+                "next step related to it; do not ask for any of their details now.")
 # T13a: a city the customer only asked about counts as theirs
 ASKED_CITY_LINE = "City: the one they asked about counts as theirs; never ask for it or confirm it again."
 MAX_CITY_CANDIDATES = 3
@@ -72,9 +79,12 @@ _BARE_AMOUNT_RE = re.compile(r"^\s*(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?\s*(?:
 _YES_RE = re.compile(r"^\s*(?:yes|yeah|yep|yup|sure|of course|it does|we do|yes,? it does|yes,? we do)[\s.!]*$", re.I)
 _NO_RE = re.compile(r"^\s*(?:no|nope|nah|naah|it doesn't|we don't|no,? it doesn't|no,? we don't)[\s.!]*$", re.I)
 # T13c: the kind of place, only with confidence (place_type). Adithya's word lists; "ghar" is Hindi for home; BHK
-# sizes, bungalow and duplex added in planning. "residential" and "commercial" count only as a short answer.
-_HOME = r"home|house|flat|apartment|villa|ghar|bungalow|duplex|\d+\s*-?\s*bhk"
-_BUSINESS = r"shop|office|store|business"
+# sizes, bungalow and duplex added in planning. "residential" and "commercial" count only as a short answer. T13d: the
+# KB's other small-business places (clinics, warehouses) and Hindi words: makan/kothi (house), dukan (shop), daftar
+# (office), vyapar (business), godown (warehouse); "meri dukan" counted as no kind of place in Adithya's live chat
+_HOME = r"home|house|flat|apartment|villa|ghar|makaan|makan|kothi|bungalow|duplex|\d+\s*-?\s*bhk"
+_BUSINESS = (r"shop|office|store|business|clinic|warehouse|godown|showroom|factory|dukan|dukaan|dukkan|daftar|"
+             r"vyapar|vyapaar")
 _PLACE = rf"(?:{_HOME}|{_BUSINESS})"
 _HOME_RE = re.compile(rf"\b(?:{_HOME}|residential)\b", re.I)
 _BUSINESS_RE = re.compile(rf"\b(?:{_BUSINESS}|commercial)\b", re.I)
@@ -99,9 +109,9 @@ _OWN_PLACE_RE = re.compile(
     rf"\b(?:i|we)\s+(?:have|own|run)\s+(?:an?\s+)(?:small\s+|big\s+|new\s+)?(?P<e>{_PLACE})\b|"
     rf"\b(?:it|this|that)(?:{_APOS}s|\s+is)\s+(?:an?|my|our)\s+(?:small\s+|big\s+|new\s+)?(?P<f>{_PLACE})"
     rf"(?=\s*(?:$|[.,!?;)]|\s+(?:in|at|near|on|with|and|so|but)\b))", re.I)
-# "ghar" counts only in a message about solar or installing ("solar lagwana hai ghar par"); "main ghar par hoon" is
-# only "I'm at home"
-_GHAR_RE = re.compile(r"\bghar\b", re.I)
+# A Hindi place word counts only in a message about solar or installing ("solar lagwana hai ghar par", T13d: "dukan par
+# solar lagwana hai"); "main ghar par hoon" is only "I'm at home"
+_GHAR_RE = re.compile(r"\b(?:ghar|makaan|makan|kothi|dukan|dukaan|dukkan|daftar)\b", re.I)
 _SOLAR_WORDS_RE = re.compile(r"\b(?:solar|panels?|lagwa\w*|laga\w*|install\w*)\b", re.I)
 SHORT_ANSWER_WORDS = 6  # "a small shop in Lucknow" is still an answer to the question
 # The detail a question asks about, by its words (only a question about one detail is read)
@@ -185,6 +195,42 @@ def support_missing(lead: dict, support: dict) -> list[str]:
         "project details": bool(support.get("project_details")),
     }
     return [need for need in SUPPORT_NEEDS if not have[need]]
+
+
+def asks_parked(state: dict) -> bool:
+    """True once the customer skipped two questions about their details in a row (T13d): no more asks for now."""
+    return state.get("skipped_asks", 0) >= MAX_SKIPPED_ASKS
+
+
+def ask_targets(state: dict) -> list[str]:
+    """Everything the assistant may still ask the customer for: the support request's needs, or the lead's required
+    details before the save, or after the save the details that would still add points. Item names are _ITEM_WORDS
+    keys. (The bill turn's "home or business?" is not here: that turn gave a detail, so nothing was skipped.)"""
+    lead = state.get("lead", {})
+    if state.get("support_case") and not state.get("support_request_id"):
+        return support_missing(lead, state.get("support", {}))
+    if not state.get("lead_id"):
+        return ordered_missing(lead, state.get("contact_request", False))
+    ruled_out = set(state.get("ruled_out", []))
+    return [d for d in missing_details(LeadData.model_validate(lead), _breakdown_stub(lead)) if d not in ruled_out]
+
+
+def asked_items(text: str, items: list[str]) -> list[str]:
+    """The items a question sentence of `text` asks for, by their words (_ITEM_WORDS), in the order of `items`."""
+    questions = [without_tags(piece) for line in text.split("\n") for piece in split_sentences(line)]
+    questions = [q for q in questions if q.endswith("?")]
+    return [item for item in items
+            if any(re.search(rf"\b{w}\b", q, re.I) for q in questions for w in _ITEM_WORDS.get(item, ()))]
+
+
+def skipped_asks(state: dict, previous: object, new_details: list[str], invited: bool) -> int:
+    """The count of questions about their details the customer skipped in a row, after this message (T13d): +1 when
+    the assistant's last reply asked for a detail it still needed and this message gave none; back to 0 when the
+    message gives a detail or invites asks (a contact request, "what else do you need?", a clear buying signal)."""
+    if new_details or invited:
+        return 0
+    asked = asked_items(str(previous.content), ask_targets(state)) if isinstance(previous, AIMessage) else []
+    return state.get("skipped_asks", 0) + (1 if asked else 0)
 
 
 def shows_interest(state: dict) -> bool:
@@ -304,18 +350,23 @@ def place_type(message: str, previous: object) -> dict:
         kinds = _kinds(_HOME_RE.findall(text) + _BUSINESS_RE.findall(text))
     else:
         found = [w for m in _OWN_PLACE_RE.finditer(text) for w in m.groups() if w]
-        if _GHAR_RE.search(text) and _SOLAR_WORDS_RE.search(text):
-            found.append("ghar")
+        if _SOLAR_WORDS_RE.search(text):
+            found += [m.group(0) for m in _GHAR_RE.finditer(text)]
         # the place named in passing elsewhere in the message still counts, so "my home office" names both kinds
         kinds = _kinds(found) | (_kinds(_HOME_RE.findall(text) + _BUSINESS_RE.findall(text)) if found else set())
     return {"customer_type": kinds.pop()} if len(kinds) == 1 else {}
 
 
 def chat_intent(lead: dict, intents: set[str], callback_time: str | None) -> dict:
-    """{"intent_level": "interested"} when the extractor left the intent unknown but the chat shows buying interest
-    (BUYING_INTENTS) or a callback request (T13c: chat 1's lead scored 48 with the intent unknown after the customer
-    asked the price and for a callback). "ready" only ever comes from the extractor."""
-    if lead.get("intent_level") or not (intents & BUYING_INTENTS or callback_time):
+    """The intent the chat itself shows, over the extractor's guess:
+    - T13d: a request to be called (a contact request, or a callback time) is "ready", whatever the extractor said
+      (the assignment's Hot is "strong purchase intent"; audit S21: "can someone call me?" plus details scored COLD 43);
+    - T13c: buying interest while the intent is unknown is "interested" (chat 1 scored 48 with the intent unknown after
+      the customer asked the price).
+    {} when nothing changes."""
+    if "contact_request" in intents or callback_time:
+        return {} if lead.get("intent_level") == "ready" else {"intent_level": "ready"}
+    if lead.get("intent_level") or not intents & BUYING_INTENTS:
         return {}
     return {"intent_level": "interested"}
 
@@ -477,7 +528,7 @@ def remove_false_claims(reply: str, state: dict) -> tuple[str, bool]:
     if not changed:
         return reply, False
     text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-    if "?" not in text:
+    if "?" not in text and not asks_parked(state):
         text = f"{text} {_still_needed_ask(state)}".strip()
     return text, True
 
@@ -510,11 +561,104 @@ def drop_known_city_question(reply: str, state: dict) -> tuple[str, list[str]]:
     if not removed:
         return reply, []
     text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-    if "?" not in text and not state.get("lead_id") and shows_interest(state):
+    if "?" not in text and not state.get("lead_id") and shows_interest(state) and not asks_parked(state):
         if ordered_missing(state.get("lead", {}), state.get("contact_request", False)):
             text = f"{text} {_still_needed_ask(state)}".strip()
     logger.warning("reply asked for a city the bot already has; removed", extra={"removed": len(removed)})
     return text, removed
+
+
+def drop_detail_questions(reply: str, state: dict) -> tuple[str, list[str]]:
+    """While asks are parked (the customer skipped two questions about their details in a row, T13d), remove every
+    question sentence that asks for a detail the assistant still needs; tags alone go with their sentence. Nothing is
+    added in its place. Returns (reply, the removed sentences); the graph puts them in a guard step."""
+    if not asks_parked(state):
+        return reply, []
+    targets = ask_targets(state)
+    lines, removed = [], []
+    for line in reply.split("\n"):
+        kept, dropped_last = [], False
+        for piece in split_sentences(line):
+            text = without_tags(piece)
+            if not text:  # tags alone follow the sentence before them
+                if piece.strip() and not dropped_last:
+                    kept.append(piece.strip())
+                continue
+            dropped_last = text.endswith("?") and bool(asked_items(text, targets))
+            if dropped_last:
+                removed.append(text)
+            elif piece.strip():
+                kept.append(piece.strip())
+        indent = re.match(r"[ \t]*", line).group(0)
+        lines.append(indent + " ".join(kept) if kept else "")
+    if not removed:
+        return reply, []
+    logger.warning("reply asked for details after two skipped questions; removed", extra={"removed": len(removed)})
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip(), removed
+
+
+def save_ready_lead(state: dict, ops: LeadOps) -> dict:
+    """Save the lead in code when nothing required is missing and the model didn't (T13d): no lead yet, no support case,
+    and the customer did not say no in this message. Also logs a callback time they already gave. The create_lead tool
+    stays the normal path; this runs in finalize, so a turn whose model failed or skipped the tool (audit S22, Render
+    12:03:32 UTC) still keeps the lead, and the service's one-lead-per-session rule means it can never save twice.
+    A database error is logged and nothing is saved (so no reply claims it); the next turn tries again.
+    Returns the state update ({} when nothing was saved)."""
+    lead = state.get("lead", {})
+    if (not lead or state.get("lead_id") or state.get("support_case") or state.get("declines")
+            or ordered_missing(lead, state.get("contact_request", False))):
+        return {}
+    try:
+        areas = ops.areas_fn()
+    except Exception:  # the service then marks the location "unknown"
+        areas = None
+    time_given = state.get("callback_time")
+    try:
+        result = service.create_lead(ops.engine, lead, session_id=state.get("session_id") or None, llm=ops.reason_llm,
+                                     areas=areas, reason_now=ops.reason_now, callback_time=time_given,
+                                     call_requested=bool(state.get("call_requested")))
+    except DBAPIError as exc:
+        logger.warning("lead save in code failed: %s", type(exc).__name__)
+        return {}
+    ops.calls.append("create")
+    if result.lead is None:
+        return {}
+    update = {"lead_id": result.lead.id, "lead_saved": dict(lead), "lead_created_now": True}
+    if result.lead.reason_source == "template" and not ops.reason_now:
+        update["reason_pending"] = result.lead.id
+    if time_given and time_given != state.get("callback_logged"):
+        try:
+            updated = service.schedule_callback(ops.engine, result.lead.id, time_given).updated
+        except DBAPIError as exc:  # the lead is saved; the tool can log the callback on a later turn
+            logger.warning("callback log in code failed: %s", type(exc).__name__)
+        else:
+            ops.calls.append("callback")
+            update |= {"callback_status": "requested", "callback_logged": time_given,
+                       "callback_now": "updated" if updated else "requested"}
+    logger.info("lead saved in code (create_lead was not called)", extra={"lead_id": result.lead.id})
+    return update
+
+
+def add_saved_line(reply: str, outcome: str) -> str:
+    """The reply of a turn whose lead was saved in code after the model answered (T13d): the model's questions go (they
+    asked for details the lead already has, e.g. S22's "could you share your phone number so we can save your
+    details?") and `outcome` (what was saved, with its own question) closes the reply."""
+    lines = []
+    for line in reply.split("\n"):
+        kept, dropped_last = [], False
+        for piece in split_sentences(line):
+            text = without_tags(piece)
+            if not text:
+                if piece.strip() and not dropped_last:
+                    kept.append(piece.strip())
+                continue
+            dropped_last = text.endswith("?")
+            if not dropped_last and piece.strip():
+                kept.append(piece.strip())
+        indent = re.match(r"[ \t]*", line).group(0)
+        lines.append(indent + " ".join(kept) if kept else "")
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return f"{text}\n\n{outcome}" if text else outcome
 
 
 def _wanted_item(state: dict) -> str | None:
@@ -524,6 +668,8 @@ def _wanted_item(state: dict) -> str | None:
     lead = state.get("lead", {})
     if package_case(state) == "unknown":
         return "property type"
+    if asks_parked(state):  # T13d: they skipped two questions in a row
+        return None
     if state.get("support_case") and not state.get("support_request_id"):
         missing = support_missing(lead, state.get("support", {}))
         return missing[0] if missing else None
@@ -597,6 +743,8 @@ def status_block(state: dict) -> str:
         missing = support_missing(lead, state.get("support", {}))
         if state.get("support_request_id"):
             lines.append(f"Support request saved (id {state['support_request_id']}). Do not create a sales lead.")
+        elif missing and asks_parked(state):  # T13d
+            lines.append("This is an existing customer's issue (no sales lead). " + SKIPPED_LINE)
         elif missing:
             lines.append("This is an existing customer's issue (no sales lead). Still needed for the support "
                          "request: " + ", ".join(missing) + ".")
@@ -610,14 +758,18 @@ def status_block(state: dict) -> str:
             ruled_out = set(state.get("ruled_out", []))  # "apart from timing": not asked in this conversation
             useful = [d for d in missing_details(LeadData.model_validate(lead), _breakdown_stub(lead))
                       if d not in ruled_out]
-            if useful:
+            if useful and not asks_parked(state):
                 lines.append("Would still add points, most useful first: " + ", ".join(useful)
                              + ". Never ask again for anything under Details known.")
-            lines.append(_saved_lead_next(state, useful))
+            lines.append(SKIPPED_LINE if asks_parked(state) and not state.get("callback_now")
+                         and not state.get("lead_created_now") else _saved_lead_next(state, useful))
         else:
             missing = ordered_missing(lead, state.get("contact_request", False))
             if missing and not shows_interest(state):  # a pure information question: no details asked (T10b)
                 lines.append(INFO_ONLY_LINE)
+            elif missing and asks_parked(state):  # T13d
+                lines.append("Lead saved: no, so never say the details are saved, recorded or passed to the team. "
+                             + SKIPPED_LINE)
             elif missing:
                 lines.append("Lead saved: no, so never say the details are saved, recorded or passed to the team. "
                              "Still needed before it can be saved: " + ", ".join(missing) + ".")

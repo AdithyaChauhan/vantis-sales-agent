@@ -198,9 +198,52 @@ def test_tags_on_questions_and_claims_are_removed_even_for_a_found_section():
     reply = ("HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog]. "
              "I've saved your details [KB Section 8: Product & Service Catalog]. "
              "Would you like a quote? [KB Section 15: Frequently Asked Questions]")
+    # T13d: a tag standing alone after the question goes back to the last fact; one inside a claim is removed
     assert strip_unsourced_citations(reply, [CATALOG, FAQ]) == (
-        "HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog]. I've saved your details. "
-        "Would you like a quote?", 2)
+        "HomePro 5 is 5 kW [KB Section 8: Product & Service Catalog]. [KB Section 15: Frequently Asked Questions] "
+        "I've saved your details. Would you like a quote?", 1)
+    assert strip_unsourced_citations("Would you like a quote? [KB Section 15: Frequently Asked Questions]",
+                                     [FAQ]) == ("Would you like a quote?", 1)  # no fact before it: removed
+
+
+S01_REPLY = (  # the audit's S01 (assignment Q1, Groq), with the tag the model put after its closing question
+    "We offer several reference rooftop solar packages:\n\n"
+    "1. **Vantis HomeStart 3** – 3 kW solution for moderate household use.\n"
+    "2. **Vantis HomePro 5** – 5 kW solution for higher household electricity needs.\n"
+    "3. **Vantis HomeMax 10** – 10 kW solution for large homes or high consumption.\n"
+    "4. **Vantis Business 15** – 15 kW reference solution for small shops, offices or facilities.\n"
+    "5. **Vantis Business 25** – 25 kW reference solution for larger small‑business requirements.\n"
+    "6. **Vantis Site Assessment** – pre‑installation evaluation of rooftop and property.\n"
+    "7. **Vantis Care** – post‑installation support and maintenance for existing customers.\n\n"
+    "All of these are reference offerings; a site assessment will determine the final system size and configuration "
+    "for your property. Would you like to schedule a site assessment to see which option fits best? "
+    "[KB Section 8: Product & Service Catalog]"
+)
+S02_REPLY = (  # the audit's S02 (assignment Q2, Groq): both tags after the closing question, on its own line
+    "There isn’t a single fixed price for a 5 kW system – the cost depends on factors such as the exact equipment, "
+    "your roof’s characteristics, location and project complexity. To give you an accurate quote we’d need to assess "
+    "those details in a site visit.\n\n"
+    "Would you like us to arrange a Vantis Site Assessment to determine the best solution for your home? "
+    "[KB Section 5: Pricing] [KB Section 15: Frequently Asked Questions]"
+)
+
+
+def test_s01_the_tag_after_the_closing_question_moves_to_the_facts_and_gets_its_chip():
+    reply, removed = strip_unsourced_citations(S01_REPLY, [CATALOG, CATALOG_2])
+    assert removed == 0
+    assert reply.endswith("for your property. [KB Section 8: Product & Service Catalog] Would you like to schedule a "
+                          "site assessment to see which option fits best?")
+    assert [s["section"] for s in pick_sources(tidy_citations(reply, [CATALOG]), [CATALOG])] == ["8"]
+
+
+def test_s02_both_tags_move_back_to_the_last_fact_on_an_earlier_line():
+    pricing = chunk(5, "Pricing", "Cost depends on system size.", chunk_id="s05-pricing")
+    reply, removed = strip_unsourced_citations(S02_REPLY, [pricing, FAQ])
+    assert removed == 0
+    first, question = reply.split("\n\n")
+    assert first.endswith("in a site visit. [KB Section 5: Pricing] [KB Section 15: Frequently Asked Questions]")
+    assert "[KB" not in question
+    assert [s["section"] for s in pick_sources(reply, [pricing, FAQ])] == ["5", "15"]
 
 
 def test_a_tag_on_a_thank_you_is_removed():
@@ -319,3 +362,76 @@ def test_two_policy_sentences_give_one_honest_line():
     reply = "We don't offer discounts. Our brand partners are confidential.\nAnything else?"
     kept, removed = remove_uncovered_policies(reply, [], HONEST)
     assert kept == f"{HONEST}\nAnything else?" and len(removed) == 2
+
+
+# ---------- T13d round 2: nothing free unless the KB says so; a missing tag ----------
+from app.rag.answer import add_missing_tag, remove_free_claims  # noqa: E402
+
+HONEST = "I can't confirm that from the information I have; the Vantis sales team can tell you."
+D1_REPLY = ("We offer end‑to‑end rooftop solar solutions for homes and small businesses, covering everything from a "
+            "free consultation and system sizing to panel and inverter installation, monitoring and ongoing "
+            "maintenance support[KB Section 1: Company Overview].")
+D7_REPLY = ("We can help you explore solar options whenever you’re ready—our team can assess your electricity use, roof "
+            "space and location to recommend a suitable system. If you’d like, we can arrange a free consultation or "
+            "check your city’s service coverage at a later time. Let us know what you’d like to do next.")
+
+
+def test_a_free_consultation_loses_the_word_free_in_the_live_replies():
+    """The live check of 13 Oct (D1, D7): Groq called the consultation free; the KB never says so."""
+    reply, removed = remove_free_claims(D1_REPLY, [CATALOG], HONEST)
+    assert "from a consultation and system sizing" in reply and "free" not in reply and removed == ["a free"]
+    reply, _ = remove_free_claims(D7_REPLY, [CATALOG], HONEST)
+    assert "we can arrange a consultation or check" in reply and "free" not in reply
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ("The site assessment is completely free. Would you like one?", f"{HONEST} Would you like one?"),
+    ("Maintenance visits come at no extra cost. Support is available.", f"{HONEST} Support is available."),
+    ("Consultation muft hai.", HONEST),
+    ("We offer a complimentary assessment.", "We offer an assessment."),
+    ("Free consultation is available.", "Consultation is available."),
+])
+def test_free_claims_are_removed(reply, expected):
+    assert remove_free_claims(reply, [CATALOG], HONEST)[0] == expected
+
+
+@pytest.mark.parametrize("reply", [
+    "Feel free to ask anything.", "Installation is hassle-free.", "Is the consultation free?",
+    "Our team is free to help on weekdays? Yes.",
+])
+def test_other_uses_of_free_and_questions_stay(reply):
+    assert remove_free_claims(reply, [CATALOG], HONEST) == (reply, [])
+
+
+def test_free_stays_when_this_turns_kb_says_so():
+    says_free = chunk(15, "FAQ", "Q: Is the first consultation free?\nA: Yes, it is free.", chunk_id="s15-free")
+    assert remove_free_claims(D1_REPLY, [says_free], HONEST) == (D1_REPLY, [])
+
+
+S13 = chunk(13, "Financing & Government Subsidies", "Government subsidy programs, eligibility requirements, and "
+            "amounts may change over time.", chunk_id="s13-subsidies")
+SUBSIDY_FAQ = chunk(15, "Frequently Asked Questions", "Q: Do you provide subsidy assistance?\nA: The team can explain "
+                    "applicable considerations, but current eligibility and subsidy amounts require verification.",
+                    chunk_id="s15-subsidy")
+C4B_REPLY = ("Yes, there can be government subsidies, but eligibility and the exact amount need to be verified for your "
+             "situation. Our team can walk you through the details and let you know what you may qualify for. Would "
+             "you like us to arrange a quick call or send more information about the subsidy process?")
+
+
+def test_a_reply_that_uses_this_turns_chunks_without_a_tag_gets_the_best_ones_tag():
+    """The drill of 13 Oct (C4b): Groq answered from the subsidy chunks but cited none, so no source chip showed."""
+    reply, tag = add_missing_tag(C4B_REPLY, [SUBSIDY_FAQ, S13])
+    assert tag == "[KB Section 13: Financing & Government Subsidies]"
+    assert "verified for your situation. [KB Section 13: Financing & Government Subsidies] Our team" in reply
+    assert [s["section"] for s in pick_sources(reply, [SUBSIDY_FAQ, S13])] == ["13"]
+
+
+@pytest.mark.parametrize("reply", [
+    "Sure! What is your name?",  # a question is never tagged
+    "Vantis can help with that. The team will be happy to assist.",  # no real match
+    "Subsidy amounts need checking [KB Section 15: Frequently Asked Questions].",  # already cites a section
+    HONEST,
+])
+def test_no_tag_without_a_real_match(reply):
+    assert add_missing_tag(reply, [SUBSIDY_FAQ, S13], skip=(HONEST,)) == (reply, None)
+    assert add_missing_tag(C4B_REPLY, []) == (C4B_REPLY, None)  # no chunks this turn

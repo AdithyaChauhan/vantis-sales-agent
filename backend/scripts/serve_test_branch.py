@@ -42,7 +42,8 @@ def force_gemini_timeouts() -> None:
     """Make every Gemini chat model built from now on hang (the embedder is not touched). Call it before the
     agent is built."""
 
-    def hanging_gemini_chat(model: str, settings: Settings) -> llm.GeminiChat:
+    def hanging_gemini_chat(model: str, settings: Settings,
+                            http_timeout_s: float = llm.GEMINI_MIN_TIMEOUT_S) -> llm.GeminiChat:
         return HangingGemini(model=model, google_api_key=settings.google_api_key or "unused",
                              thinking_level=llm.THINKING_LEVEL)
 

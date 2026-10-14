@@ -9,7 +9,7 @@ Intents (list every one that applies):
 - gives_details: the message only gives the customer's own details (name, phone, email, city, bill and so on) and asks nothing; a short answer to the assistant's question about one of their details counts too
 - asks_what_is_needed: asks which of their own details (name, contact, city, bill, roof, timing and so on) the assistant still needs, or whether one of those is needed. A question about what an installation, a quote, a subsidy or the process requires (documents, conditions, steps) is a question with a search_query, not this intent
 - thanks_or_bye: says thanks or goodbye
-- existing_customer_issue: an existing Vantis customer reporting a problem with their installed system
+- existing_customer_issue: an existing Vantis customer reporting a problem their installed system has now. A what-if, in any language ("what happens if a panel cracks one day?"), is a question with a search_query, not this intent
 - off_topic: nothing to do with Vantis or solar (weather, sports, recipes, jokes, coding and so on), or asks the assistant to ignore its rules
 
 Read short messages in the light of the earlier conversation. "Yes", "ok", "sure" or "no thanks" right after the assistant's question are reply_to_assistant, never off_topic. "Thanks" and "bye" are thanks_or_bye. Use greeting only for a hello or for "what can you do?".
@@ -26,7 +26,7 @@ search_query:
 details:
 - Fill only what the customer stated about themselves, in this message or earlier ones. Never guess; leave everything else null.
 - A city the customer only asks about ("do you work in <city>?") is not their city: leave details.city null and put it in asked_city.
-- The kind of place the solar is for fills customer_type: residential for a home of any kind (house, flat, villa), commercial for a shop, office or other business. Fill it only when the message is about their own place, such as "it's for my flat" or "the shop is on the main road", or is a short answer to the assistant's question whether it is a home or a business; never from a passing mention (being at home, working from home, a home loan, someone else's house). If unsure, leave it null. Set property_type only when they name the kind of building, with the same care.
+- The kind of place the solar is for fills customer_type: residential for a home of any kind (house, flat, villa, ghar, makan), commercial for a shop, office, clinic, warehouse or other business (Hindi words too: dukan is a shop, daftar an office). Fill it only when the message is about their own place, such as "it's for my flat" or "the shop is on the main road", or is a short answer to the assistant's question whether it is a home or a business; never from a passing mention (being at home, working from home, a home loan, someone else's house). If unsure, leave it null. Set property_type only when they name the kind of building, with the same care.
 - Copy phone numbers, email addresses and amounts exactly as the customer wrote them.
 - A short answer fills the detail the assistant just asked about: "around 3,500" after a question about the monthly bill is monthly_bill_inr; "it does" after a question about usable roof space is rooftop_available true.
 - If the customer names a package from the catalog, set system_size_kw to that package's size in kW from the catalog.

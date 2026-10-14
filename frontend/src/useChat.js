@@ -57,6 +57,7 @@ export function useChat() {
         sources: Array.isArray(body.sources) ? body.sources : [],
         steps: Array.isArray(body.steps) ? body.steps : [],
         degraded: Boolean(body.degraded),
+        answeredBy: typeof body.answered_by === "string" ? body.answered_by : "model", // T13d: who wrote the reply
         elapsedMs: Math.round(performance.now() - started),
         at: new Date().toISOString(),
       };

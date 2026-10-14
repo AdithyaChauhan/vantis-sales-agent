@@ -91,12 +91,14 @@ describe("session", () => {
     send("Fresh start");
     await screen.findByText("Reply 4");
 
+    const id = expect.any(String); // T13d: each message carries its own client_message_id
     expect(chatPayloads(fetchMock)).toEqual([
-      { message: "First question", channel: "web" },
-      { message: "Second question", channel: "web", session_id: SESSION },
-      { message: "Third question", channel: "web", session_id: SESSION },
-      { message: "Fresh start", channel: "web" },
+      { message: "First question", channel: "web", client_message_id: id },
+      { message: "Second question", channel: "web", session_id: SESSION, client_message_id: id },
+      { message: "Third question", channel: "web", session_id: SESSION, client_message_id: id },
+      { message: "Fresh start", channel: "web", client_message_id: id },
     ]);
+    expect(new Set(chatPayloads(fetchMock).map((p) => p.client_message_id)).size).toBe(4);
   });
 });
 
@@ -199,7 +201,10 @@ describe("errors", () => {
     render(<ChatPage />);
     await screen.findByText(WELCOME.text);
     send("Is there a warranty?");
-    expect((await screen.findByRole("alert")).textContent).toBe("Something went wrong. Please try again.");
+    // T13d: sent once more after RETRY_DELAY_MS (1.5 s) before the error shows
+    expect((await screen.findByRole("alert", {}, { timeout: 4000 })).textContent).toBe(
+      "Something went wrong. Please try again.",
+    );
     expect(box().value).toBe("Is there a warranty?");
     expect(sendButton().disabled).toBe(false);
   });
@@ -235,6 +240,26 @@ describe("reply and lead", () => {
     expect(screen.getByText("Tool: schedule_callback")).toBeTruthy();
     expect(screen.getByText("Saved as lead #12")).toBeTruthy();
     expect(screen.getByText("requested, the team will confirm")).toBeTruthy();
+  });
+
+  it("says when no model answered and the reply came from the knowledge base (T13d)", async () => {
+    fakeApi({
+      chat: () =>
+        jsonResponse(
+          200,
+          chatReply("Warranty coverage depends on the equipment. [KB Section 15: Frequently Asked Questions]", {
+            steps: [{ node: "agent", detail: "LLM failed", data: {} }],
+            degraded: true,
+            answered_by: "knowledge_base",
+          }),
+        ),
+    });
+    render(<ChatPage />);
+    await screen.findByText(WELCOME.text);
+    send("panel ki warranty kitne saal ki hoti hai");
+    await screen.findByText(/Warranty coverage depends/);
+    expect(screen.getByText("No model answered")).toBeTruthy();
+    expect(screen.queryByText(/backup path/)).toBeNull();
   });
 
   it("new messages show when they were sent; messages saved without a time show none", async () => {

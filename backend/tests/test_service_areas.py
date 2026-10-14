@@ -65,8 +65,53 @@ def test_pune_unverified(kb_areas):
 
 @needs_pdf
 def test_unrelated_words_not_fuzzy_matched(kb_areas):
-    for name in ("Mumbai", "Kanpur Dehat Town", "Delhi Cantt Area", "Kota Bharu"):
+    for name in ("Mumbai", "Kanpur Dehat Town", "Navi Mumbai", "Greater Noida West"):
         assert kb_areas.lookup(name).status == "unverified"
+
+
+@needs_pdf
+@pytest.mark.parametrize("place, city", [
+    ("Sector 62, Noida", "Noida"), ("Noida sector 18", "Noida"), ("Gomti Nagar, Lucknow", "Lucknow"),
+    ("Indirapuram, Ghaziabad", "Ghaziabad"), ("South Delhi", "Delhi"), ("DLF Phase 3, Gurugram", "Gurugram"),
+    ("Delhi Cantt Area", "Delhi"), ("DLF Phase 3, Gurgaon", "Gurugram"),
+])
+def test_a_locality_of_a_listed_city_is_that_city(kb_areas, place, city):
+    """T13d (Adithya): a locality with a listed city's name counts as that city."""
+    r = kb_areas.lookup(place)
+    assert (r.status, r.matched_city, r.match) == ("listed", city, "locality")
+
+
+@needs_pdf
+@pytest.mark.parametrize("place", [
+    "Greater Noida", "Noida Extension", "Kanpur Dehat", "near Lucknow", "Lucknow ke paas ek gaon", "30 km from Lucknow",
+    "outskirts of Jaipur", "Lucknow district", "close to Kanpur", "Lucknow ke aas paas",
+])
+def test_a_separate_place_or_a_landmark_phrase_is_unverified(kb_areas, place):
+    """T13d (Adithya): only a known separate place that contains a listed name, or a landmark phrase around it, makes it
+    unverified; never fuzzy-matched to the listed city."""
+    r = kb_areas.lookup(place)
+    assert (r.status, r.matched_city, r.match) == ("unverified", None, "lookalike")
+
+
+@needs_pdf
+def test_aliases_and_typos_still_come_before_the_fuzzy_match(kb_areas):
+    assert kb_areas.lookup("New Delhi").match == "alias"
+    assert (kb_areas.lookup("Dehli").matched_city, kb_areas.lookup("Lucknw").matched_city) == ("Delhi", "Lucknow")
+
+
+@needs_pdf
+@pytest.mark.parametrize("text, places", [
+    ("aap log noida me kaam karte ho", ["Noida"]),
+    ("hi, mera ghar Greater Noida me hai", ["Greater Noida"]),
+    ("Lucknow ke paas ek gaon hai mera", ["Lucknow ke paas"]),
+    ("30 km from Lucknow, also an office in Kanpur", ["30 km from Lucknow", "Kanpur"]),
+    ("I live in Dehli", ["Delhi"]),
+    ("Sector 62, Noida, and a Gurgaon office", ["Noida", "Gurugram"]),
+    ("Karna", []),  # never fuzzy: "Karna" is not Karnal
+    ("I live in Pune", []),
+])
+def test_find_in_text(kb_areas, text, places):
+    assert kb_areas.find_in_text(text) == places
 
 
 # The tests below use a small made-up table, so they also run without the PDF.
@@ -130,3 +175,15 @@ def test_dehli_is_delhi_with_the_real_kb(kb_areas):
     r = kb_areas.lookup("Dehli")
     assert (r.status, r.matched_city) == ("listed", "Delhi")
     assert kb_areas.lookup("Raipur").status == "unverified"
+
+
+@needs_pdf
+@pytest.mark.parametrize("place", ["Lucknow se 30 km door", "Lucknow se thoda door", "Kanpur se bahar"])
+def test_the_hinglish_distance_form_is_a_landmark(kb_areas, place):
+    assert kb_areas.lookup(place).status == "unverified"
+
+
+@needs_pdf
+def test_the_hinglish_distance_form_in_a_message(kb_areas):
+    assert kb_areas.find_in_text("mera gaon Lucknow se 30 km door hai") == ["Lucknow se 30 km door"]
+    assert kb_areas.find_in_text("main Lucknow se hu") == ["Lucknow"]  # "from Lucknow": the city itself

@@ -4,6 +4,8 @@ import pytest
 from app.leads.schemas import LeadData
 from app.leads.scoring import (
     COLD_ACTION,
+    COLD_READY_ACTION,
+    CALL_REQUESTED_ACTION,
     HOT_ACTION,
     WARM_ACTION,
     missing_details,
@@ -249,3 +251,73 @@ def test_minimum_fields_for_a_lead():
     only_property = LeadData(name="Asha Rao", email="asha@example.com", city="Delhi", property_type="house")
     assert missing_for_creation(only_property) == []
     assert missing_for_creation(LeadData(name="Asha Rao", city="Delhi", property_type="house")) == ["phone or email"]
+
+
+# ---------- T13d: the assignment's Cold, a request to be called, home or business as the need ----------
+
+EXPLORING_WITH_DETAILS = {  # the audit's S22: "just exploring, maybe next year", then details
+    "name": "Vikram Rao", "phone": "9876500004", "city": "Kanpur", "property_type": "house",
+    "monthly_bill_inr": "3000", "intent_level": "exploring", "timeline_bucket": "gt_6m",
+}
+
+
+def test_only_exploring_without_a_near_timeline_is_capped_at_cold():
+    _, breakdown = scored(EXPLORING_WITH_DETAILS)
+    assert (breakdown["raw_score"], breakdown["lead_score"], breakdown["lead_status"]) == (56, 44, "COLD")
+    assert [c["rule"] for c in breakdown["caps"]] == ["exploring"]
+    assert next_status_gap(breakdown) == ("WARM", ["only exploring, no timeline under 3 months"])
+
+
+@pytest.mark.parametrize("timeline", ["lt_1m", "1_3m"])
+def test_exploring_with_a_timeline_under_3_months_is_not_capped(timeline):
+    _, breakdown = scored({**EXPLORING_WITH_DETAILS, "timeline_bucket": timeline})
+    assert breakdown["caps"] == [] and breakdown["lead_status"] == "WARM"
+
+
+def test_an_exploring_cap_that_changes_nothing_is_not_recorded():
+    _, breakdown = scored(EXPLORER)  # 36: already COLD
+    assert breakdown["caps"] == [] and breakdown["lead_score"] == 36
+
+
+def test_only_the_strictest_cap_is_recorded():
+    _, breakdown = scored({**EXPLORING_WITH_DETAILS, "city": "Pune", "email": "v@example.com",
+                           "system_size_kw": "5 kW"}, location_status="unverified")
+    assert breakdown["lead_score"] == 44 and [c["rule"] for c in breakdown["caps"]] == ["exploring"]
+
+
+def test_a_cold_lead_that_is_ready_gets_a_call_never_follow_up_in_30_days():
+    data, breakdown = scored({"name": "Ravi Kumar", "phone": "9812345678", "city": "Pune",
+                              "customer_type": "residential", "intent_level": "ready"}, location_status="unverified")
+    assert breakdown["lead_status"] == "COLD"
+    assert recommended_action(breakdown, data) == COLD_READY_ACTION and "30 days" not in COLD_READY_ACTION
+    assert recommended_action(breakdown, data, "tomorrow 11am").startswith("Call tomorrow 11am, as requested")
+    data, breakdown = scored(EXPLORER)
+    assert recommended_action(breakdown, data) == COLD_ACTION  # exploring: the nurture list, as before
+
+
+def test_a_call_request_lead_from_s21_is_warm_with_a_24_hour_follow_up():
+    """The audit's S21: "can someone call me?", then name, phone and a house in Faridabad: COLD 43 before T13d."""
+    data, breakdown = scored({"name": "Neha Gupta", "phone": "9876500003", "city": "Faridabad",
+                              "property_type": "house", "intent_level": "ready"}, location_status="listed")
+    assert (breakdown["lead_score"], breakdown["lead_status"]) == (53, "WARM")
+    assert recommended_action(breakdown, data).startswith(WARM_ACTION)
+
+
+def test_home_or_business_counts_as_the_need():
+    assert missing_for_creation(LeadData(name="Amit Shah", phone="9876500004", city="Kanpur",
+                                         customer_type="residential")) == []
+
+
+
+def test_a_call_asked_for_without_a_time_says_call_whatever_the_status():
+    """Adithya (T13d round 2): "Call the customer within 24 hours; they asked for a call", whatever the status."""
+    for raw, status in ((RAHUL, "HOT"), ({"name": "Neha Gupta", "phone": "9876500003", "city": "Lucknow",
+                                          "property_type": "house", "intent_level": "ready"}, "WARM"),
+                        (EXPLORER, "COLD")):
+        data, breakdown = scored(raw)
+        assert breakdown["lead_status"] == status
+        action = recommended_action(breakdown, data, call_requested=True)
+        assert action.startswith(CALL_REQUESTED_ACTION) and "30 days" not in action
+    data, breakdown = scored(RAHUL)
+    assert recommended_action(breakdown, data, "tomorrow 11am", call_requested=True).startswith(
+        "Call tomorrow 11am, as requested")  # a time they gave wins

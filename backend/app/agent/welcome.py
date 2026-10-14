@@ -58,6 +58,33 @@ PACKAGES_FIT_TEXT = (
 STILL_NEEDED_ASK = "Could you share your {items}? Then I can pass your details to the sales team."
 SUPPORT_STILL_NEEDED_ASK = "Could you share your {items}? Then I can pass your request to the Vantis team."
 READY_TO_PASS_ASK = "Shall I pass your details to the sales team so they can follow up?"
+# T13d: the safety net (app/agent/fallback.py), when no model answered. City lines from the code's own check, with the
+# KB Section 10 tag after them; the lines for a message the KB sentences don't match; the one closing question
+AREA_LISTED_TEXT = "Vantis currently covers {city}."
+AREA_UNVERIFIED_TEXT = ("I can't confirm service in {city} yet, as it isn't among the service areas in my information; "
+                        "the Vantis team can check it for you.")
+NOT_COVERED_TEXT = "That isn't covered in the information I have; the Vantis team can confirm it for you."
+DETAILS_THANKS_TEXT = "Thanks for sharing that."
+CONTINUE_TEXT = "Happy to help with that."
+FALLBACK_OFFER = "Would you like the Vantis sales team to help you with this?"
+ANYTHING_ELSE_ASK = "Anything else you'd like to know?"
+# The next detail as the safety net's one question (keys: the items of leads.ask_targets)
+NEXT_QUESTION = {
+    "city": "Which city is the property in?",
+    "requirement, monthly bill, usage, system size or property type": (
+        "What is your approximate monthly electricity bill?"),
+    "name": "Could you share your name?",
+    "phone or email": "Could you share your phone number or email?",
+    "property type": "Is this for a home or a business?",
+    "issue": "Could you describe the problem with your system?",
+    "project details": "Could you share your system details (size and when it was installed)?",
+    "timeline": "When would you like the system installed?",
+    "monthly bill or usage": "What is your approximate monthly electricity bill?",
+    "rooftop availability": "Does the property have usable roof space for the panels?",
+    "ownership": "Do you own the property?",
+    "email": "Could you share your email address?",
+    "phone number": "Could you share your phone number?",
+}
 # The missing items in everyday words (keys: NEED_ORDER and SUPPORT_NEEDS in app/agent/leads.py)
 CUSTOMER_WORDS = {
     "city": "city",

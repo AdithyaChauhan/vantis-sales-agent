@@ -64,9 +64,40 @@ describe("How I answered", () => {
     expect(within(panel).getByText("Kanpur: listed")).toBeTruthy();
   });
 
-  it("says when a fallback was used", () => {
-    render(<Message message={assistant({ steps: STEPS, degraded: true })} />);
+  it("says when a model answered on a backup path", () => {
+    render(<Message message={assistant({ steps: STEPS, degraded: true, answeredBy: "model" })} />);
     expect(screen.getByText("Fallback used")).toBeTruthy();
+    expect(screen.getByText("Part of this turn used a backup path (see the steps above)")).toBeTruthy();
+  });
+
+  it.each([
+    ["knowledge_base", "The reply quotes the knowledge base directly"],
+    ["tools", "The reply says what this turn saved"],
+    ["fixed", "A fixed reply was sent"],
+  ])("never says a backup path answered when no model did (%s, T13d)", (answeredBy, detail) => {
+    const steps = [{ node: "agent", detail: "LLM failed", data: {} }, { node: "fallback", detail: "no model answered", data: {} }];
+    render(<Message message={assistant({ steps, degraded: true, answeredBy })} />);
+    expect(screen.getByText("No model answered")).toBeTruthy();
+    expect(screen.getByText(detail)).toBeTruthy();
+    expect(screen.queryByText(/backup path/)).toBeNull();
+    expect(screen.queryByText("Fallback used")).toBeNull();
+  });
+
+  it("adds no last line to a healthy reply or a welcome text", () => {
+    for (const answeredBy of ["model", "fixed"]) {
+      const { container, unmount } = render(<Message message={assistant({ steps: STEPS, answeredBy })} />);
+      expect(within(container).queryByText("No model answered")).toBeNull();
+      expect(within(container).queryByText("Fallback used")).toBeNull();
+      unmount();
+    }
+  });
+
+  it("labels the new steps", () => {
+    const steps = [{ node: "save", detail: "lead saved (create_lead was not called)", data: {} },
+      { node: "fallback", detail: "no model answered: reply from KB Section 15", data: {} }];
+    render(<Message message={assistant({ steps, degraded: true, answeredBy: "knowledge_base" })} />);
+    expect(screen.getByText("Saved the lead")).toBeTruthy();
+    expect(screen.getByText("Backup reply, no model")).toBeTruthy();
   });
 
   it("is not shown on the customer's own messages", () => {

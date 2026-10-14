@@ -10,11 +10,31 @@ const NODE_LABELS = {
   retrieve: "Searched the knowledge base",
   agent: "Model call",
   sync: "Saved new details",
+  save: "Saved the lead",
   guard: "Safety check on the reply",
   reply: "Fixed reply, no model call",
+  fallback: "Backup reply, no model",
   area_check: "Service area check",
 };
 const MS_IN_DETAIL = /,?\s*(\d+) ms\b/;
+
+/**
+ * T13d: the last line says who wrote the reply (the API's `answered_by`). Only a model's reply on a degraded turn
+ * "used a backup path"; when no model answered, the line says so (the Vercel page once claimed "A backup path
+ * answered" on a turn no model answered).
+ */
+const NO_MODEL = {
+  knowledge_base: "The reply quotes the knowledge base directly",
+  tools: "The reply says what this turn saved",
+  fixed: "A fixed reply was sent",
+};
+
+/** The last line of the panel: [label, detail], or null when nothing needs saying. */
+export function answerLine(answeredBy, degraded) {
+  if (NO_MODEL[answeredBy] && (degraded || answeredBy !== "fixed")) return ["No model answered", NO_MODEL[answeredBy]];
+  if (degraded) return ["Fallback used", "Part of this turn used a backup path (see the steps above)"];
+  return null;
+}
 
 /** A plain label for one step. */
 export function stepLabel(step) {
@@ -40,8 +60,9 @@ function stepDetail(step) {
   return (step.detail ?? "").replace(MS_IN_DETAIL, "").trim();
 }
 
-export default function StepsPanel({ steps, elapsedMs, degraded }) {
-  if (!steps?.length && !degraded) return null;
+export default function StepsPanel({ steps, elapsedMs, degraded, answeredBy }) {
+  const last = answerLine(answeredBy, degraded);
+  if (!steps?.length && !last) return null;
   const parts = ["How I answered", steps.length === 1 ? "1 step" : `${steps.length} steps`];
   if (Number.isFinite(elapsedMs)) parts.push(seconds(elapsedMs));
   return (
@@ -58,10 +79,10 @@ export default function StepsPanel({ steps, elapsedMs, degraded }) {
             <span className="step-time">{stepTime(step) ?? ""}</span>
           </li>
         ))}
-        {degraded ? (
+        {last ? (
           <li>
-            <span className="step-label">Fallback used</span>
-            <span className="step-detail">A backup path answered (keyword search or a backup model)</span>
+            <span className="step-label">{last[0]}</span>
+            <span className="step-detail">{last[1]}</span>
             <span className="step-time" />
           </li>
         ) : null}

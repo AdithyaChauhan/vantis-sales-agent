@@ -630,7 +630,8 @@ def test_a_model_failure_after_the_save_says_the_lead_is_saved_not_try_again(ops
     state = run(graph, "Rohan Verma, 9876500002")
     assert state["reply"] == welcome.SAVED_FALLBACK_TEXT and state["degraded"] is True
     assert state["lead_id"] and count(ops.engine, Lead) == 1
-    assert any(s["detail"] == "LLM failed; the reply says what the tools did" for s in state["steps"])
+    assert (state["answered_by"], state["steps"][-1]["node"]) == ("tools", "fallback")  # T13d: the safety net
+    assert ops.calls == ["create"]  # the tool saved it; finalize never saves twice
 
 
 # ---------- T13a: city memory ----------
@@ -818,24 +819,29 @@ def test_without_the_second_model_the_turn_goes_on_as_before(ops):
 
 @pytest.mark.parametrize("lead, intents, callback_time, expected", [
     ({}, {"buying_interest"}, None, {"intent_level": "interested"}),
-    ({}, {"contact_request"}, None, {"intent_level": "interested"}),
-    ({}, {"gives_details"}, "tomorrow 5pm", {"intent_level": "interested"}),  # a callback request
+    ({}, {"contact_request"}, None, {"intent_level": "ready"}),  # T13d: a request to be called is ready
+    ({}, {"gives_details"}, "tomorrow 5pm", {"intent_level": "ready"}),  # a callback request
     ({}, {"question"}, None, {}),  # only a question: still unknown
     ({"intent_level": "ready"}, {"buying_interest"}, None, {}),  # the extractor's value is never replaced
-    ({"intent_level": "exploring"}, {"contact_request"}, "5pm", {}),
+    ({"intent_level": "interested"}, {"buying_interest"}, None, {}),
+    ({"intent_level": "exploring"}, {"contact_request"}, "5pm", {"intent_level": "ready"}),  # a call beats exploring
+    ({"intent_level": "ready"}, {"contact_request"}, "5pm", {}),  # already ready: nothing changes
 ])
 def test_chat_intent(lead, intents, callback_time, expected):
     assert chat_intent(lead, intents, callback_time) == expected
 
 
-def test_a_callback_request_makes_an_unknown_intent_interested_and_the_score_counts_it(ops):
-    # Chat 1: Ravi scored 48 with the intent unknown after asking the price and asking for a callback
+def test_a_callback_request_makes_the_intent_ready_and_the_action_names_the_time(ops):
+    # Chat 1: Ravi scored 48 with the intent unknown after asking the price and asking for a callback. T13d: a request
+    # to be called is ready intent, and the action names their time from the moment the lead is created
     understand_llm = Scripted(understood(["gives_details", "contact_request"], None, name="Ravi", phone="9812345678",
                                          city="Kanpur", monthly_bill_inr="6000", callback_time="tomorrow 5pm"))
     agent = Scripted(tool_call("create_lead", {}), answer("Saved. I'll note the callback."))
     graph, _ = make_graph(understand_llm, agent, ops=ops)
     state = run(graph, "Ravi, 9812345678, Kanpur, bill 6000, call me tomorrow 5pm")
-    assert state["lead"]["intent_level"] == "interested" and state["steps"][0]["data"]["intent_from_chat"] is True
+    assert state["lead"]["intent_level"] == "ready" and state["steps"][0]["data"]["intent_from_chat"] is True
     lead = service.get_lead(ops.engine, state["lead_id"])
     intent = next(r for r in lead.score_breakdown["rules"] if r["rule"] == "intent")
-    assert (lead.intent_level, intent["points"]) == ("interested", 15)
+    assert (lead.intent_level, intent["points"]) == ("ready", 25)
+    assert lead.recommended_action.startswith("Call tomorrow 5pm, as requested")
+    assert "30 days" not in lead.recommended_action

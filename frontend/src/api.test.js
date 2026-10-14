@@ -10,6 +10,7 @@ import {
   pingServer,
   postChat,
   REQUEST_TIMEOUT_MS,
+  RETRY_DELAY_MS,
 } from "./api.js";
 import { chatReply, fakeApi, jsonResponse, SALES_KEY } from "./test-utils.js";
 
@@ -105,16 +106,67 @@ describe("sales calls", () => {
   });
 });
 
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** Run a postChat call with fake timers, so the retry's pause passes at once. */
+async function withFakeTimers(call) {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const result = call().then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS + 10);
+    return await result;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 describe("postChat", () => {
-  it("leaves session_id out of the first message", async () => {
+  it("leaves session_id out of the first message and gives each message a random id", async () => {
     const fetchMock = fakeApi({ chat: () => jsonResponse(200, { session_id: "s", reply: "ok" }) });
     await postChat({ message: "hi", sessionId: null });
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ message: "hi", channel: "web" });
+    await postChat({ message: "again", sessionId: "s" });
+    const [first, second] = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(first).toEqual({ message: "hi", channel: "web", client_message_id: expect.stringMatching(UUID_V4) });
+    expect(second.client_message_id).not.toBe(first.client_message_id);
   });
 
-  it("turns a network failure into a friendly error", async () => {
-    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new TypeError("Failed to fetch"))));
-    await expect(postChat({ message: "hi", sessionId: null })).rejects.toMatchObject({ kind: "network", message: GENERIC_ERROR });
+  it("turns a network failure into a friendly error after one retry with the same id (T13d)", async () => {
+    const fetchMock = vi.fn(() => Promise.reject(new TypeError("Failed to fetch")));
+    vi.stubGlobal("fetch", fetchMock);
+    const { error } = await withFakeTimers(() => postChat({ message: "hi", sessionId: null }));
+    expect(error).toMatchObject({ kind: "network", message: GENERIC_ERROR });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const ids = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body).client_message_id);
+    expect(ids[0]).toMatch(UUID_V4);
+    expect(ids[1]).toBe(ids[0]);
+  });
+
+  it.each([
+    ["a network error", () => Promise.reject(new TypeError("Failed to fetch"))],
+    ["a proxy's 502 page", async () => new Response("<html>Bad gateway</html>", { status: 502 })],
+    ["a proxy's 503 page", async () => new Response("upstream unavailable", { status: 503 })],
+  ])("sends a message again once after %s, and the reply that comes then is shown", async (_, firstAnswer) => {
+    let calls = 0;
+    const fetchMock = vi.fn(() => (++calls === 1 ? firstAnswer() : Promise.resolve(jsonResponse(200, chatReply("ok")))));
+    vi.stubGlobal("fetch", fetchMock);
+    const { value } = await withFakeTimers(() => postChat({ message: "hi", sessionId: null }));
+    expect(value).toMatchObject({ reply: "ok" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["our own 503 (the database is down)", () => jsonResponse(503, { detail: "We can't reach our database right now." })],
+    ["a 422", () => jsonResponse(422, { detail: "x", errors: { message: "too long" } })],
+    ["a 429", () => jsonResponse(429, { detail: "Slow down.", retry_after: 5 })],
+  ])("never sends again after %s: the server answered", async (_, answer) => {
+    const fetchMock = vi.fn(async () => answer());
+    vi.stubGlobal("fetch", fetchMock);
+    const { error } = await withFakeTimers(() => postChat({ message: "hi", sessionId: null }));
+    expect(error).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("treats a 200 that isn't JSON as a server error", async () => {

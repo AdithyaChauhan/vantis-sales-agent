@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     google_api_key: str = ""
     llm_model_main: str = ""
     llm_model_fast: str = ""
+    # Gemini's service tier (T13d): standard (default, nothing sent), priority (Tier 2/3 paid projects, costs more) or
+    # flex
+    gemini_service_tier: str = "standard"
     embedding_model: str = ""
     embedding_dim: int = 768
     # Relevance gate, checked in T4 (docs/EVAL.md): best similarity was 0.68-0.84 for the 24 KB
@@ -29,6 +32,9 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     fallback_model: str = ""
+    # T13d: a second Groq model for answers, tried after the first; its tokens a minute are its own (Groq limits each
+    # model separately). Empty: none
+    fallback_model_2: str = ""
 
     sales_api_key: str = ""
     cors_origins: str = "http://localhost:5173"

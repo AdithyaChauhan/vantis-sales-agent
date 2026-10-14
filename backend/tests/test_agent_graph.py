@@ -175,16 +175,22 @@ def test_unparsable_understanding_also_falls_back():
     assert search.queries == ["What do you offer?"] and state["degraded"] is True
 
 
-def test_agent_failure_is_degraded():
+def test_agent_failure_is_degraded_and_gets_the_safety_net_not_try_again():
+    """T13d: no KB sentence shares a word with the question (the fake chunks are a package row and the quote FAQ), so
+    the reply says plainly that the information doesn't cover it, then offers help; never "I'm having trouble"."""
     graph, _ = make_graph(Scripted(understood(["question"], "q")), Scripted(RuntimeError("both down")))
-    state = run(graph, "What do you offer?")
-    assert (state["reply"], state["degraded"], state["sources"]) == (LLM_DOWN_REPLY, True, [])
+    state = run(graph, "Do you sell water heaters?")
+    assert (state["reply"], state["degraded"], state["sources"]) == (
+        f"{welcome.NOT_COVERED_TEXT}\n\n{welcome.FALLBACK_OFFER}", True, [])
+    assert state["answered_by"] == "fixed" and state["reply"] != LLM_DOWN_REPLY
+    assert [s["node"] for s in state["steps"]][-2:] == ["agent", "fallback"]
 
 
-def test_empty_agent_reply_is_degraded():
+def test_empty_agent_reply_is_degraded_and_gets_the_safety_net():
     graph, _ = make_graph(Scripted(understood(["question"], "q")), Scripted(answer("   ")))
     state = run(graph, "What do you offer?")
-    assert (state["reply"], state["degraded"]) == (LLM_DOWN_REPLY, True)
+    assert state["degraded"] is True and state["reply"] != LLM_DOWN_REPLY  # T13d: an empty answer is no answer
+    assert state["steps"][-1]["node"] == "fallback"
 
 
 def test_no_context_gives_the_agent_an_empty_context():
@@ -242,11 +248,11 @@ def test_lead_details_merge_and_errors_stay_per_turn():
 
 def test_small_to_big_is_off_by_default_and_adds_the_summary_when_on():
     off, _ = make_graph(Scripted(understood(["question"], "catalog")), Scripted(answer(CITED)))
-    state = run(off, "What do you offer?")
+    state = run(off, "Tell me about Plan A")  # T13d: "What do you offer?" now brings the summary itself
     # the 2 found, plus (T13c) the KB Section 9 rows, since the found row names only one of the two packages
     assert len(state["chunks"]) == 4 and state["steps"][1]["data"]["added_package_rows"] == 2
     on, _ = make_graph(Scripted(understood(["question"], "catalog")), Scripted(answer(CITED)), small_to_big=True)
-    state = run(on, "What do you offer?")
+    state = run(on, "Tell me about Plan A")
     assert [c["chunk_id"] for c in state["chunks"]] == ["s08-plan-a", "s15-quote", "s08-table-summary"]
     assert state["steps"][1]["data"]["added_summaries"] == 1
 

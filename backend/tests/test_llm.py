@@ -1,6 +1,7 @@
 """Chat-model layer: wiring of Gemini + Groq, deadlines, the skip list, provider, latency and reply text.
 No network calls."""
 import logging
+import threading
 import time
 
 import groq
@@ -32,6 +33,16 @@ from app.core.llm import (
 )
 
 MESSAGES = [HumanMessage("hi")]
+
+
+@pytest.fixture(autouse=True)
+def idle_deadline_pool():
+    """Wait until every worker of the deadline pool is free. A late fake call of an earlier test keeps its worker until
+    its sleep ends, and a deadline counts from submit, so a busy pool turned a fake 429 into a timeout."""
+    barrier = threading.Barrier(llm.DEADLINE_WORKERS + 1)
+    for _ in range(llm.DEADLINE_WORKERS):
+        llm._deadline_pool.submit(barrier.wait, 5)
+    barrier.wait(5)
 
 
 class Answer(BaseModel):
@@ -144,33 +155,35 @@ def test_nothing_configured_fails_on_call_not_on_build():
         invoke_llm(model, MESSAGES)
 
 
-def test_the_reason_uses_the_main_model_for_4_s_and_never_groq():
+def test_the_reason_uses_the_fast_model_for_8_s_and_never_groq():
+    """T13d: off the main model's quota; it runs after the reply, so 8 s."""
     [reason] = reason_candidates(settings())
-    assert (reason.key, reason.use, reason.seconds) == ("gemini:gemini-main", "reason", 4)
-    assert isinstance(reason.model, GeminiChat) and reason.model.model == "gemini-main"
+    assert (reason.key, reason.use, reason.seconds) == ("gemini:gemini-fast", "reason", 8)
+    assert isinstance(reason.model, GeminiChat) and reason.model.model == "gemini-fast"
     assert reason_candidates(settings(google_api_key="")) == []  # no Groq: the template answers instead
+    assert reason_candidates(settings(llm_model_fast="")) == []  # no fast model: the template, never main
 
 
-def test_understand_candidates_are_main_then_groq_then_fast_4_s_each():
+def test_understand_candidates_are_main_then_fast_4_s_each_and_never_groq():
+    """T13d: Groq's tokens are kept for answers; understand falls back to the raw message and the code's reading."""
     candidates = understand_candidates(Answer, settings())
-    [main], [groq_model], [fast] = (models_in(c.model) for c in candidates)
-    assert (main.model, groq_model.model_name, fast.model) == ("gemini-main", "groq-model", "gemini-fast")
-    assert [c.key for c in candidates] == ["gemini:gemini-main", "groq:groq-model", "gemini:gemini-fast"]
+    [main], [fast] = (models_in(c.model) for c in candidates)
+    assert (main.model, fast.model) == ("gemini-main", "gemini-fast")
+    assert [c.key for c in candidates] == ["gemini:gemini-main", "gemini:gemini-fast"]
     assert {(c.use, c.seconds) for c in candidates} == {("understand", 4)}
     for gemini in (main, fast):
         assert_our_http_rules(request_http(gemini))
-    assert (groq_model.request_timeout, groq_model.max_retries) == (4, 0)
     for candidate in candidates:  # structured output with the raw message kept
         assert "raw" in candidate.model.output_schema.model_json_schema()["properties"]
 
 
 def test_understand_candidates_leave_out_unconfigured_providers():
     assert len(understand_candidates(Answer, settings(groq_api_key=""))) == 2
-    assert len(understand_candidates(Answer, settings(google_api_key=""))) == 1
-    assert understand_candidates(Answer, settings(google_api_key="", groq_api_key="")) == []
+    assert understand_candidates(Answer, settings(google_api_key="")) == []  # Groq never understands
+    assert len(understand_candidates(Answer, settings(llm_model_fast="gemini-main"))) == 1  # one model, tried once
 
 
-def test_reason_llm_is_built_from_the_main_model(monkeypatch):
+def test_reason_llm_is_built_from_the_fast_model(monkeypatch):
     monkeypatch.setattr(llm, "get_settings", lambda: settings())
     built = []
     monkeypatch.setattr(llm, "model_chain", lambda candidates, skips=None: built.append(candidates) or "chain")
@@ -178,7 +191,7 @@ def test_reason_llm_is_built_from_the_main_model(monkeypatch):
     try:
         assert llm.reason_llm() == "chain"
         [[reason]] = built
-        assert (reason.key, reason.use) == ("gemini:gemini-main", "reason")
+        assert (reason.key, reason.use) == ("gemini:gemini-fast", "reason")
     finally:
         llm.reason_llm.cache_clear()
 
@@ -321,40 +334,73 @@ class Script:
 GROQ_OK = candidate(returns(structured("from groq", "groq")), "groq:m", seconds=1)
 
 
-def test_an_understand_timeout_skips_the_model_for_60_s_then_it_is_tried_again():
+def test_an_understand_timeout_pauses_the_model_for_15_s_then_it_is_tried_again():
     clock = Clock()
     skips = SkipList(clock)
     main = Script("slow", "ok")
     chain = model_chain([candidate(main.runnable(), "gemini:main", "understand", 0.1), GROQ_OK], skips)
     assert chain.invoke(MESSAGES)["parsed"].text == "from groq"  # main timed out: the window opens at once
-    assert skips.left("gemini:main", "understand") == 60
+    assert skips.left("gemini:main", "understand") == 15
     _, elapsed = timed(chain)  # inside the window: main is passed over, no wait
     assert main.calls == 1 and elapsed < 0.1
-    clock.now += 61
+    clock.now += 16
     assert chain.invoke(MESSAGES)["parsed"].text == "ok"  # the window ended: main is tried again
     assert main.calls == 2
 
 
-def test_one_slow_answer_does_not_open_the_window_but_two_in_a_row_do():
+def test_one_slow_answer_pauses_the_model_for_15_s_for_answers_only():
+    """T13d: a single timeout pauses the model (it took two in a row before), only for that kind of call."""
     skips = SkipList(Clock())
-    main_answers = Script("slow", "slow")
+    main_answers = Script("slow")
     main_understands = Script("ok")
     answer = model_chain([candidate(main_answers.runnable(), "gemini:main", "answer", 0.1), GROQ_OK], skips)
     understand = model_chain([candidate(main_understands.runnable(), "gemini:main", "understand", 1)], skips)
     assert answer.invoke(MESSAGES)["parsed"].text == "from groq"  # one slow answer: Groq answers this call
-    assert skips.left("gemini:main", "answer") == 0
-    understand.invoke(MESSAGES)  # an understand success does not reset the answers' count
-    answer.invoke(MESSAGES)  # the 2nd slow answer in a row opens the window
-    assert skips.left("gemini:main", "answer") == 60
+    assert skips.left("gemini:main", "answer") == 15
+    assert skips.left("gemini:main", "understand") == 0
+    assert understand.invoke(MESSAGES)["parsed"].text == "ok"  # understand still uses it
+
+
+def test_a_repeat_right_after_a_pause_doubles_it_up_to_60_s():
+    """T13d (Adithya): a long Google slowdown must not cost a doomed deadline on every turn."""
+    clock = Clock()
+    skips = SkipList(clock)
+    pauses = []
+    for _ in range(4):  # each failure comes right after the last pause ended
+        skips.failed("gemini:main", "answer", "timeout")
+        pauses.append(skips.left("gemini:main", "answer"))
+        clock.now += pauses[-1] + 1
+    assert pauses == [15, 30, 60, 60]
+    assert skips.left("gemini:main", "understand") == 0  # still only that kind of call
+
+
+def test_a_success_or_a_quiet_spell_starts_the_back_off_again():
+    clock = Clock()
+    skips = SkipList(clock)
+    skips.failed("gemini:main", "answer", "5xx")
+    clock.now += 16
+    skips.failed("gemini:main", "answer", "5xx")
+    assert skips.left("gemini:main", "answer") == 30
+    clock.now += 31
+    skips.succeeded("gemini:main", "answer")
+    skips.failed("gemini:main", "answer", "5xx")
+    assert skips.left("gemini:main", "answer") == 15  # a success in between
+    clock.now += 15 + llm.BACKOFF_GRACE_S + 1
+    skips.failed("gemini:main", "answer", "5xx")
+    assert skips.left("gemini:main", "answer") == 15  # a quiet spell longer than the grace
 
 
 def test_an_answer_success_resets_the_count():
-    skips = SkipList(Clock())
+    clock = Clock()
+    skips = SkipList(clock)
     main = Script("slow", "ok", "slow")
     answer = model_chain([candidate(main.runnable(), "gemini:main", "answer", 0.1), GROQ_OK], skips)
-    for _ in range(3):
-        answer.invoke(MESSAGES)
-    assert skips.left("gemini:main", "answer") == 0
+    answer.invoke(MESSAGES)  # slow: paused 15 s
+    clock.now += 16
+    answer.invoke(MESSAGES)  # ok: the back-off starts again
+    clock.now += 1
+    answer.invoke(MESSAGES)  # slow again soon after: 15 s, not 30
+    assert skips.left("gemini:main", "answer") == 15
 
 
 class StatusError(Exception):
@@ -365,19 +411,20 @@ class StatusError(Exception):
         setattr(self, attribute, code)
 
 
-@pytest.mark.parametrize("error, kind, seconds", [
-    (StatusError(503), "5xx", 120),
-    (StatusError(504, "status_code"), "5xx", 120),
-    (StatusError(429), "429", 60),
-    (StatusError(429, "status_code"), "429", 60),
+@pytest.mark.parametrize("error, kind, seconds, understand_left", [
+    (StatusError(503), "5xx", 15, 0),
+    (StatusError(504, "status_code"), "5xx", 15, 0),
+    (StatusError(429), "429", 60, 60),
+    (StatusError(429, "status_code"), "429", 60, 60),
 ])
-def test_a_5xx_or_429_opens_the_window_at_once_even_for_an_answer(error, kind, seconds):
+def test_a_5xx_pauses_that_kind_of_call_for_15_s_and_a_429_every_use(error, kind, seconds, understand_left):
+    """T13d: a 5xx says one call was unlucky (15 s, that use only); a 429 is the model's quota (every use)."""
     skips = SkipList(Clock())
     chain = model_chain([candidate(raises(error), "gemini:main", "answer"), GROQ_OK], skips)
     assert chain.invoke(MESSAGES)["parsed"].text == "from groq"
     assert failure_kind(error) == kind
-    # T13c: a 429 or 5xx is about the model itself, so every use skips it
-    assert skips.left("gemini:main", "answer") == skips.left("gemini:main", "understand") == seconds
+    assert skips.left("gemini:main", "answer") == seconds
+    assert skips.left("gemini:main", "understand") == understand_left
 
 
 def test_a_400_never_opens_the_window():
@@ -473,7 +520,7 @@ def test_the_render_sequence_still_tries_main_and_fast_for_the_answer():
     understand_chain, answer_chain, _, answer = chains(skips, "slow")
     with pytest.raises(LLMError):
         understand_chain.invoke(MESSAGES)
-    assert skips.left("gemini:main", "understand") == 60 and skips.left("gemini:fast", "understand") == 60
+    assert skips.left("gemini:main", "understand") == 15 and skips.left("gemini:fast", "understand") == 15  # T13d
     assert skips.left("gemini:main", "answer") == 0 and skips.left("gemini:fast", "answer") == 0
     assert answer_chain.invoke(MESSAGES).content == "From fast"  # main timed out once, Groq 429, fast answered
     assert (answer["main"].calls, answer["groq"].calls, answer["fast"].calls) == (1, 1, 1)
@@ -501,12 +548,15 @@ def test_the_render_sequence_through_the_graph_gives_a_slower_reply_not_a_failed
     assert state["degraded"] is True  # the understand step failed and used the raw message
 
 
-def test_a_timeout_skips_the_model_for_that_use_only_and_a_5xx_for_every_use():
+def test_a_timeout_or_5xx_pauses_that_use_only_and_a_429_every_use():
     skips = SkipList(Clock())
     skips.failed("gemini:main", "understand", "timeout")
-    assert (skips.left("gemini:main", "understand"), skips.left("gemini:main", "answer")) == (60, 0)
+    assert (skips.left("gemini:main", "understand"), skips.left("gemini:main", "answer")) == (15, 0)
     skips.failed("gemini:fast", "understand", "5xx")
-    assert skips.left("gemini:fast", "answer") == skips.left("gemini:fast", "reason") == 120
+    assert (skips.left("gemini:fast", "understand"), skips.left("gemini:fast", "answer")) == (15, 0)
+    skips.failed("groq:m", "answer", "429")
+    assert skips.left("groq:m", "answer") == skips.left("groq:m", "reason") == 60
+    assert (skips.paused_by("groq:m", "reason"), skips.paused_by("gemini:fast", "understand")) == ("429", "5xx")
 
 
 def test_skip_logs_say_which_uses_the_window_covers(caplog):
@@ -561,6 +611,168 @@ def test_automatic_function_calling_is_off_for_every_kind_of_call():
         assert _extra_utils.should_disable_afc(config) is True  # the SDK's own check: one request, no AFC loop
 
 
+def test_the_service_tier_is_sent_only_when_it_is_not_standard():
+    """T13d (item 7): GEMINI_SERVICE_TIER reaches google-genai's request as serviceTier; standard sends nothing."""
+    from google.genai import models as genai_models
+
+    def request_body(tier: str) -> dict:
+        gemini = gemini_chat("gemini-main", settings(gemini_service_tier=tier))
+        config = gemini._prepare_request(MESSAGES)["config"]
+        body = {}
+        genai_models._GenerateContentConfig_to_mldev(None, config, body)
+        return body
+
+    assert gemini_chat("gemini-main", settings()).service_tier is None
+    assert "serviceTier" not in request_body("standard")
+    assert request_body("priority")["serviceTier"] == "priority"
+    assert request_body(" Flex ")["serviceTier"] == "flex"
+    assert "serviceTier" not in request_body("fastest")  # unknown: standard, with a warning
+
+
+def test_the_last_try_model_is_main_with_a_20_s_deadline_and_a_25_s_http_timeout():
+    chain = chat_llm("gemini-main", settings(), tools=[echo])
+    assert chain.last_try is not None
+    assert llm.LAST_TRY_S == 20 and llm.LAST_TRY_HTTP_S == 25
+    patient = gemini_chat("gemini-main", settings(), http_timeout_s=llm.LAST_TRY_HTTP_S)
+    assert patient.request_http.timeout == 25_000 and patient.request_http.retry_options.attempts == 1
+
+
+# ---------- T13d: retry-after, the turn's budget and the last try ----------
+
+class RateLimited(Exception):
+    """A provider error with an HTTP response (Groq's 429 carries a retry-after header)."""
+
+    def __init__(self, headers: dict, status: int = 429):
+        super().__init__(f"HTTP {status}")
+        self.status_code = status
+        request = httpx.Request("POST", "https://example.invalid")
+        self.response = httpx.Response(status, headers=headers, request=request)
+
+
+class GeminiQuota(Exception):
+    """google-genai's APIError: code and the JSON body in `details`, with a RetryInfo."""
+
+    def __init__(self, delay: str):
+        super().__init__("429 RESOURCE_EXHAUSTED")
+        self.code = 429
+        self.details = {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": [
+            {"@type": "type.googleapis.com/google.rpc.QuotaFailure"},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay}]}}
+
+
+def test_retry_after_comes_from_groqs_header_or_geminis_retry_info_within_1_to_60_s():
+    assert llm.retry_after_s(RateLimited({"retry-after": "7"})) == 7
+    assert llm.retry_after_s(GeminiQuota("13s")) == 13
+    assert llm.retry_after_s(GeminiQuota("0.2s")) == 1  # never shorter than 1 s
+    assert llm.retry_after_s(RateLimited({"retry-after": "3600"})) == 60  # never longer than 60 s
+    assert llm.retry_after_s(RateLimited({})) is None and llm.retry_after_s(ValueError("x")) is None
+    try:  # found through the cause chain, like failure_kind
+        try:
+            raise GeminiQuota("9s")
+        except GeminiQuota as cause:
+            raise RuntimeError("wrapped") from cause
+    except RuntimeError as wrapped:
+        assert llm.retry_after_s(wrapped) == 9
+
+
+def test_a_429_pauses_the_model_for_the_providers_retry_after():
+    """Render 13 Oct 12:01:54: Groq's 429 paused it for 60 s; its own retry-after was a few seconds."""
+    skips = SkipList(Clock())
+    chain = model_chain([candidate(raises(RateLimited({"retry-after": "6"})), "groq:m", "answer"),
+                         candidate(returns(structured("from fast")), "gemini:fast", "answer", seconds=1)], skips)
+    assert chain.invoke(MESSAGES)["parsed"].text == "from fast"
+    assert skips.left("groq:m", "answer") == skips.left("groq:m", "understand") == 6
+
+
+def test_inside_a_turn_a_model_that_timed_out_is_skipped_for_the_rest_of_it():
+    skips = SkipList(Clock())
+    main = Script("slow", "ok")
+    understand = model_chain([candidate(main.runnable(), "gemini:main", "understand", 0.1), GROQ_OK], skips)
+    answer = model_chain([candidate(main.runnable(), "gemini:main", "answer", 0.1), GROQ_OK], skips)
+    with llm.turn_scope() as turn:
+        understand.invoke(MESSAGES)  # main times out on understand
+        assert turn.timed_out == {"gemini:main"} and turn.failures == {"gemini:main": "timeout"}
+        assert answer.invoke(MESSAGES)["parsed"].text == "from groq"  # not tried again for the answer
+    assert main.calls == 1
+    assert skips.left("gemini:main", "answer") == 0  # outside this turn it is only paused for understand
+    assert answer.invoke(MESSAGES)["parsed"].text == "ok"  # a new turn (or none) tries it again
+
+
+def test_inside_a_turn_every_deadline_fits_the_time_left_and_nothing_starts_without_2_s(monkeypatch):
+    clock = Clock()
+    deadlines = {}
+    original = llm._attempt
+
+    def spy(c, messages, config=None, seconds=None, **kwargs):
+        deadlines[c.key] = seconds
+        return original(c, messages, config=config, seconds=seconds, **kwargs)
+
+    monkeypatch.setattr(llm, "_attempt", spy)
+    chain = model_chain([candidate(returns(structured("ok")), "gemini:main", "answer", seconds=10)], SkipList(clock))
+    with llm.turn_scope(seconds=3 + llm.TURN_RESERVE_S, clock=clock):
+        assert chain.invoke(MESSAGES)["parsed"].text == "ok"
+        assert deadlines["gemini:main"] == 3  # 3 s left in the turn, not its own 10 s
+        clock.now += 1.5  # 1.5 s left: no model starts
+        with pytest.raises(LLMError):
+            chain.invoke(MESSAGES)
+
+
+def last_try_setup(clock, groq_left=None, main_fails=None):
+    """Main (timed out this turn), Groq (paused for `groq_left` s by a 429) and the long main for the last try."""
+    skips = SkipList(clock, sleep=lambda seconds: setattr(clock, "now", clock.now + seconds))
+    if groq_left:
+        skips.failed("groq:m", "answer", "429", groq_left)
+    groq = candidate(returns(ai("from groq", "groq")), "groq:m", "answer", seconds=1)
+    main = candidate(returns(ai("short main")), "gemini:main", "answer", seconds=1)
+    patient = candidate(raises(main_fails) if main_fails else returns(ai("patient main")), "gemini:main", "answer",
+                        seconds=20)
+    return skips, llm.last_try_chain([main, groq], patient, skips)
+
+
+def test_the_last_try_waits_for_a_model_whose_pause_ends_soon():
+    """Render 13 Oct 12:02:48: the turn failed in 1.35 s while Groq's pause had 6 s left."""
+    clock = Clock()
+    skips, last_try = last_try_setup(clock, groq_left=6)
+    with llm.turn_scope(clock=clock) as turn:
+        turn.timed_out.add("gemini:main")
+        start = clock.now
+        assert last_try.invoke(MESSAGES).content == "from groq"
+        assert clock.now - start == 6  # it waited for the pause to end, then tried Groq once
+
+
+def test_otherwise_the_last_try_gives_the_main_model_a_long_deadline():
+    clock = Clock()
+    _, last_try = last_try_setup(clock, groq_left=30)  # Groq's pause ends too late to wait for it
+    with llm.turn_scope(clock=clock) as turn:
+        turn.timed_out.add("gemini:main")
+        turn.failures["gemini:main"] = "timeout"
+        assert last_try.invoke(MESSAGES).content == "patient main"
+
+
+def test_no_last_try_after_a_429_on_main_without_time_or_outside_a_turn():
+    clock = Clock()
+    _, last_try = last_try_setup(clock, groq_left=30)
+    with pytest.raises(LLMError):  # outside a chat turn (the background reason, offline scripts)
+        last_try.invoke(MESSAGES)
+    with llm.turn_scope(clock=clock) as turn:
+        turn.failures["gemini:main"] = "429"  # its quota: a longer deadline won't help
+        with pytest.raises(LLMError):
+            last_try.invoke(MESSAGES)
+    with llm.turn_scope(clock=clock) as turn:
+        clock.now = turn.ends - (llm.LAST_TRY_MIN_S - 1)  # 4 s left
+        with pytest.raises(LLMError):
+            last_try.invoke(MESSAGES)
+
+
+def test_a_failed_last_try_counts_like_any_failure():
+    clock = Clock()
+    skips, last_try = last_try_setup(clock, main_fails=StatusError(503))
+    with llm.turn_scope(clock=clock):
+        with pytest.raises(StatusError):
+            last_try.invoke(MESSAGES)
+    assert skips.paused_by("gemini:main", "answer") == "5xx"
+
+
 # ---------- the patient path for offline scripts (T12b) ----------
 
 def test_patient_retries_a_503_then_answers():
@@ -597,7 +809,28 @@ def test_no_skips_never_opens_a_window():
 
 def test_offline_models_have_30_s_deadlines_and_the_chat_keeps_its_own():
     understand = understand_candidates(Answer, settings(), seconds=llm.OFFLINE_TIMEOUT_S)
-    assert [c.seconds for c in understand] == [30, 30, 30]
+    assert [c.seconds for c in understand] == [30, 30]
     assert [c.seconds for c in reason_candidates(settings(), seconds=llm.OFFLINE_TIMEOUT_S)] == [30]
-    assert [c.seconds for c in understand_candidates(Answer, settings())] == [4, 4, 4]
-    assert [c.seconds for c in reason_candidates(settings())] == [4]
+    assert [c.seconds for c in understand_candidates(Answer, settings())] == [4, 4]
+    assert [c.seconds for c in reason_candidates(settings())] == [8]
+
+
+
+def test_a_second_groq_model_follows_the_first_with_its_own_skip_key():
+    """T13d round 2: FALLBACK_MODEL_2 has its own tokens a minute, so the first one's 429 doesn't end the chain."""
+    keys = [c.key for c in answer_candidates("gemini-main", settings(fallback_model_2="groq-small"))]
+    assert keys == ["gemini:gemini-main", "groq:groq-model", "groq:groq-small", "gemini:gemini-fast"]
+    second = answer_candidates("gemini-main", settings(fallback_model_2="groq-small"))[2]
+    assert (second.model.model_name, second.seconds, second.model.reasoning_effort) == ("groq-small", 10, "low")
+    assert len(answer_candidates("gemini-main", settings(fallback_model_2="groq-model"))) == 3  # the same model: once
+    assert [c.key for c in understand_candidates(Answer, settings(fallback_model_2="groq-small"))] == [
+        "gemini:gemini-main", "gemini:gemini-fast"]  # never for understand
+
+
+def test_when_the_first_groq_model_is_out_of_tokens_the_second_answers():
+    skips = SkipList(Clock())
+    chain = model_chain([candidate(raises(RateLimited({"retry-after": "20"})), "groq:big", "answer"),
+                         candidate(returns(ai("from the small one", "groq")), "groq:small", "answer", seconds=1)],
+                        skips)
+    assert chain.invoke(MESSAGES).content == "from the small one"
+    assert skips.left("groq:big", "answer") == 20 and skips.left("groq:small", "answer") == 0

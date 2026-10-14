@@ -29,6 +29,10 @@ class AgentState(TypedDict, total=False):
     asked_cities: list[str]  # T13a: the cities in question while the city is open (two or more asked about)
     city_source: str | None  # T13a: "stated" or "asked" (a city they only asked about counts as theirs)
     ruled_out: list[str]  # details the customer ruled out ("apart from timing"); never asked for again (T12a)
+    skipped_asks: int  # T13d: questions about their details the customer skipped in a row (2: no more asks for now)
+    ever_declined: bool  # T13d: the customer said no to something in this chat (the safety net's offer then never comes)
+    fallback_offered: bool  # T13d: the safety net's offer was made once in this chat
+    call_requested: bool  # T13d: the customer asked to be called or contacted in this chat (the action says to call)
     area_checks: list[dict]  # this turn's service-area checks of every city named, made in code (T12b)
     # This turn's tool calls and tool results
     scratch: Annotated[list[AnyMessage], add_messages]
@@ -45,6 +49,8 @@ class AgentState(TypedDict, total=False):
     declines: bool  # this turn the customer said no to what the assistant asked (T12a)
     lead_created_now: bool  # create_lead saved the lead this turn (T12a)
     callback_now: str | None  # "requested" or "updated" when schedule_callback wrote this turn (T12a)
+    model_failed: bool  # T13d: no model answered this turn's last agent call (finalize then builds the reply)
+    answered_by: str  # T13d: who wrote the reply: model, knowledge_base, tools or fixed (the steps panel says it)
     reply: str
     sources: list[dict]
     lead_summary: dict | None
@@ -74,6 +80,8 @@ def turn_input(message: str, session_id: str = "") -> dict:
         "validation_errors": {},
         "tool_rounds": 0,
         "steps": [],
+        "model_failed": False,
+        "answered_by": "",
         "reply": "",
         "sources": [],
         "degraded": False,

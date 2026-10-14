@@ -8,6 +8,7 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine, text  # noqa: E402
 
+from app.api import chat as chat_api  # noqa: E402
 from app.api import security  # noqa: E402
 from app.core.config import get_settings, to_sqlalchemy_url  # noqa: E402
 from app.core.db import get_engine, init_db  # noqa: E402
@@ -21,9 +22,10 @@ EMPTY_LEAD_TABLES = text("TRUNCATE leads, callbacks, support_requests RESTART ID
 
 @pytest.fixture(autouse=True)
 def fresh_limits():
-    """Every test starts with empty rate-limit counters (they are per process)."""
+    """Every test starts with empty rate-limit counters and no saved replies (they are per process)."""
     security.CHAT_LIMITER.reset()
     security.KEY_FAILURES.reset()
+    chat_api.RECENT_REPLIES.reset()
 
 
 @pytest.fixture(autouse=True)
