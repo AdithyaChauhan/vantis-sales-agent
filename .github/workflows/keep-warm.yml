@@ -1,0 +1,30 @@
+# Keeps the live API awake for the review (T14). Render's free service sleeps after 15 idle minutes, and the first
+# request after that waits for Render to wake it and the app to start (32.5 s measured, docs/DEPLOY.md).
+# Calls GET /api/health/live every 10 minutes from 08:00 to 23:00 IST. That path answers without touching the database,
+# so Neon still sleeps between chats (/api/health would wake it on every ping and use up its free compute hours).
+#
+# Switch it off after the review: GitHub → Actions → "Keep the API warm" → "..." → Disable workflow
+# (or run `gh workflow disable keep-warm.yml`, or delete this file).
+name: Keep the API warm
+
+on:
+  schedule:
+    # GitHub reads cron in UTC. IST is UTC + 5:30, so 08:00-23:00 IST is 02:30-17:30 UTC.
+    # GitHub may start a scheduled run a few minutes late.
+    - cron: "30-59/10 2 * * *"  # 08:00, 08:10, 08:20 IST
+    - cron: "*/10 3-16 * * *"   # 08:30 to 22:20 IST
+    - cron: "0-30/10 17 * * *"  # 22:30, 22:40, 22:50, 23:00 IST
+  workflow_dispatch:  # a manual run from the Actions tab
+
+permissions: {}  # the job needs no access to the repository
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: GET /api/health/live
+        # A cold start can take up to a minute, so each try may take 100 s; curl retries a timeout or a 5xx twice
+        run: curl --fail --silent --show-error --max-time 100 --retry 2 --retry-delay 10 "$API_URL/api/health/live"
+        env:
+          API_URL: https://vantis-sales-agent-api.onrender.com

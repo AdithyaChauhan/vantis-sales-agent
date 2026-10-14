@@ -17,17 +17,17 @@ Rahul Sharma wants a 5 kW system for his house in Lucknow, his bill is about ₹
 
 The reason above was written by an LLM in a live test. Its wording changes from run to run; the score, status and action never do.
 
-## The assignment's definitions and our rules
+## The three statuses (PDF Section 4E) and our rules
 
-| Assignment says | Our rules |
+| Status | Our rules |
 |---|---|
-| **Hot**: strong purchase intent, clear requirement, supported location and/or near-term timeline | 75 points or more. In practice: ready to buy (25), a size, bill or usage figure (20), a listed city (20) and a timeline under 3 months (15-20). A request to be called counts as ready to buy |
-| **Warm**: meaningful interest but incomplete information, longer timeline, or additional qualification required | 45-74 points, **or** a lead that would be HOT but needs checking first (a city not on the list, or a need outside the reference packages): capped at WARM |
-| **Cold**: exploratory intent, weak buying signal, unsupported requirement/location, or insufficient purchase intent | Below 45 points, **or** a lead that is only exploring without a timeline under 3 months, whatever else it gave: capped at COLD |
+| **HOT**: a buyer with a clear need, a place we serve, and soon | 75 points or more. In practice: ready to buy (25), a size, bill or usage figure (20), a listed city (20) and a timeline under 3 months (15-20). A request to be called counts as ready to buy |
+| **WARM**: real interest, but something is missing, far off or still to be checked | 45-74 points, **or** a lead that would be HOT but needs checking first (a city not on the list, or a need outside the reference packages): capped at WARM |
+| **COLD**: just looking, or little sign of buying | Below 45 points, **or** a lead that is only exploring without a timeline under 3 months, whatever else it gave: capped at COLD |
 
 ### Why an unlisted city or an unusual need is WARM, not COLD
 
-The assignment lists "unsupported requirement/location" under Cold. The Vantis knowledge base doesn't call these unsupported:
+PDF Section 4E puts an unsupported location or requirement under Cold. The Vantis knowledge base doesn't call these unsupported:
 
 - KB Section 10: "The list is intentionally limited; locations not listed should be treated as unverified." and "If a customer mentions a city not appearing above, the AI should say that service availability is not confirmed in its current information and offer to collect details for verification."
 - The KB never says a requirement is unsupported. KB Sections 3 and 9 say package choices need customer information and a site assessment, and the catalog entries are "reference offerings".
@@ -47,7 +47,7 @@ So an unlisted city or a need outside the reference packages means **"check firs
 
 **Status:** HOT at 75 or more · WARM at 45 to 74 · COLD below 45.
 
-**Caps:** a city that is not on the list, or a need outside the reference packages, caps the lead at WARM, and the score at 74, so that the score and the status always agree and the dashboard never sorts a capped lead above a real HOT one. A lead that is only exploring, without a timeline under 3 months, is capped at COLD, and the score at 44 (the assignment's Cold: "exploratory intent"). The breakdown keeps the score before the cap (`raw_score`) and says which cap applied. A cap is recorded only when it lowers the score: a COLD lead in an unlisted city has nothing to cap, so neither its reason nor its action mentions one. When two caps would lower it, only the stricter one is recorded (an exploring lead in an unlisted city is COLD 44 for exploring).
+**Caps:** a city that is not on the list, or a need outside the reference packages, caps the lead at WARM, and the score at 74, so that the score and the status always agree and the dashboard never sorts a capped lead above a real HOT one. A lead that is only exploring, without a timeline under 3 months, is capped at COLD, and the score at 44 (Cold in PDF Section 4E). The breakdown keeps the score before the cap (`raw_score`) and says which cap applied. A cap is recorded only when it lowers the score: a COLD lead in an unlisted city has nothing to cap, so neither its reason nor its action mentions one. When two caps would lower it, only the stricter one is recorded (an exploring lead in an unlisted city is COLD 44 for exploring).
 
 Every lead stores its **score breakdown** as JSON: each rule with its points, the maximum and a short label, plus the raw score and the caps. The dashboard shows it, so a sales rep can see where every point came from.
 
@@ -60,7 +60,7 @@ A lead is saved only when we have:
 - a **city**, and
 - some **need**: a requirement, a monthly bill, a usage figure, a system size, a property type, or whether it is a home or a business.
 
-Until then, the details stay in the conversation and the assistant asks for what is missing, a question or two at a time (the assignment: "ask follow-up questions instead of creating an incomplete lead").
+Until then, the details stay in the conversation and the assistant asks for what is missing, a question or two at a time (PDF Section 8, missing information).
 
 The assistant saves the lead with its `create_lead` tool. If a turn ends with everything required known and no lead saved (the model's call failed, or it asked again for a detail it already had), the code saves it at the end of that turn, with the same rules and at most one lead per conversation, and logs a callback time the customer already gave. It never does so on a turn where the customer said no, or for an existing customer's support issue. Invalid values (a 9-digit phone, a broken email, a negative bill) are never saved. The customer gets a plain question back, such as "That doesn't look like a 10-digit Indian mobile number."
 

@@ -1,7 +1,11 @@
-"""render.yaml stays in sync with Settings and backend/.env.example, and holds no secrets."""
+"""render.yaml stays in sync with Settings and backend/.env.example, and holds no secrets. The keep-warm workflow
+pings the live API on its schedule (T14)."""
 import yaml
 
 from app.core.config import BACKEND_DIR, REPO_ROOT, Settings
+
+KEEP_WARM = REPO_ROOT / ".github" / "workflows" / "keep-warm.yml"
+IST_OFFSET_MIN = 5 * 60 + 30  # GitHub reads cron in UTC; IST is UTC + 5:30
 
 SECRETS = {"DATABASE_URL", "GOOGLE_API_KEY", "GROQ_API_KEY"}
 GENERATED = {"SALES_API_KEY"}
@@ -89,3 +93,35 @@ def test_tracing_stays_off_on_render():
     variables = env_vars()
     assert variables["LANGSMITH_TRACING"]["value"] == "false"
     assert "LANGSMITH_API_KEY" not in variables
+
+
+def cron_values(field: str, low: int, high: int) -> list[int]:
+    """The values one cron field matches. Handles "*", "n" and "a-b", each with an optional "/step"."""
+    span, _, step = field.partition("/")
+    if span == "*":
+        first, last = low, high
+    elif "-" in span:
+        first, last = map(int, span.split("-"))
+    else:
+        first = last = int(span)
+    return list(range(first, last + 1, int(step) if step else 1))
+
+
+def test_keep_warm_pings_the_light_check_every_10_minutes_from_8_to_23_ist():
+    # T14: keeps Render awake for the reviewers; the light check, so Neon still sleeps between chats
+    workflow = yaml.safe_load(KEEP_WARM.read_text(encoding="utf-8"))
+    triggers = workflow.get(True, workflow.get("on"))  # PyYAML reads the key "on" as the boolean True
+    minutes_ist = set()
+    for item in triggers["schedule"]:
+        minute, hour, day, month, weekday = item["cron"].split()
+        assert (day, month, weekday) == ("*", "*", "*")
+        for h in cron_values(hour, 0, 23):
+            for m in cron_values(minute, 0, 59):
+                minutes_ist.add((h * 60 + m + IST_OFFSET_MIN) % (24 * 60))
+    assert sorted(minutes_ist) == list(range(8 * 60, 23 * 60 + 1, 10))  # 08:00, 08:10, …, 23:00
+    assert "workflow_dispatch" in triggers
+    assert workflow["permissions"] == {}
+    [job] = workflow["jobs"].values()
+    [step] = job["steps"]
+    assert '"$API_URL/api/health/live"' in step["run"]
+    assert step["env"]["API_URL"].startswith("https://") and not step["env"]["API_URL"].endswith("/")

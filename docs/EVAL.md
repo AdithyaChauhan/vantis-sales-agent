@@ -718,3 +718,25 @@ Written by hand on 2026-10-13. Chat 1 on the live site (13:26–13:33 IST) witho
 - Calls: 18 model calls (7 understand, 10 answer, 1 lead reason after turn 5), none failed or skipped, plus the query embeddings. Budget was about 40.
 - LangSmith shows each turn as the graph steps (understand, retrieve, agent, tools, finalize), with `model_chain:<use>` → `<use>: gemini:<model>` (model, use, deadline; output and tokens) → the provider's own run nested in them, and an `embed: …` run inside retrieve.
 - "How I answered" on the "12345" turn: 2 steps, understand ("intents: gives_details") and the model call ("gemini", 1.0 s). Both have a label and a detail, so the 2 "empty" steps in Adithya's copy were the closed panel. Not changed.
+
+## T13d and T13e: live scenario runs (summary)
+
+These runs printed their per-turn tables to the terminal, and those tables were not saved here. This summary holds what `docs/PROGRESS.md` recorded (T13d and T13e entries), all on the Neon test branch against `serve_test_branch`.
+
+### T13d (`live_scenarios --group t13d`, and the slow-Google drill)
+- Google timed out on every understand call during the run.
+- **t13d: 9 of 12.** D1 cited KB Section 1 without the rewrite, and D6 and D7 lacked the intent. Code readers for a failed understand step were added (`app/agent/text_details.py`). D6 passed when re-run; in round 2, D7 live ended COLD.
+- **Drill C4** (`--group slow`): 3 of 3. **C4b:** the search used the raw message, but Groq left out the KB tag.
+- **Round 2:** the Groq model list and 2 probes (gpt-oss-20b, qwen3.8-27b: tool calls, 8K tokens a minute, 1,000 requests a day). gpt-oss-20b became the second Groq model (`FALLBACK_MODEL_2`).
+- About 55 model calls in total.
+
+### T13e (`live_scenarios --group t13e`, then `--group t13e-fix`)
+- **t13e: 11 of 14.** The three failures (wording from `prompts/README.md`):
+  - E1: "I'm in Delhi NCR. Do you cover my area?" was read as Delhi by the fast model, after the main model's understand deadline (4 s then, 5 s now) ran out.
+  - R1: "What solar systems do you provide?" was answered from KB Section 1 with no package.
+  - R2: the what-if "agar inverter kharab ho jaye to kya karna padega" opened a support case.
+- **Round 2, `t13e-fix`: 9 of 11, plus F1 on the fast model** (region found, reply wording failed). This group reruns the three failed checks, each with two phrasings written for the rerun, plus two controls for `problem_now`.
+- **Round 3: 4 of 5.** F2, G1, G2 and F10 passed. F11, "I have a question about my inverter", still opened the support flow; this is the known gap in the README's Limitations.
+- **F1 with the main model forced out:** 2 of 2 through the word-list backup (the fast model timed out, then returned a 503).
+- About 79 model requests in all.
+- The fast model's region reading was not tested live in round 3 (Google 503).

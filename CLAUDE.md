@@ -8,7 +8,6 @@ Read this at the start of every session.
 ## Project
 Pradrix AI Engineer Intern, Round 2 assignment. Deadline: Thu 15 Oct 2026, 23:59 IST (target: submit by 20:00).
 Build an AI sales and lead-qualification agent for **Vantis Energy Solutions** (fictional solar company).
-Graded on: agent workflow 20%, RAG 20%, tool calling 15%, prompts 10%, API 10%, lead scoring 10%, code 5%, docs 5%, demo 5%.
 Goal: production-minded, explainable and tested. Not flashy.
 The owner (Adithya) must be able to explain every line in an interview. Prefer clear code over clever code.
 

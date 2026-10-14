@@ -13,7 +13,7 @@ What gets deployed: `render.yaml` (repo root) describes one free web service, bu
 | Service name | `vantis-sales-agent-api` (Blueprint from `render.yaml`) |
 | Plan, region | Free, Singapore (same AWS region as the Neon project) |
 | First deployed | 2026-10-11 (T6) |
-| URL | In the Render Dashboard. It goes into the README in T14 |
+| URL | <https://vantis-sales-agent-api.onrender.com> (in the README since T14) |
 | Measured warm | `/api/health` 0.13-0.23 s; `/api/chat` 1.0-1.8 s (Gemini 0.9-1.2 s of that) |
 | Measured cold (first request after sleeping) | `/api/health` 32.5 s after 17 idle minutes (Render wake + app start), then `/api/chat` 3.0 s. Render's own health checks did not keep the service awake |
 
@@ -130,6 +130,17 @@ Changing a variable: edit it on the **Environment** page and save. Render redepl
 | 750 free instance hours a month per workspace | Enough for one service running all month |
 | 500 build pipeline minutes a month (Hobby workspace) | Each image build takes a few minutes. `render.yaml` has a `buildFilter`, so pushes that change only docs or tests start no build. If the minutes run out, builds stop until next month (or until a payment method and a spend limit allow more) |
 | Temporary filesystem, no shell, restarts possible | The app writes no files and keeps no state on disk (all data is in Neon), so a restart loses nothing |
+
+## Keep-warm during the review (T14)
+
+`.github/workflows/keep-warm.yml` calls `GET /api/health/live` every 10 minutes from 08:00 to 23:00 IST, so reviewers don't wait for a cold start.
+- **Schedule:** GitHub reads cron in UTC, so the file has three cron lines for 02:30-17:30 UTC. `tests/test_deploy_config.py` checks they give exactly 08:00, 08:10, …, 23:00 IST.
+- **Why `/api/health/live`:** it doesn't query the database, so Neon still sleeps between chats. `/api/health` would wake Neon on every ping and use up its free compute hours.
+- **Free hours:** it keeps the Render service awake for about 15 hours a day, well within the 750 free instance hours a month.
+- **Late runs:** GitHub can start a scheduled run a few minutes late, so a cold start can still happen now and then. The page's waking note covers it.
+- **Not a deploy:** the workflow file is outside `buildFilter`, so it starts no Render build.
+- **Manual run:** Actions → "Keep the API warm" → **Run workflow** (`workflow_dispatch`).
+- **Switch it off after the review:** GitHub → Actions → "Keep the API warm" → "..." → **Disable workflow**. Or run `gh workflow disable keep-warm.yml`, or delete the file.
 
 ## Health checks: why there are two
 
