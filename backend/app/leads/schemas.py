@@ -61,13 +61,14 @@ class LeadData(BaseModel):
     timeline: str | None = Field(None, description="When they want it installed, in their words")
     timeline_bucket: TimelineBucket | None = Field(
         None,
-        description="lt_1m = now, this month or next month (agle mahine); 1_3m = in 1-3 months; "
+        description="lt_1m = now, this month or next month, in any language; 1_3m = in 1-3 months; "
         "3_6m = in 3-6 months; gt_6m = later than 6 months",
     )
     intent_level: IntentLevel | None = Field(
         None,
         description="ready = asks for a quote, installation, site visit or callback, or plans to install "
-        "soon; interested = wants solar and asks about options; exploring = just curious or far-off plans",
+        "soon; interested = wants solar and asks about options; exploring = just curious, only researching or "
+        "far-off plans",
     )
     requirement_outside_catalog: bool | None = Field(
         None, description="True if the need clearly falls outside the KB's reference packages"

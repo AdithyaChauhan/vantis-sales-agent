@@ -3,7 +3,7 @@ checks. No network, no database: a small service-area list."""
 import pytest
 
 from app.agent.text_details import (
-    asks_to_be_called, asks_what_is_offered, details_from_text, is_go_ahead, is_what_if, reports_problem_now,
+    asks_to_be_called, asks_what_is_offered, details_from_text, is_go_ahead,
 )
 from app.leads.schemas import LeadData
 from app.services.service_areas import ServiceAreas
@@ -70,20 +70,6 @@ def test_bad_values_reach_the_validators_and_become_questions():
 def test_without_the_city_list_only_clear_phrases_give_a_city():
     assert details_from_text("I live in Lucknow", None) == {"city": "Lucknow"}
     assert details_from_text("aap log noida me kaam karte ho", None) == {}
-
-
-@pytest.mark.parametrize("message, what_if, now", [
-    ("agar inverter kharab ho jaye to kya karna padega", True, False),  # Adithya's live chat: a what-if
-    ("What if the panels get damaged in a storm?", True, False),
-    ("If my inverter breaks, what do I do?", True, False),
-    ("in case the inverter fails, is it covered?", True, False),
-    ("my inverter stopped working", False, True),
-    ("inverter kaam nahi kar raha", False, True),
-    ("mera inverter kharab ho gaya hai, agar warranty me hai to kya karna hoga", True, True),  # a problem now
-    ("can you check if it's under warranty", False, False),  # "if" here means "whether"
-])
-def test_what_if_and_a_problem_now(message, what_if, now):
-    assert (is_what_if(message), reports_problem_now(message)) == (what_if, now)
 
 
 @pytest.mark.parametrize("message, expected", [

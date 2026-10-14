@@ -11,9 +11,10 @@ from sqlalchemy.orm import Session
 from app.agent import welcome
 from app.agent.leads import (
     ASKED_CITY_LINE, ASKED_WHAT_LINE, INTEREST_LINE, SAVED_INFO_LINE, LeadOps, card_fields, chat_intent, confirmed_city,
-    details_named, drop_known_city_question, fix_callback_claims, is_clock_time, merge_callback_time,
+    drop_known_city_question, fix_callback_claims, is_clock_time, merge_callback_time,
     remove_false_claims, resolve_city, ruled_out_details, short_answer_details, status_block,
 )
+from app.core.llm import LLMError
 from app.leads import service
 from app.leads.models import Callback, Lead, SupportRequest
 from tests.agent_fakes import Scripted, answer, make_graph, run, tool_call, understood
@@ -216,7 +217,6 @@ def test_information_only_turn_does_not_ask_for_details():
 @pytest.mark.parametrize("state", [
     {"lead": {}, "intents": ["question", "buying_interest"]},
     {"lead": {"system_size_kw": 5.0}, "intents": ["question"]},
-    {"lead": {}, "intents": ["question"], "asked_cities": ["Karimnagar"]},
 ])
 def test_interest_brings_back_the_missing_details(state):
     block = status_block(state)
@@ -427,10 +427,12 @@ def test_short_answers_fill_the_one_detail_asked_about(question, message, expect
     assert short_answer_details(AIMessage(question), message, {}) == expected
 
 
-def test_a_short_answer_the_extractor_missed_is_saved_and_not_asked_again(ops):
+def test_a_short_answer_is_read_in_code_when_the_understand_step_failed(ops):
+    # T12a: the bare "2000" after the bill question was lost. T13e: the understand step's short-answer rule reads it;
+    # code reads it only when that step failed (the backup)
     understand_llm = Scripted(
         understood(["gives_details"], None, city="Noida"),
-        understood(["reply_to_assistant"], None),  # the extractor missed the bare number
+        LLMError("all down"),
     )
     agent = Scripted(answer("Vantis covers Noida. What is your average monthly electricity bill?"),
                      answer("Thanks. Could I have your name and phone number?"))
@@ -510,8 +512,9 @@ def test_a_saved_lead_lists_what_would_still_add_points_most_useful_first():
 @pytest.mark.parametrize("message, detail", [
     # T12a replay, turn 9: "apart from timing" still got a timeline question
     ("is there any other info you need from me apart from the timing?", "rooftop availability"),
-    # turn 10: the detail the customer asks about comes first
-    ("do you really need the email?", "email"),
+    # T13e: the detail a customer names is the model's call (ASKED_WHAT_LINE tells it to answer that one first);
+    # code picks the most useful one, from no word list
+    ("do you really need the email?", "timeline"),
     ("what else?", "timeline"),
 ])
 def test_the_detail_to_ask_for_is_chosen_in_code(message, detail):
@@ -525,8 +528,7 @@ def test_a_ruled_out_detail_is_never_offered_again():
     block = status_block(state)
     assert "most useful first: rooftop availability, ownership, email." in block
     assert INTEREST_LINE.format(detail="rooftop availability") in block
-    assert ruled_out_details("anything else apart from timing?") == ["timeline"]
-    assert details_named("is rooftop availability info not needed?") == ["rooftop availability"]
+    assert ruled_out_details("anything else apart from timing?") == ["timeline"]  # backup only (understand failed)
 
 
 @pytest.mark.parametrize("turn, line", [
@@ -572,11 +574,12 @@ def test_the_replays_callback_turns_end_with_one_request_and_true_sentences(ops)
     assert lead.timeline is None
 
 
-def test_a_bare_time_of_day_is_a_callback_time_even_when_the_extractor_misses_it(ops):
-    # T12a replay (final run), turn 12: after an ownership question "4pm" came back with no details at all
+def test_a_bare_time_of_day_is_a_callback_time_when_the_understand_step_failed(ops):
+    # T12a replay (final run), turn 12: after an ownership question "4pm" came back with no details at all. T13e: the
+    # understand step's callback-time rule reads it; code reads the bare time only when that step failed (the backup)
     graph, agent = saved_lead_graph(
         ops,
-        understood(["reply_to_assistant"], None),
+        LLMError("all down"),
         understood(["contact_request"], None, callback_time="day after tomorrow"),
         answers=[tool_call("schedule_callback", {}, "c1"), answer("Logged your callback request for 4pm."),
                  tool_call("schedule_callback", {}, "c2"),
@@ -618,7 +621,8 @@ def test_asking_what_is_needed_skips_the_kb_search(ops):
     )
     state = run(graph, "is roof space info needed?")
     assert not any(s["node"] == "retrieve" for s in state["steps"])  # no KB context, so nothing to quote
-    assert ASKED_WHAT_LINE.format(detail="rooftop availability") in lead_status_text(agent)
+    # T13e: the line tells the model to answer about the detail they named; code picks the most useful one otherwise
+    assert ASKED_WHAT_LINE.format(detail="timeline") in lead_status_text(agent)
 
 
 def test_a_model_failure_after_the_save_says_the_lead_is_saved_not_try_again(ops):

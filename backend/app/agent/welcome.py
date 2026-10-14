@@ -56,13 +56,26 @@ PACKAGES_FIT_TEXT = (
     "Which reference package fits depends on your property and electricity use; a site assessment decides it."
 )
 STILL_NEEDED_ASK = "Could you share your {items}? Then I can pass your details to the sales team."
+CONTACT_PAIR_ASK = "Could you share your name and phone number?"  # T13e: the one pair of details asked together
 SUPPORT_STILL_NEEDED_ASK = "Could you share your {items}? Then I can pass your request to the Vantis team."
 READY_TO_PASS_ASK = "Shall I pass your details to the sales team so they can follow up?"
 # T13d: the safety net (app/agent/fallback.py), when no model answered. City lines from the code's own check, with the
 # KB Section 10 tag after them; the lines for a message the KB sentences don't match; the one closing question
 AREA_LISTED_TEXT = "Vantis currently covers {city}."
-AREA_UNVERIFIED_TEXT = ("I can't confirm service in {city} yet, as it isn't among the service areas in my information; "
-                        "the Vantis team can check it for you.")
+AREA_UNVERIFIED_TEXT = ("I can't confirm service in {city} yet, as it isn't on our current service list; the Vantis "
+                        "team can check it for you.")
+# T13e: a region is never a city Vantis covers: its listed cities (KB Section 10 data), then which city
+AREA_REGION_TEXT = "Vantis's service areas in {region} are {cities}."
+REGION_CITY_ASK = "Which city in {region} is the property in?"
+# T13e: a customer only exploring or researching is never asked for a callback time (KB Section 17)
+SAVED_EXPLORING_TEXT = "Your details are saved, and the Vantis team can help whenever you're ready."
+EXPLORER_READY_TEXT = "The Vantis team can help whenever you're ready."
+# T13e: a reply naming the package for a stated size says the size is confirmed later (KB Sections 8 and 9)
+SIZE_ASSESSMENT_TEXT = "A site assessment confirms the final size for your property."
+# T13e: the customer mentions their system, but whether something is wrong with it now is unclear
+PROBLEM_NOW_ASK = "Is something wrong with your system right now?"
+# T13e: the start of the KB Section 8 list added to a reply to "what do you offer?" that named no offering
+OFFERINGS_INTRO = "Vantis's offerings are:"
 NOT_COVERED_TEXT = "That isn't covered in the information I have; the Vantis team can confirm it for you."
 DETAILS_THANKS_TEXT = "Thanks for sharing that."
 CONTINUE_TEXT = "Happy to help with that."

@@ -4,7 +4,7 @@ and search only."""
 import pytest
 from langchain_core.messages import AIMessage
 
-from app.agent.leads import keep_one_question, own_details_question, package_case, passing_place_kinds, place_type
+from app.agent.leads import keep_one_question, package_case, passing_place_kinds, place_type
 from app.agent.welcome import NUMBERS_CONFIRM_TEXT
 from app.core.llm import LLMError
 from app.core.prompts import load_prompt
@@ -17,30 +17,14 @@ TIMING = RetrievedChunk("s15-timing", 15, "FAQ", 5, "faq", "Q: How long does ins
 PLAN_A = RetrievedChunk("s08-plan-a", 8, "Catalog", 3, "table_row", "Offering: Plan A, 3 kW")
 
 
-# ---------- D1: "what is needed" only for the customer's own details ----------
+# ---------- D1: "what is needed" only for the customer's own details (T13e: the understand step decides) ----------
 
-@pytest.mark.parametrize("message, own", [
-    ("what else do you need from me?", True),
-    ("is there any other info u need that can help apart from timing?", True),
-    ("are you sure? rooftop availability info is not needed?", True),
-    ("do you need my email too?", True),
-    ("What else do I need for installation?", False),
-    ("Do you offer anything else besides panels?", False),
-    ("what documents are required?", False),
-    ("What do I need for installation?", False),
-])
-def test_own_details_question(message, own):
-    assert own_details_question(message) is own
-
-
-def test_a_kb_question_labelled_asks_what_is_needed_still_searches():
+def test_a_kb_question_the_understand_step_reads_as_a_question_searches():
     search = FakeSearch()
-    graph, _ = make_graph(Scripted(understood(["asks_what_is_needed"])), Scripted(answer("You need a site visit.")),
-                          search=search)
-    state = run(graph, "What else do I need for installation?")
-    assert search.queries == ["What else do I need for installation?"]
-    assert "question" in state["intents"] and "asks_what_is_needed" not in state["intents"]
-    assert state["steps"][0]["data"]["query_note"] == "not about their details: searches the KB"
+    graph, _ = make_graph(Scripted(understood(["question"], "Installation & Site Assessment requirements")),
+                          Scripted(answer("You need a site visit.")), search=search)
+    run(graph, "What else do I need for installation?")
+    assert search.queries == ["Installation & Site Assessment requirements"]
 
 
 def test_what_else_do_you_need_from_me_does_not_search():
@@ -72,13 +56,18 @@ def test_no_raw_message_search_for_off_topic_short_replies_or_contact_requests(i
 
 # ---------- D4: a stated size brings the catalog, so the package can be named ----------
 
-def test_a_size_in_the_message_adds_the_catalog_summary():
+@pytest.mark.parametrize("understanding", [
+    understood(["question"], "Pricing cost Plan B 5 kW"),  # the understand step's query names an offering
+    understood(["question", "buying_interest"], "Pricing cost", system_size_kw="5 kW"),  # or the size is new
+])
+def test_a_size_in_the_message_adds_the_catalog_summary(understanding):
+    # T13e: read from the understand step's fields (its query, a new size), not from the message's words
     agent = Scripted(answer("Pricing depends on the project [KB Section 5: Pricing]."))
     search = FakeSearch(SearchResult(chunks=[PRICING], mode="hybrid"))
-    graph, _ = make_graph(Scripted(understood(["question"], "Pricing cost")), agent, search=search)
+    graph, _ = make_graph(Scripted(understanding), agent, search=search)
     state = run(graph, "How much does a 5kW system cost?")
     context = agent.calls[0][-1].content
-    assert "Plan B 5 kW" in context  # the KB Section 8 summary (tests/agent_fakes.py)
+    assert "Plan B; Residential; 5 kW" in context  # the KB Section 8 summary (tests/agent_fakes.py)
     # T13d: the understand step adds it (also without a search), so it comes before the search's chunks
     assert [c["chunk_id"] for c in state["chunks"]] == ["s08-table-summary", "s05-pricing"]
 
@@ -336,7 +325,7 @@ def test_a_business_bill_gets_the_business_rule():
 @pytest.mark.parametrize("intents, details", [
     (["gives_details"], dict(HOME_BILL, system_size_kw="5 kW")),  # a settled size: the stated-size rule names it
     (["contact_request", "gives_details"], HOME_BILL),  # name and phone come first
-    (["existing_customer_issue"], HOME_BILL),  # a support case, not a sale
+    (["existing_customer_issue"], dict(HOME_BILL, issue="inverter fault")),  # a support case (T13e: with its issue)
 ])
 def test_no_package_rule_with_a_settled_size_a_contact_request_or_a_support_case(intents, details):
     agent = Scripted(answer("Thanks."))
@@ -462,12 +451,11 @@ def test_a_passing_mention_never_gives_the_type(message):
 
 
 @pytest.mark.parametrize("message", NEVER)
-def test_the_extractors_type_from_a_passing_mention_is_dropped(message):
-    agent = Scripted(answer("Thanks."))
-    graph, _ = make_graph(Scripted(understood(["gives_details"], None, property_type="house")), agent)
+def test_a_passing_mention_gives_no_type_when_the_understand_step_failed(message):
+    # T13e: the understand step decides the kind of place (its prompt names passing mentions); the words are the backup
+    graph, _ = make_graph(Scripted(LLMError("all down")), Scripted(answer("Thanks.")))
     state = run(graph, message)
-    assert "customer_type" not in state["lead"] and "property_type" not in state["lead"]
-    assert state["steps"][0]["data"]["dropped"] == ["customer_type", "property_type"]
+    assert "customer_type" not in state["lead"]
 
 
 def test_a_place_of_their_own_next_to_a_passing_mention_keeps_the_type():
@@ -476,7 +464,7 @@ def test_a_place_of_their_own_next_to_a_passing_mention_keeps_the_type():
     graph, _ = make_graph(Scripted(understood(["gives_details"], None, customer_type="residential")),
                           Scripted(answer("Thanks.")))
     state = run(graph, "at home now, it's for my 2BHK")
-    assert state["lead"]["customer_type"] == "residential" and state["steps"][0]["data"]["dropped"] == []
+    assert state["lead"]["customer_type"] == "residential"
 
 
 def test_a_passing_mention_never_drops_a_type_from_an_earlier_turn():
@@ -485,7 +473,7 @@ def test_a_passing_mention_never_drops_a_type_from_an_earlier_turn():
     graph, _ = make_graph(understand, Scripted(answer("Thanks.")))
     run(graph, "It is for my shop")
     state = run(graph, "The bill is 9000, I mostly work from home")
-    assert state["lead"]["customer_type"] == "commercial" and state["steps"][0]["data"]["dropped"] == []
+    assert state["lead"]["customer_type"] == "commercial"
 
 
 def test_a_short_answer_counts_when_the_understand_step_failed():
@@ -500,15 +488,20 @@ def test_a_short_answer_counts_when_the_understand_step_failed():
         "customer_type"]
 
 
-def test_a_home_the_extractor_missed_still_brings_the_home_packages():
-    # C7 run 1: "it's for my home" stored no type on the bill turn, so the reply searched twice and cited KB Section 8
+def test_a_home_on_the_bill_turn_brings_the_home_packages():
+    # C7 run 1: "it's for my home" stored no type on the bill turn, so the reply searched twice and cited KB Section 8.
+    # T13e: the understand step gives the type (its place rules); the words are read only when that step failed
     agent = Scripted(answer("Thanks."))
-    graph, _ = make_graph(Scripted(understood(["gives_details", "buying_interest"], None, monthly_bill_inr="4000")),
-                          agent)
+    graph, _ = make_graph(Scripted(understood(["gives_details", "buying_interest"], None, monthly_bill_inr="4000",
+                                              customer_type="residential")), agent)
+    state = run(graph, "My bill is about 4000 a month, it's for my home.")
+    assert state["lead"]["customer_type"] == "residential" and state["steps"][0]["data"]["from_words"] == []
+    assert len(state["chunks"]) == 2 and "Property type: home." in agent_input(agent)
+    agent = Scripted(answer("Thanks."))
+    graph, _ = make_graph(Scripted(LLMError("all down")), agent)
     state = run(graph, "My bill is about 4000 a month, it's for my home.")
     assert state["lead"]["customer_type"] == "residential"
     assert state["steps"][0]["data"]["from_words"] == ["customer_type"]
-    assert len(state["chunks"]) == 2 and "Property type: home." in agent_input(agent)
 
 
 def test_the_words_never_replace_a_type_from_the_extractor_or_an_earlier_turn():

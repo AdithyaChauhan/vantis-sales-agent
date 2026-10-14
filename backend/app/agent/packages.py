@@ -12,9 +12,12 @@ import re
 
 from app.rag.answer import split_sentences, without_tags
 
-# A system size in the message ("5kW", "3 kW"): the customer settled the size, so one package may be named (T12b)
+# A system size in the message ("5kW", "3 kW"): the customer settled the size, so one package may be named (T12b). A
+# format check (a number with a kW unit), like the phone check, for the guards on our own reply (T13e audit: kept)
 SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:kw|kwp|kilowatts?)\b", re.IGNORECASE)
 _LIST_MARKER_RE = re.compile(r"^[ \t]*(?:\d+[.)]|[-*•])[ \t]+")  # "1. " or "- ": kept with the item, never a sentence
+# A reply that already says the size is checked later (T13e)
+_ASSESSMENT_RE = re.compile(r"\bassess|\bsite\s+(?:visit|survey|inspection)\b|\bfinal\s+size\b", re.IGNORECASE)
 
 
 def reference_packages(guidance: list[dict]) -> dict[str, list[str]]:
@@ -112,3 +115,48 @@ def all_or_no_packages(
     text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     return text or fallback, removed
 
+
+
+def add_size_line(reply: str, packages: dict[str, list[str]], line: str, tag: str = "") -> tuple[str, bool]:
+    """On a turn whose message states a system size, a reply that names a reference package but never says the size
+    is confirmed later gets `line` ("A site assessment confirms the final size…", with `tag`), before its closing
+    question (T13e: Adithya's live test named HomePro 5 for "a 5kW system for my house" without it; KB Section 9 says
+    not to assume 5 kW suits every household). Returns (reply, added)."""
+    plain = without_tags(reply)
+    if not any(names_in(plain, names) for names in packages.values()) or _ASSESSMENT_RE.search(plain):
+        return reply, False
+    sentence = f"{line.rstrip('.')} {tag}.".replace(" .", ".") if tag else line
+    rows = [split_sentences(row) for row in reply.split("\n")]
+    questions = [(i, j) for i, pieces in enumerate(rows) for j, piece in enumerate(pieces)
+                 if without_tags(piece).endswith("?")]
+    if questions and questions[-1] == (len(rows) - 1, len(rows[-1]) - 1):  # the reply ends with its question
+        i, j = questions[-1]
+        rows[i].insert(j, sentence)
+    else:
+        rows.append([sentence]) if not rows[-1] or rows[-1] == [""] else rows[-1].append(sentence)
+    return "\n".join(" ".join(pieces) for pieces in rows), True
+
+
+def _closing_question(reply: str) -> tuple[str, str]:
+    """(the reply without its closing question, that question) when the reply ends with a question, else (reply, "")."""
+    lines = reply.rstrip().split("\n")
+    pieces = split_sentences(lines[-1])
+    if pieces and without_tags(pieces[-1]).endswith("?"):
+        rest = " ".join(pieces[:-1]).strip()
+        return "\n".join(lines[:-1] + ([rest] if rest else [])).strip(), pieces[-1].strip()
+    return reply.strip(), ""
+
+
+def add_offerings_line(reply: str, catalog: str, intro: str, tag: str = "") -> tuple[str, bool]:
+    """A reply to "what do you offer?" (the understand step's asks_offerings, T13e) that names none of the offerings
+    in the KB Section 8 summary (`catalog`, KB data) gets that list, each offering with who it is for and the tag
+    after the last one, before its closing question. Adithya's live test answered the assignment's first question
+    from KB Section 1's list of services and named no package. Returns (reply, added)."""
+    rows = [line[2:].split("; ") for line in catalog.split("\n") if line.startswith("- ")]
+    names = [row[0] for row in rows] + [row[0].removeprefix("Vantis ") for row in rows]  # with or without the brand
+    if not rows or names_in(without_tags(reply), names):
+        return reply, False
+    items = [f"{i}. {row[0]} ({row[1]})" if len(row) > 1 else f"{i}. {row[0]}" for i, row in enumerate(rows, start=1)]
+    items[-1] = f"{items[-1]} {tag}".rstrip()
+    body, question = _closing_question(reply)
+    return "\n\n".join(part for part in (body, intro + "\n" + "\n".join(items), question) if part), True

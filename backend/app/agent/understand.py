@@ -1,4 +1,4 @@
-"""The understand step: an LLM (app: understand_llm, i.e. main, then Groq, then fast, 4 s each) reads the new
+"""The understand step: an LLM (app: understand_llm, i.e. main, then fast, 5 s each) reads the new
 message (with recent history) and returns intents, a standalone search query in the KB's own words, and the
 lead details the customer stated.
 
@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 HISTORY_MESSAGES = 6
 HISTORY_CHARS = 500  # each earlier message is cut to this length in the prompt
+# T13e: the assistant's last message goes in its own block, its last this many characters (where its question is): the
+# history keeps only each message's first 500, so a long reply lost the question the new message answers
+LAST_REPLY_CHARS = 1500
 
 Intent = Literal[
     "question",
@@ -37,6 +40,15 @@ Intent = Literal[
     "existing_customer_issue",
     "off_topic",
 ]
+# T13e: what the new message does with the assistant's last message (the AI understands, the code enforces: the graph
+# routes, counts skipped questions and parks asks and offers from this field)
+ReplyType = Literal["answers", "skips", "accepts", "declines", "goes_ahead", "closes", "asks_new"]
+# T13e: how the customer's place relates to the city it names; code confirms only a place inside a listed city
+PlaceRelation = Literal["inside", "near", "region", "unsure", "none"]
+# The lead details a customer can rule out (the names app/leads/scoring.py missing_details uses)
+RuledOut = Literal["timeline", "monthly bill or usage", "rooftop availability", "ownership", "email", "phone number"]
+# T13e: whether the customer's installed system has a problem right now; only "yes" starts the support flow
+ProblemNow = Literal["yes", "no", "what_if", "unsure"]
 
 
 def _loose(annotation):
@@ -89,6 +101,24 @@ class Understanding(BaseModel):
     )
     declines: bool = Field(
         False, description="True if the message says no to, or refuses, what the assistant last asked"
+    )
+    reply_type: ReplyType = Field(
+        description="What the new message does with the assistant's last message (see the rules)"
+    )
+    ruled_out: list[RuledOut] = Field(
+        default_factory=list, description="Their own details the customer excludes or won't share"
+    )
+    locality: str | None = Field(
+        None, description="Anything finer than the city in the place named (a sector, colony or village), as written"
+    )
+    place_relation: PlaceRelation = Field(
+        description="How the place in details.city or asked_city relates to that city; none when no place is named"
+    )
+    asks_offerings: bool = Field(
+        description="True when the customer asks what Vantis offers or provides in general"
+    )
+    problem_now: ProblemNow = Field(
+        description="Whether the customer's installed system has a problem right now (see the rules)"
     )
 
 
@@ -153,12 +183,21 @@ def format_history(history: list[BaseMessage]) -> str:
     return "\n".join(lines) or "(no earlier messages)"
 
 
+def last_reply(history: list[BaseMessage]) -> str:
+    """The assistant's last message, whole up to its last LAST_REPLY_CHARS characters (T13e), or "(none)"."""
+    previous = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
+    if previous is None:
+        return "(none)"
+    return " ".join(str(previous.content).split())[-LAST_REPLY_CHARS:]
+
+
 def build_prompt(hints: KbHints, message: str, history: list[BaseMessage]) -> str:
-    """The understand prompt with the KB hints, the history and the new message filled in."""
+    """The understand prompt with the KB hints, the history, the assistant's last message and the new message."""
     filled = {
         "{section_titles}": hints.titles or "(not available)",
         "{catalog}": hints.catalog or "(not available)",
         "{history}": format_history(history),
+        "{last_reply}": last_reply(history),
     }
     prompt = load_prompt("lead_extraction_prompt")
     for placeholder, value in filled.items():
@@ -168,7 +207,8 @@ def build_prompt(hints: KbHints, message: str, history: list[BaseMessage]) -> st
 
 def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMessage]) -> dict:
     """{intents, search_query, details (raw), asked_city, cities, callback_time, issue, project_details, declines,
-    provider, model, latency_ms, tokens}. Raises LLMError on any failure."""
+    reply_type, ruled_out, locality, place_relation, asks_offerings, problem_now, provider, model, latency_ms,
+    tokens}. Raises LLMError on any failure."""
     start = time.perf_counter()
     try:
         result = llm.invoke([HumanMessage(build_prompt(hints, message, history))])
@@ -193,6 +233,12 @@ def understand(llm: Runnable, hints: KbHints, message: str, history: list[BaseMe
         "issue": text(parsed.issue),
         "project_details": text(parsed.project_details),
         "declines": bool(parsed.declines),
+        "reply_type": parsed.reply_type,
+        "ruled_out": list(dict.fromkeys(parsed.ruled_out)),
+        "locality": text(parsed.locality),
+        "place_relation": parsed.place_relation,
+        "asks_offerings": bool(parsed.asks_offerings),
+        "problem_now": parsed.problem_now,
         "provider": provider_of(raw) if raw is not None else "unknown",
         "model": raw.response_metadata.get("model_name") if raw is not None else None,
         "latency_ms": latency_ms,

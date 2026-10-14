@@ -216,6 +216,8 @@ def test_a_fixed_reply_turn_is_answered_by_fixed_text():
 
 
 def test_the_safety_net_lists_the_offerings_for_a_question_about_the_offer():
-    reply, _, sections = fallback_reply(state("What solar systems do you provide?"), [PRICING, CATALOG_SUMMARY], None)
+    # T13e: the understand step's asks_offerings flag (its word-list backup when that step failed) says so
+    asks = {**state("What solar systems do you provide?"), "asks_offerings": True}
+    reply, _, sections = fallback_reply(asks, [PRICING, CATALOG_SUMMARY], None)
     assert reply.startswith("1. Plan A (Residential)\n2. Plan B (Residential)\n3. Plan C (Small Commercial) "
                             "[KB Section 8: Catalog]") and sections[0] == 8

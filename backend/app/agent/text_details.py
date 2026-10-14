@@ -1,24 +1,21 @@
-"""What code reads from the customer's own words (T13d), without a model.
+"""Backup only: what code reads from the customer's own words when the understand step failed (T13d, T13e).
 
-- details_from_text: when the understand step fails (every model slow or down), the phone, email, city, monthly bill,
-  system size and, only from clear patterns, the name. In the Render logs of 13 Oct the turn "main Rakesh Sharma hu,
-  mera number 9876543210 hai, email …" failed on every model, so nothing was stored and no lead was saved.
-- is_what_if / reports_problem_now: "agar inverter kharab ho jaye to kya karna padega" asks what to do if it breaks; it
-  is a question, not a fault to raise a support request for.
-- is_go_ahead: a clear new buying signal ("I want to go ahead", "how do I book", "lagwana hai"), after which the
-  assistant may ask for details again (leads.py, skipped asks).
-- asks_to_be_called: "can someone call me?", "mujhe call karo": a contact request, read in code when the understand
-  step fails, so it still counts as ready intent (live check of 13 Oct: Google timed out on every understand call).
-- asks_what_is_offered: "What solar systems do you provide?", "kya kya milta hai": the KB Section 8 list joins the
-  context with or without the understand step (on 13 Oct the raw search for the assignment's Q1 found Section 1).
-- details_from_text also reads clear intent and timeline phrases ("just exploring", "next year", "agle mahine"), so
-  "just exploring, maybe next year" ends COLD on a day the understand step fails.
+The understand step decides what a message means (the AI understands, the code enforces); everything here runs only on a
+turn whose understand step failed (every model slow or down), so that turn still keeps what the customer gave:
+- details_from_text: the phone, email, city, monthly bill, system size and, only from clear patterns, the name, plus
+  clear intent and timeline phrases. In the Render logs of 13 Oct "main Rakesh Sharma hu, mera number 9876543210 hai,
+  email …" failed on every model, so nothing was stored and no lead was saved.
+- reply_type_from_words: what a short reply does with our last question ("ok" after an offer is a yes), with
+  is_go_ahead for a clear buying signal.
+- asks_to_be_called: a contact request, so it still counts as ready intent.
+- asks_what_is_offered: the KB Section 8 list joins the context for "what do you offer" (also used by the safety net).
 
 Every value still goes through LeadData's validators, so a bad phone or email becomes a question, never a stored value.
 """
 import re
 
 from app.agent.packages import SIZE_RE
+from app.agent.questions import last_question_kind
 from app.services.service_areas import ServiceAreas
 
 # A phone-like run of 8-13 digits (spaces, dashes, a +91 allowed); clean_phone decides whether it is a mobile number
@@ -57,15 +54,16 @@ _NOT_NAME = {
     "abhi", "bhi", "toh", "ready", "interested", "bahut", "ek", "you", "your", "a", "an", "i", "am", "we", "our", "sir",
     "madam", "ji", "thanks", "thank", "okay", "ok", "yes", "haan", "solar", "bill", "kya", "kaise", "aap", "log",
 }
-# A what-if: "what if", "in case", "suppose", "agar", "yadi", a clause that starts with "if", "ho jaye" (would become)
-_WHAT_IF_RE = re.compile(r"\b(?:what\s+if|in\s+case|suppose|supposing|what\s+happens\s+(?:if|when)|"
-                         r"what\s+would\s+happen|agar|yadi)\b|(?:^|[.,!?;]\s*)if\b|\bho\s+ja(?:a)?(?:ye|e)\b", re.I)
-# A problem the customer has now
-_PROBLEM_NOW_RE = re.compile(
-    r"\b(?:(?:is|isn['’]?t|not|stopped|has\s+stopped)\s+working|stopped|is\s+(?:broken|down|faulty|dead)|"
-    r"not\s+(?:generating|charging|turning\s+on|starting)|showing\s+(?:an?\s+)?error|"
-    r"(?:kharab|band|kharaab)\s+ho\s+(?:gaya|gayi|gya|gyi|chuka|chuki)|kaam\s+nahi\s+kar\s+(?:raha|rahi|rhe|rahe)|"
-    r"chal\s+nahi\s+(?:raha|rahi))\b", re.I)
+# Short replies by their words (Adithya's lists), matched loosely: punctuation, case and repeated letters don't matter,
+# 👍 counts as ok and 🙏 as thanks
+_YES_WORDS = r"y+e+s+|y+e+a+h*|y+e+p+|y+u+p+|sure|of\s+course|definitely|ha+n*"
+_OK_WORDS = r"o+k+(?:a+y+|ie|ey)?|k+|fine|alright|all\s+right|th(?:ee|i)k\s+(?:hai|h)|ac+h+a+"
+_THANKS_WORDS = r"thanks?|thank\s+(?:you|u)|thanku|thankyou|thx|thnx|ty|tysm|shukriya|dhanyava+d|dhanyawa+d"
+_NO_WORDS = r"not\s+interested|not\s+now|maybe\s+later|no\s+need|nahi\s+chahiye|nahi+n?|no+|nope|na+h*"
+_FILLER_WORDS = r"a\s+lot|so\s+much|very\s+much|please|ji|sir|madam"
+_SHORT_REPLY_RE = re.compile(
+    rf"(?:\b(?:{_THANKS_WORDS}|{_NO_WORDS}|{_YES_WORDS}|{_OK_WORDS}|{_FILLER_WORDS})\b\s*)+")
+_STARTS_YES_NO_RE = re.compile(r"^\W*(?:yes|yeah|yep|no|nope|nah|haan|han|nahi|nahin)\b", re.I)
 # A clear new buying signal (Adithya: "I want to go ahead", "how do I book", "lagwana hai, aage kya karna hai")
 _GO_AHEAD_RE = re.compile(
     r"\b(?:go\s+ahead|proceed|book(?:ing)?\b|sign\s+up|get\s+started|start\s+the\s+process|next\s+steps?|"
@@ -183,15 +181,50 @@ def details_from_text(message: str, areas: ServiceAreas | None = None) -> dict:
     return {key: value for key, value in found.items() if value}
 
 
-def is_what_if(message: str) -> bool:
-    """True for a question about something that might happen ("agar inverter kharab ho jaye to kya karna padega",
-    "what if the panels get damaged?")."""
-    return bool(_WHAT_IF_RE.search(message))
+def short_reply(message: str) -> str | None:
+    """"yes", "thanks", "no" or "ok" for a message made only of such words (fillers like "please" or "ji" allowed),
+    else None. Any yes word makes it a yes ("yes thanks"), else any thanks word a thanks ("ok thanks"), else any no word
+    a no ("no thanks" is a no: a thanks word with "no" turns something down)."""
+    text = message.lower().replace("👍", " ok ").replace("🙏", " thanks ")
+    text = " ".join(re.sub(r"[^a-z\s]", " ", text).split())
+    if not text or not _SHORT_REPLY_RE.fullmatch(text):
+        return None
+
+    def has(words: str) -> bool:
+        return bool(re.search(rf"\b(?:{words})\b", text))
+
+    if has(_YES_WORDS):
+        return "yes"
+    if has(_NO_WORDS):
+        return "no"
+    if has(_THANKS_WORDS):
+        return "thanks"
+    return "ok" if has(_OK_WORDS) else None
 
 
-def reports_problem_now(message: str) -> bool:
-    """True when the message says something is wrong now ("my inverter stopped working", "kharab ho gaya hai")."""
-    return bool(_PROBLEM_NOW_RE.search(message))
+def reply_type_from_words(message: str, previous: object, found: dict) -> str:
+    """What a message does with our last reply (the understand step's reply_type values), read from its words when that
+    step failed. Our last question's kind (last_question_kind) decides what a short reply means:
+    - yes: accepts an offer or a yes/no question, answers a detail question, else asks something new;
+    - thanks: closes the chat;
+    - ok: accepts an offer or a yes/no question, skips a detail question, else closes the chat;
+    - no: declines an offer, answers a detail or yes/no question, else closes the chat;
+    then a message starting with yes or no after a detail or yes/no question answers it ("no, it's rented"), a clear
+    buying signal goes ahead, details found in code answer, and anything else asks something new."""
+    kind, last = short_reply(message), last_question_kind(previous)
+    if kind == "yes":
+        return "accepts" if last in ("offer", "yes_no") else "answers" if last == "detail" else "asks_new"
+    if kind == "thanks":
+        return "closes"
+    if kind == "ok":
+        return {"offer": "accepts", "yes_no": "accepts", "detail": "skips"}.get(last, "closes")
+    if kind == "no":
+        return "declines" if last == "offer" else "answers" if last in ("detail", "yes_no") else "closes"
+    if last in ("detail", "yes_no") and _STARTS_YES_NO_RE.match(message):
+        return "answers"
+    if is_go_ahead(message):
+        return "goes_ahead"
+    return "answers" if found else "asks_new"
 
 
 def asks_what_is_offered(message: str) -> bool:

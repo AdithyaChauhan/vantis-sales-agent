@@ -70,15 +70,13 @@ def test_unrelated_words_not_fuzzy_matched(kb_areas):
 
 
 @needs_pdf
-@pytest.mark.parametrize("place, city", [
-    ("Sector 62, Noida", "Noida"), ("Noida sector 18", "Noida"), ("Gomti Nagar, Lucknow", "Lucknow"),
-    ("Indirapuram, Ghaziabad", "Ghaziabad"), ("South Delhi", "Delhi"), ("DLF Phase 3, Gurugram", "Gurugram"),
-    ("Delhi Cantt Area", "Delhi"), ("DLF Phase 3, Gurgaon", "Gurugram"),
+@pytest.mark.parametrize("place", [
+    "Sector 62, Noida", "Noida sector 18", "Gomti Nagar, Lucknow", "South Delhi", "DLF Phase 3, Gurgaon",
 ])
-def test_a_locality_of_a_listed_city_is_that_city(kb_areas, place, city):
-    """T13d (Adithya): a locality with a listed city's name counts as that city."""
-    r = kb_areas.lookup(place)
-    assert (r.status, r.matched_city, r.match) == ("listed", city, "locality")
+def test_a_locality_left_in_the_name_is_never_guessed(kb_areas, place):
+    """T13e: lookup() checks the city alone; the understand step splits a locality off (tests/test_agent_turn_rules.py).
+    A locality left in the name is unverified, the safe side, never guessed as the city."""
+    assert kb_areas.lookup(place).status == "unverified"
 
 
 @needs_pdf
@@ -87,10 +85,89 @@ def test_a_locality_of_a_listed_city_is_that_city(kb_areas, place, city):
     "outskirts of Jaipur", "Lucknow district", "close to Kanpur", "Lucknow ke aas paas",
 ])
 def test_a_separate_place_or_a_landmark_phrase_is_unverified(kb_areas, place):
-    """T13d (Adithya): only a known separate place that contains a listed name, or a landmark phrase around it, makes it
-    unverified; never fuzzy-matched to the listed city."""
+    """T13d (Adithya): a separate place that contains a listed name, or a landmark phrase around it, is never the listed
+    city. T13e: no phrase list in lookup() any more; plain whole-string fuzz.ratio never scores them close."""
     r = kb_areas.lookup(place)
-    assert (r.status, r.matched_city, r.match) == ("unverified", None, "lookalike")
+    assert (r.status, r.matched_city) == ("unverified", None)
+
+
+@needs_pdf
+def test_every_listed_city_matches_a_typo_but_never_a_longer_name(kb_areas):
+    """T13e (Adithya): a dropped, a doubled or a swapped pair of letters still matches the city; the city with a word in
+    front or behind stays unverified (only the alias "New Delhi" is Delhi). It pins the plain fuzz.ratio scorer: WRatio,
+    extractOne's default, scores "Greater Noida" close to Noida."""
+    for city in kb_areas.cities:
+        name = city.lower()
+        typos = [name[:i] + name[i + 1:] for i in range(len(name))] + [name[:i] + name[i] + name[i:]
+                                                                        for i in range(len(name))]
+        typos += [name[:i] + name[i + 1] + name[i] + name[i + 2:] for i in range(len(name) - 1)
+                  if name[i] != name[i + 1]]
+        for typo in typos:
+            assert kb_areas.lookup(typo).matched_city == city, (city, typo)
+        for longer in (f"Greater {city}", f"New {city}", f"Old {city}", f"{city} Extension", f"{city} Dehat",
+                       f"{city} Cantt", f"{city} Rural", f"near {city}", f"the area near {city}"):
+            if longer != "New Delhi":
+                assert kb_areas.lookup(longer).status == "unverified", longer
+    assert kb_areas.lookup("New Delhi").matched_city == "Delhi"
+
+
+REGIONS = {"Delhi NCR": "Delhi NCR", "NCR": "Delhi NCR", "Delhi-NCR": "Delhi NCR", "Uttar Pradesh": "Uttar Pradesh",
+           "UP": "Uttar Pradesh", "U.P.": "Uttar Pradesh", "UP state": "Uttar Pradesh", "Punjab": "Punjab",
+           "Haryana": "Haryana", "Rajasthan": "Rajasthan"}
+
+
+@needs_pdf
+@pytest.mark.parametrize("name, region", REGIONS.items())
+def test_a_region_is_never_a_listed_city(kb_areas, name, region):
+    """T13e: "I'm in Delhi NCR" got "Vantis currently covers Delhi NCR". A KB Section 10 region (or its short form) is a
+    region: no matched city, with the region's listed cities from the KB."""
+    r = kb_areas.lookup(name)
+    assert (r.status, r.matched_city, r.regions) == ("region", None, [region])
+    expected = {c for c in kb_areas.cities if region in kb_areas.city_regions[c]}
+    assert r.region_cities and set(r.region_cities) == expected
+
+
+@needs_pdf
+@pytest.mark.parametrize("place, status, city", [
+    ("Delhi", "listed", "Delhi"), ("New Delhi", "listed", "Delhi"), ("Noida, UP", "listed", "Noida"),
+    ("Gurgaon, Haryana", "listed", "Gurugram"), ("Lucknow Uttar Pradesh", "listed", "Lucknow"),
+    ("Mohali, Punjab", "unverified", None), ("Hariyana", "region", None),
+])
+def test_a_city_with_its_region_is_the_city(kb_areas, place, status, city):
+    r = kb_areas.lookup(place)
+    assert (r.status, r.matched_city) == (status, city)
+
+
+@needs_pdf
+@pytest.mark.parametrize("text, places", [
+    ("I'm in Delhi NCR. Do you cover my area?", ["Delhi NCR"]),  # English
+    ("Delhi NCR mein service hai kya?", ["Delhi NCR"]),  # Hinglish
+    ("Do you install in NCR?", ["Delhi NCR"]),
+    ("NCR me lagate ho?", ["Delhi NCR"]),
+    ("I live in Uttar Pradesh", ["Uttar Pradesh"]),
+    ("main Uttar Pradesh se hu", ["Uttar Pradesh"]),
+    ("Do you work in UP?", ["Uttar Pradesh"]),
+    ("UP mein solar lagwate ho kya?", ["Uttar Pradesh"]),
+    ("Do you cover Punjab?", ["Punjab"]),
+    ("Punjab mein installation karte ho?", ["Punjab"]),
+    ("I'm from Haryana, can I get solar?", ["Haryana"]),
+    ("Haryana me solar lagwana hai", ["Haryana"]),
+    ("Is Rajasthan covered?", ["Rajasthan"]),
+    ("Rajasthan se hu, aap aate ho?", ["Rajasthan"]),
+    ("solar set up ka kharcha kitna hai", []),  # "up" in small letters is never Uttar Pradesh
+    ("I live in Delhi", ["Delhi"]),
+])
+def test_find_in_text_reads_regions_in_the_backup(kb_areas, text, places):
+    """Backup only (the understand step failed): a region in the raw message is the region, never the listed city
+    inside its name."""
+    assert kb_areas.find_in_text(text) == places
+
+
+def test_regions_come_from_the_rows_too():
+    areas = ServiceAreas.from_rows(SMALL_ROWS)
+    r = areas.lookup("NCR")
+    assert (r.status, set(r.region_cities)) == ("region", {"Delhi", "Noida"})
+    assert areas.lookup("Uttar Pradesh").status == "region" and areas.lookup("Lucknow").status == "listed"
 
 
 @needs_pdf
@@ -106,7 +183,7 @@ def test_aliases_and_typos_still_come_before_the_fuzzy_match(kb_areas):
     ("Lucknow ke paas ek gaon hai mera", ["Lucknow ke paas"]),
     ("30 km from Lucknow, also an office in Kanpur", ["30 km from Lucknow", "Kanpur"]),
     ("I live in Dehli", ["Delhi"]),
-    ("Sector 62, Noida, and a Gurgaon office", ["Noida", "Gurugram"]),
+    ("Sector 62, Noida, and a Gurgaon office", ["Noida", "Gurugram"]),  # backup: a listed name in the words
     ("Karna", []),  # never fuzzy: "Karna" is not Karnal
     ("I live in Pune", []),
 ])

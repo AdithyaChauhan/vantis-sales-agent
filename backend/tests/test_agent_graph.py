@@ -247,11 +247,13 @@ def test_lead_details_merge_and_errors_stay_per_turn():
 
 
 def test_small_to_big_is_off_by_default_and_adds_the_summary_when_on():
-    off, _ = make_graph(Scripted(understood(["question"], "catalog")), Scripted(answer(CITED)))
-    state = run(off, "Tell me about Plan A")  # T13d: "What do you offer?" now brings the summary itself
+    # T13e: a query naming the catalog or an offering brings the summary itself (names_catalog); this one names neither
+    off, _ = make_graph(Scripted(understood(["question"], "installation options")), Scripted(answer(CITED)))
+    state = run(off, "Tell me about Plan A")
     # the 2 found, plus (T13c) the KB Section 9 rows, since the found row names only one of the two packages
     assert len(state["chunks"]) == 4 and state["steps"][1]["data"]["added_package_rows"] == 2
-    on, _ = make_graph(Scripted(understood(["question"], "catalog")), Scripted(answer(CITED)), small_to_big=True)
+    on, _ = make_graph(Scripted(understood(["question"], "installation options")), Scripted(answer(CITED)),
+                       small_to_big=True)
     state = run(on, "Tell me about Plan A")
     assert [c["chunk_id"] for c in state["chunks"]] == ["s08-plan-a", "s15-quote", "s08-table-summary"]
     assert state["steps"][1]["data"]["added_summaries"] == 1

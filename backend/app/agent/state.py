@@ -50,6 +50,8 @@ class AgentState(TypedDict, total=False):
     lead_created_now: bool  # create_lead saved the lead this turn (T12a)
     callback_now: str | None  # "requested" or "updated" when schedule_callback wrote this turn (T12a)
     model_failed: bool  # T13d: no model answered this turn's last agent call (finalize then builds the reply)
+    asks_offerings: bool  # T13e: the customer asks what Vantis offers in general (the understand step's flag)
+    problem_unclear: bool  # T13e: the customer mentions their system, but whether something is wrong now is unclear
     answered_by: str  # T13d: who wrote the reply: model, knowledge_base, tools or fixed (the steps panel says it)
     reply: str
     sources: list[dict]
@@ -81,6 +83,8 @@ def turn_input(message: str, session_id: str = "") -> dict:
         "tool_rounds": 0,
         "steps": [],
         "model_failed": False,
+        "asks_offerings": False,
+        "problem_unclear": False,
         "answered_by": "",
         "reply": "",
         "sources": [],

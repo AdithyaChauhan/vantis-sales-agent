@@ -11,6 +11,8 @@ Run:
     python -m scripts.live_scenarios --group slow --base-url http://127.0.0.1:8001
     python -m scripts.live_scenarios --group replay --base-url http://127.0.0.1:8001   (T13c, about 25 model calls)
     python -m scripts.live_scenarios --group t13d --base-url http://127.0.0.1:8001     (T13d, about 25 model calls)
+    python -m scripts.live_scenarios --group t13e --base-url http://127.0.0.1:8001     (T13e, about 28 model calls)
+    python -m scripts.live_scenarios --group t13e-fix --base-url http://127.0.0.1:8001 (T13e round 2, about 22)
 
 Groups:
 - holdout: the 8 held-out questions (data/eval/holdout_eval.jsonl), one session each (assignment: unknown info)
@@ -21,6 +23,11 @@ Groups:
   discount question
 - t13d: the assignment's Q1 and Q2 keep their sources, "5 kW for my house" names its package, a what-if is not a fault,
   a Hindi business word, a call request is ready, "just exploring" is COLD, and no third ask after two skipped ones
+- t13e: Adithya's live test of 562f27e: a region is never a city, leading questions are skips and no question repeats,
+  an info-only chat asks no contact details and "ok" goes where its reply type says, an explorer gets no callback ask,
+  a size gets the site-assessment line; then R1-R4 check the audit moves (the understand step now decides)
+- t13e-fix: the three checks that failed in the t13e run, each with two new phrasings written for the rerun, plus two
+  controls for problem_now (a problem now opens the support flow; an unclear mention asks whether something is wrong)
 
 For each turn it prints the reply and PASS or FAIL for each check, then a markdown table for docs/EVAL.md.
 The number check reads the whole KB (read-only, from DATABASE_URL): a reply may state only numbers the KB, the
@@ -33,12 +40,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from app.agent.welcome import REDIRECT_TEXT
+from app.agent.questions import question_sentences, repeats
+from app.agent.welcome import CLOSING_TEXT, REDIRECT_TEXT
 from app.leads.validators import PHONE_INVALID
 from app.rag.answer import LLM_DOWN_REPLY, is_claim, split_sentences, without_tags
 from app.rag.numbers import known_numbers, number_mentions, unsupported
 
-PAUSE_S = {"holdout": 20, "edge": 20, "slow": 65, "replay": 20, "t13d": 20}
+PAUSE_S = {"holdout": 20, "edge": 20, "slow": 65, "replay": 20, "t13d": 20, "t13e": 20, "t13e-fix": 20}
 
 
 @dataclass
@@ -305,6 +313,63 @@ def no_ask_once_parked() -> Check:
     return "no question for details after two skipped ones", check
 
 
+def _understand_data(response: dict) -> dict:
+    return next((s for s in response.get("steps", []) if s.get("node") == "understand"), {}).get("data", {})
+
+
+def reply_type_in(*values: str) -> Check:
+    """T13e: the understand step's reply_type is one of `values`."""
+    return (f"reply type {' or '.join(values)}", lambda r, c: _understand_data(r).get("reply_type") in values)
+
+
+def asks_which_city() -> Check:
+    return ("asks which city", lambda r, c: any(re.search(r"\bcity\b", q, re.I)
+                                                for q in _question_sentences(_reply(r))))
+
+
+def no_repeated_question() -> Check:
+    """T13e: no question of this reply nearly repeats one of the previous reply's (the code's own rule)."""
+    def check(response: dict, ctx: Context) -> bool:
+        earlier = question_sentences(ctx.replies[-1]) if ctx.replies else []
+        return not any(repeats(q, earlier) for q in _question_sentences(_reply(response)))
+    return "no question repeats the last reply's", check
+
+
+def no_contact_ask() -> Check:
+    return ("asks for no name, phone or email",
+            lambda r, c: not any(re.search(r"\b(?:name|phone|mobile|number|e-?mail)\b", q, re.I)
+                                 for q in _question_sentences(_reply(r))))
+
+
+def no_callback_ask() -> Check:
+    return ("no callback offer or time question",
+            lambda r, c: not any(re.search(r"\bcall\s*-?\s*backs?\b|\bcall\s+you\b|\b(?:what|which)\s+(?:time|day)\b",
+                                           q, re.I) for q in _question_sentences(_reply(r))))
+
+
+def ok_routed() -> Check:
+    """T13e: "closes" gives the closing text; any other reply type goes to the model."""
+    def check(response: dict, ctx: Context) -> bool:
+        closes = _understand_data(response).get("closes")
+        return (_reply(response) == CLOSING_TEXT) == bool(closes)
+    return "the closing text only when the reply type closes the chat", check
+
+
+def a_support_case() -> Check:
+    """T13e round 2 control: a problem the customer has now still opens the support flow."""
+    return ("a support case", lambda r, c: "existing_customer_issue" in _understand_data(r).get("intents", []))
+
+
+def asks_whether_something_is_wrong() -> Check:
+    return ("asks whether something is wrong now",
+            lambda r, c: any(re.search(r"\b(?:wrong|problem|issue|working|fault)\b", q, re.I)
+                             for q in _question_sentences(_reply(r))))
+
+
+def catalog_in_context() -> Check:
+    return "the KB Section 8 list joined the context", lambda r, c: bool(_understand_data(r).get("catalog"))
+
+
 def answered_by_groq() -> Check:
     def check(response: dict, ctx: Context) -> bool:
         providers = [s["data"].get("provider") for s in response.get("steps", []) if s.get("node") == "agent"]
@@ -450,6 +515,102 @@ T13D = [
     ]),
 ]
 
+# T13e: Adithya's live test of 562f27e (14 Oct). Expected cities and packages are the KB's (as HOME_PACKAGES above)
+NCR_CITIES = ["Delhi", "Gurugram", "Noida", "Ghaziabad", "Faridabad"]
+UP_CITIES = ["Lucknow", "Prayagraj", "Kanpur", "Varanasi", "Noida", "Ghaziabad"]
+OFFERINGS = ["HomeStart 3", "HomePro 5", "HomeMax 10", "Business 15", "Business 25"]
+NO_COVERS_REGION = not_mentions(
+    r"\b(?:cover|covers|serve|serves)\s+(?:the\s+)?(?:Delhi\s+NCR|NCR|UP|Uttar\s+Pradesh)\b",
+    "never says Vantis covers the region")
+NO_KB_WORDS = not_mentions(r"\bknowledge\s+base\b", "never says 'knowledge base'")
+T13E = [
+    Scenario("E1", "t13e", "a region is not a city (English)", [
+        Turn("I'm in Delhi NCR. Do you cover my area?",
+             [city_checked("region"), names_every(NCR_CITIES), asks_which_city(), not_known("city"), NO_COVERS_REGION,
+              cites(10), *COMMON]),
+    ]),
+    Scenario("E2", "t13e", "a region is not a city (Hinglish)", [
+        Turn("UP mein solar lagwate ho kya?",
+             [city_checked("region"), names_every(UP_CITIES), asks_which_city(), not_known("city"), NO_COVERS_REGION,
+              *COMMON]),
+    ]),
+    Scenario("E3", "t13e", "leading questions are skips, never the same question twice", [
+        Turn("mujhe ghar pe solar lagwana hai", [no_lead(), *COMMON]),
+        Turn("5kW ka total kharcha 2 lakh tak aa jayega na?",
+             [reply_type_in("asks_new"), no_repeated_question(), no_amounts(), *COMMON]),
+        Turn("subsidy 30% milti hai na?",
+             [reply_type_in("asks_new"), no_repeated_question(), no_ask_once_parked(), *COMMON]),
+    ]),
+    Scenario("E4", "t13e", "info-only: no contact ask, a topic covered in general, then ok", [
+        Turn("Do you provide installation in Delhi?", [city_checked("listed"), no_contact_ask(), *COMMON]),
+        Turn("Do you clean the panels every month?",
+             [mentions(r"maintenance|post-installation|support", "says what the KB covers"),
+              mentions(r"depend|terms|confirm", "the details depend on the terms"), cites_any(8, 11, 12, 15),
+              no_contact_ask(), no_repeated_question(), NO_KB_WORDS, *COMMON]),
+        Turn("ok", [ok_routed(), no_repeated_question(), *COMMON]),
+    ]),
+    Scenario("E5", "t13e", "an explorer is never asked for a callback time", [
+        Turn("Just researching solar for now. I'm Vikram Rao, 9876500004, house in Kanpur, bill around 3000",
+             [lead_saved(), lead_status("COLD"), no_callback_ask(), mentions(r"ready", "the team can help when ready"),
+              *COMMON]),
+    ]),
+    Scenario("E6", "t13e", "a stated size names its package and the site assessment", [
+        Turn("I'm interested in installing a 5kW solar system for my house",
+             [mentions(r"HomePro\s*5", "names HomePro 5"), mentions(r"site assessment", "the site assessment line"),
+              cites(8), *COMMON]),
+    ]),
+    # R1-R4: the audit moves (T13e): the understand step decides what code used to read from the words
+    Scenario("R1", "t13e", "assignment Q1 lists every offering through the catalog query", [
+        Turn("What solar systems do you provide?", [catalog_in_context(), names_every(OFFERINGS), cites(8), *COMMON]),
+    ]),
+    Scenario("R2", "t13e", "a Hinglish what-if is no support case", [
+        Turn("agar inverter kharab ho jaye to kya karna padega", [not_a_support_case(), *COMMON]),
+    ]),
+    Scenario("R3", "t13e", "a Hindi business word is a business", [
+        Turn("meri dukan Lucknow mein hai, uske liye solar lagwana hai", [customer_type_is("commercial"), *COMMON]),
+    ]),
+    Scenario("R4", "t13e", "a town with its own name is never the listed city", [
+        Turn("Mera ghar Greater Noida mein hai, kya aap wahan solar lagate ho?",
+             [city_checked("unverified"),
+              not_mentions(r"\bcovers?\s+(?:Greater\s+)?Noida\b", "never says it covers it"), *COMMON]),
+    ]),
+]
+
+# T13e round 2: each check that failed in the t13e run, with two new phrasings written for this rerun (not the live
+# test's messages), plus two controls for problem_now
+NCR_REGION = [city_checked("region"), names_every(NCR_CITIES), asks_which_city(), not_known("city"), NO_COVERS_REGION,
+              cites(10), *COMMON]
+OFFERS = [catalog_in_context(), names_every(OFFERINGS), cites(8), *COMMON]
+WHAT_IF = [not_a_support_case(), *COMMON]
+T13E_FIX = [
+    Scenario("F1", "t13e-fix", "E1 again: a region is not a city", [
+        Turn("I'm in Delhi NCR. Do you cover my area?", NCR_REGION)]),
+    Scenario("F2", "t13e-fix", "a region, new phrasing", [
+        Turn("We're in the NCR area, do you do rooftop installs here?", NCR_REGION)]),
+    Scenario("F3", "t13e-fix", "a region, new Hinglish phrasing", [
+        Turn("Mera office Delhi NCR mein hai, kya aap solar laga sakte ho?", NCR_REGION)]),
+    Scenario("F4", "t13e-fix", "R1 again: what Vantis offers", [Turn("What solar systems do you provide?", OFFERS)]),
+    Scenario("F5", "t13e-fix", "what Vantis offers, new phrasing", [Turn("What does Vantis sell?", OFFERS)]),
+    Scenario("F6", "t13e-fix", "what Vantis offers, new Hinglish phrasing", [
+        Turn("aap log kaun kaun se solar options dete ho?", OFFERS)]),
+    Scenario("F7", "t13e-fix", "R2 again: a Hinglish what-if", [
+        Turn("agar inverter kharab ho jaye to kya karna padega", WHAT_IF)]),
+    Scenario("F8", "t13e-fix", "a what-if, new phrasing", [
+        Turn("Suppose my inverter shows an error someday, who do I contact?", WHAT_IF)]),
+    Scenario("F9", "t13e-fix", "a what-if, new Hinglish phrasing", [
+        Turn("agar baarish mein panel toot jaye toh kya hoga?", WHAT_IF)]),
+    Scenario("F10", "t13e-fix", "control: a problem now opens the support flow", [
+        Turn("Our panels stopped producing power this morning", [a_support_case(), *COMMON])]),
+    Scenario("G1", "t13e-fix", "a region, one more new phrasing (round 3)", [
+        Turn("Is the NCR region covered by Vantis?", NCR_REGION)]),
+    Scenario("G2", "t13e-fix", "an unclear mention, one more new phrasing (round 3)", [
+        Turn("Can I ask something about my solar panels?",
+             [not_a_support_case(), asks_whether_something_is_wrong(), *COMMON])]),
+    Scenario("F11", "t13e-fix", "control: an unclear mention asks whether something is wrong", [
+        Turn("I have a question about my inverter",
+             [not_a_support_case(), asks_whether_something_is_wrong(), *COMMON])]),
+]
+
 SLOW = [
     Scenario("C4", "slow", "service failure: Gemini forced down (--slow-gemini), lead saved on Groq", [
         Turn("Do you install in Kanpur? I'd like a 3 kW system for my house.",
@@ -568,17 +729,18 @@ def scenarios_for(group: str) -> list[Scenario]:
         from scripts.eval_retrieval import HOLDOUT_QUESTIONS, load_questions
 
         return holdout_scenarios([(q.id, q.question) for q in load_questions(HOLDOUT_QUESTIONS)])
-    return {"edge": EDGE, "slow": SLOW, "replay": REPLAY, "t13d": T13D}[group]
+    return {"edge": EDGE, "slow": SLOW, "replay": REPLAY, "t13d": T13D, "t13e": T13E, "t13e-fix": T13E_FIX}[group]
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run one group against the server; print every reply, its checks and a markdown table."""
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Live T12b scenarios against a running serve_test_branch.")
-    parser.add_argument("--group", choices=("holdout", "edge", "slow", "replay", "t13d"), required=True)
+    parser.add_argument("--group", choices=("holdout", "edge", "slow", "replay", "t13d", "t13e", "t13e-fix"),
+                        required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--pause", type=float, default=None, help="seconds between turns (default: by group)")
-    parser.add_argument("--only", default=None, help="run one scenario id (e.g. C3a)")
+    parser.add_argument("--only", default=None, help="run these scenario ids only, comma-separated (e.g. C3a,C3b)")
     args = parser.parse_args(argv)
 
     import httpx
@@ -593,7 +755,8 @@ def main(argv: list[str] | None = None) -> int:
             return {"reply": f"HTTP {response.status_code}: {response.text[:200]}", "steps": []}
         return response.json()
 
-    scenarios = [s for s in scenarios_for(args.group) if not args.only or s.id == args.only]
+    only = set(args.only.split(",")) if args.only else None
+    scenarios = [s for s in scenarios_for(args.group) if not only or s.id in only]
     if args.group == "slow":
         print("The server must run with --slow-gemini for this group.")
     results: list[TurnResult] = []

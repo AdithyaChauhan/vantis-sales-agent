@@ -20,7 +20,8 @@ def test_prompt_has_the_kb_hints_history_and_message():
     history = [HumanMessage(f"question {i}") if i % 2 == 0 else AIMessage(f"answer {i}") for i in range(8)]
     prompt = build_prompt(HINTS, "And in {Kanpur}?", history)
     assert "KB Section 8: Catalog\nKB Section 10: Locations" in prompt
-    assert "[KB Section 8: Catalog]\nAll rows (Offering):\n- Plan A 3 kW" in prompt
+    assert ("[KB Section 8: Catalog]\nAll rows (Offering; Primary Customer; Reference Profile):\n"
+            "- Plan A; Residential; 3 kW") in prompt
     # only the last 6 earlier messages
     assert "Customer: question 0" not in prompt and "Assistant: answer 1" not in prompt
     assert "Customer: question 2" in prompt and "Assistant: answer 7" in prompt

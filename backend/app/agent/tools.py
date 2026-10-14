@@ -20,7 +20,7 @@ from app.leads import service
 from app.rag.answer import format_context
 from app.rag.chunker import SERVICE_AREA_SECTION
 from app.rag.retriever import RetrievedChunk, SearchResult
-from app.services.service_areas import ServiceAreas
+from app.services.service_areas import SOURCE as SERVICE_AREA_SOURCE, ServiceAreas
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +32,25 @@ def _json(data: dict) -> str:
 
 
 def service_area_data(areas: ServiceAreas, city: str, state: str | None = None) -> dict:
-    """The service-area result the model reads, for the tool and for the code's own check before the model (T12b)."""
+    """The service-area result the model reads, for the tool and for the code's own check before the model (T12b).
+    T13e: a region ("Delhi NCR") has status "region" and its listed cities; it is never a city Vantis covers."""
     result = areas.lookup(city, state)
-    return {
+    data = {
         "city": city,
-        "status": result.status,  # listed | unverified
+        "status": result.status,  # listed | unverified | region
         "matched_city": result.matched_city,
         "regions": result.regions,
         "source": result.source,
     }
+    if result.status == "region":
+        data["region_cities"] = result.region_cities
+    return data
+
+
+def unverified_area_data(place: str) -> dict:
+    """T13e: the result for a place the understand step said is only near a city, or unclear: unverified, never looked
+    up, so it can't be confirmed as the city it names ("the area near Lucknow")."""
+    return {"city": place, "status": "unverified", "matched_city": None, "regions": [], "source": SERVICE_AREA_SOURCE}
 
 
 def make_tools(

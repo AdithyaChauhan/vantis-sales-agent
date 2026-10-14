@@ -36,6 +36,16 @@ _INSTRUCTION_RE = re.compile(r"\bnext status\b|\bmissing for\b|\bthe ending\b", 
 _OWN_ENDING_RE = re.compile(r"(?:\s*[,;:–-]\s*|\s+but\s+)(?:but\s+)?not (?:HOT|WARM) yet\b.*$",
                             re.IGNORECASE | re.DOTALL)
 _STOP_WORDS = {"city", "with", "the", "and", "but", "not", "yet"}
+# T13e: the KB only calls an unlisted city unverified (KB Section 10), so a reason never says a place is outside the
+# service area or not served (a demo lead's reason said "the location is outside our service area"); "not in the listed
+# service areas" (the label's own words) stays
+_OVERCLAIM_RE = re.compile(
+    r"\boutside\s+(?:of\s+)?(?:our|the|its|vantis(?:'|’)?s?)?\s*service\s+areas?\b|"
+    r"\bout\s+of\s+(?:our|the)?\s*service\s+areas?\b|"
+    r"\bnot\s+(?:in|within|part\s+of)\s+(?:our|the|its)\s+service\s+areas?\b|"
+    r"\b(?:we|vantis)\s+(?:do\s+not|don(?:'|’)?t|does\s+not|doesn(?:'|’)?t|cannot|can(?:'|’)?t)\s+"
+    r"(?:serve|cover|operate|install)\b|"
+    r"\bnot\s+(?:served|covered|serviceable)\b|\bunserviceable\b", re.IGNORECASE)
 # A part that stops mid-clause once a written-out ending is cut ("…in words only, and"; T12b seed, second run)
 _DANGLING_RE = re.compile(r"\b(?:and|but|or|so|with|because|as|of|to|for|the|a|an|is|are|was|were|they|who|which|"
                           r"that|while|although)$", re.IGNORECASE)
@@ -116,6 +126,8 @@ def problem_with(part: str, status: str, gap_labels: list[str] | None = None) ->
         return "names another status"
     if FORBIDDEN_RE.search(part):
         return "forbidden topic"
+    if _OVERCLAIM_RE.search(part):
+        return "overclaims the service area"
     if any(_repeats(part, label) for label in gap_labels or []):
         return "repeats the ending"
     return None

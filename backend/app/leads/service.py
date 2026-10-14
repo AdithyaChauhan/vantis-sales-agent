@@ -60,6 +60,8 @@ def locate(city: str | None, state: str | None, areas: ServiceAreas | None) -> L
     if areas is None:
         return Location(city, city, "unknown")
     result = areas.lookup(city, state)
+    if result.status == "region":  # T13e: a region is never the lead's city (the graph never stores one)
+        return Location(city, city, "unknown")
     return Location(result.matched_city or city, city, result.status)
 
 

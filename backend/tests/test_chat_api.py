@@ -74,14 +74,16 @@ def test_greeting_returns_the_welcome(client, use_agent):
 
 
 def test_llm_failure_is_200_and_degraded(client, use_agent):
-    use_agent(agent_llm=Scripted(RuntimeError("Gemini and Groq both down")))
+    use_agent(understand_llm=Scripted(understood(["question"], "catalog", asks_offerings=True)),
+              agent_llm=Scripted(RuntimeError("Gemini and Groq both down")))
     response = post(client, "What do you offer?")
     assert response.status_code == 200
     body = response.json()
-    # T13d: the safety net answers, never "I'm having trouble": a question about the offer gets the KB Section 8 list
+    # T13d: the safety net answers, never "I'm having trouble": a question about the offer (T13e: the understand step's
+    # asks_offerings flag) gets the KB Section 8 list
     assert (body["degraded"], body["answered_by"]) == (True, "knowledge_base")
     assert [s["section"] for s in body["sources"]] == ["8"] and body["reply"] != LLM_DOWN_REPLY
-    assert body["reply"].startswith("1. Plan A 3 kW\n2. Plan B 5 kW [KB Section 8: Catalog]")
+    assert body["reply"].startswith("1. Plan A (Residential)\n2. Plan B (Residential) [KB Section 8: Catalog]")
 
 
 @pytest.mark.parametrize(

@@ -71,9 +71,27 @@ _KB_SAYS_FREE_RE = re.compile(r"\bfree\b(?![-\w])|\bcomplimentary\b|\bno\s+cost\
 # T13d: a reply that uses this turn's chunks but cites none gets the tag of the chunk it shares most key words with,
 # only when at least this many are shared (so a source chip shows; Groq often leaves the tag out)
 MIN_SHARED_FOR_TAG = 3
-_CANT_CONFIRM_RE = re.compile(r"\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\s+confirm\b|"
-                              r"\b(?:don(?:'|’)?t|do not)\s+have\s+(?:any\s+)?(?:information|details)\b|"
-                              r"\bnot sure\b", re.IGNORECASE)
+# A sentence that says what the assistant can't confirm or doesn't know (T13c; T13e: wider, and such a sentence carries
+# a KB tag only when it also states a fact from that section, see strip_unsourced_citations)
+_CANT_CONFIRM_RE = re.compile(
+    r"\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\s+(?:confirm|say|tell|guarantee|promise)\b|"
+    r"\b(?:don(?:'|’)?t|do not)\s+have\s+(?:any\s+)?(?:specific\s+|exact\s+|more\s+)?"
+    r"(?:information|details|info|data)\b|"
+    r"\bnot sure\b|\bno\s+(?:specific\s+|exact\s+)?information\b|"
+    r"\b(?:isn(?:'|’)?t|is not|aren(?:'|’)?t|are not)\s+(?:covered|mentioned|included|listed)\s+in\s+"
+    r"the\s+information\b|"
+    r"\binformation\s+I\s+have\s+(?:doesn(?:'|’)?t|does not)\b", re.IGNORECASE)
+# T13e: the customer never reads "the knowledge base": "our current service list" in a sentence about places, else "the
+# information I have" (Adithya's live test: "isn't listed in the knowledge base")
+_KB_WORDS_RE = re.compile(r"\b(?:the|our|my|this)\s+(?:knowledge\s+base|KB)\b|\bknowledge\s+base\b", re.IGNORECASE)
+_PLACE_WORDS_RE = re.compile(r"\b(?:cit(?:y|ies)|areas?|locations?|places?|towns?|regions?|serv(?:e|es|ed|ice)|"
+                             r"cover(?:s|ed)?|listed)\b", re.IGNORECASE)
+# T13e: a KB rule written for the assistant, never said to the customer ("No universal duration should be assumed")
+_KB_RULE_RE = re.compile(
+    r"\bshould\s+(?:not\s+)?be\s+(?:assumed|told|treated|promised|guaranteed|stated|invented|fabricated|recommended)\b|"
+    r"\bno\s+universal\b|\b(?:do\s+not|don(?:'|’)?t)\s+assume\b|\bthe\s+AI\b|\bmust\s+not\b", re.IGNORECASE)
+# Clause breaks inside a sentence; the break belongs to the clause after it
+_CLAUSE_SPLIT_RE = re.compile(r"(,\s+(?:and|but|so|as|while|since|because)\s+|;\s+|\s+[–—-]\s+)", re.IGNORECASE)
 
 
 def citation_label(chunk: RetrievedChunk) -> str:
@@ -138,6 +156,18 @@ def is_claim(sentence: str) -> bool:
     return bool(_SAVED_RE.search(text) or (_HANDED_ON_RE.search(text) and _TEAM_RE.search(text)))
 
 
+def is_honest(sentence: str) -> bool:
+    """True for a sentence that says the assistant doesn't know or can't confirm something (T13e)."""
+    return bool(_CANT_CONFIRM_RE.search(sentence))
+
+
+def states_fact_from(sentence: str, section: int, chunks: list[RetrievedChunk]) -> bool:
+    """True when the sentence, without its "I can't confirm" words, shares MIN_SHARED_FOR_TAG key words with that
+    section's chunks: it also states a fact from that section (T13e)."""
+    text = " ".join(c.content for c in chunks if c.section_no == section)
+    return len(key_words(_CANT_CONFIRM_RE.sub(" ", sentence)) & key_words(text)) >= MIN_SHARED_FOR_TAG
+
+
 def strip_unsourced_citations(reply: str, chunks: list[RetrievedChunk]) -> tuple[str, int]:
     """Remove the KB tags this turn's sources don't support (T12a): a section that is not among this turn's
     chunks (every tag when there are none, e.g. a validation message), and any tag on a question, a thank-you or
@@ -148,17 +178,25 @@ def strip_unsourced_citations(reply: str, chunks: list[RetrievedChunk]) -> tuple
     section is in this turn's chunks; they are removed only when no fact comes before them. The assignment's Q1 and
     Q2 (S01, S02 in the audit) lost their source chips because the model cited after its closing question.
 
+    T13e: a sentence saying the assistant doesn't know or can't confirm something ("I don't have information on …")
+    keeps a tag only when it also states a fact from that section (MIN_SHARED_FOR_TAG key words shared with its chunks,
+    as in "Warranty depends on the equipment, but I can't confirm the exact duration"); otherwise its tags (inline or
+    standing after it) are dropped, never moved (Adithya's live test: KB Section 1 on a timeline, KB Section 11 on
+    cashback and on panel cleaning).
+
     The prompts ask for this; this is the safety net, and it logs a warning so a slipping prompt shows.
     """
     sections = {c.section_no for c in chunks}
     removed = 0
 
-    def keep_tags(text: str, facts: bool) -> str:
+    def keep_tags(text: str, verdict: str, sentence: str = "") -> str:
         nonlocal removed
 
         def one(match: re.Match) -> str:
             nonlocal removed
-            if facts and int(match.group(2)) in sections:
+            section = int(match.group(2))
+            if section in sections and (verdict == "fact" or (verdict == "honest" and states_fact_from(
+                    sentence, section, chunks))):
                 return match.group(0)
             removed += 1
             return ""
@@ -170,23 +208,25 @@ def strip_unsourced_citations(reply: str, chunks: list[RetrievedChunk]) -> tuple
     last_fact: tuple[int, int] | None = None  # (line, piece) of the last factual sentence so far
     moved = 0
     for line in reply.split("\n"):
-        kept, facts = [], True
+        kept, verdict, sentence = [], "fact", ""
         for piece in split_sentences(line):
             bare = without_tags(piece)
             if bare:  # a sentence; tags alone take the verdict of the sentence before them
-                facts = not (bare.endswith("?") or is_claim(bare) or _THANKS_RE.match(bare))
-            elif not facts and last_fact is not None:  # tags alone after a question: back to the last fact
-                tags = keep_tags(piece, True).strip()
+                sentence = bare
+                verdict = ("other" if bare.endswith("?") or is_claim(bare) or _THANKS_RE.match(bare)
+                           else "honest" if _CANT_CONFIRM_RE.search(bare) else "fact")
+            elif verdict == "other" and last_fact is not None:  # tags alone after a question: back to the last fact
+                tags = keep_tags(piece, "fact").strip()
                 if tags:
                     i, j = last_fact
                     target = lines[i] if i < len(lines) else kept
                     target[j] = f"{target[j]} {tags}"
                     moved += 1
                 continue
-            piece = keep_tags(piece, facts).strip()
+            piece = keep_tags(piece, verdict, sentence).strip()
             if piece:
                 kept.append(piece)
-                if bare and facts:
+                if bare and verdict == "fact":
                     last_fact = (len(lines), len(kept) - 1)
         indents.append(re.match(r"[ \t]*", line).group(0))  # keeps a list item's indentation
         lines.append(kept)
@@ -305,7 +345,7 @@ def add_missing_tag(reply: str, chunks: list[RetrievedChunk], skip: tuple[str, .
     for i, pieces in enumerate(lines):
         for j, piece in enumerate(pieces):
             text = without_tags(piece)
-            if (not text or text.endswith("?") or is_claim(text) or _THANKS_RE.match(text)
+            if (not text or text.endswith("?") or is_claim(text) or _THANKS_RE.match(text) or is_honest(text)
                     or any(text == fixed or text in fixed for fixed in skip)):
                 continue
             words = key_words(text)
@@ -342,6 +382,75 @@ def plain_service_area_words(reply: str) -> tuple[str, int]:
     if count:
         logger.warning("reply used KB office words for service areas; replaced", extra={"changed": count})
     return changed, count
+
+
+def _sentences_outside_tags(reply: str, change) -> str:
+    """The reply with `change(sentence_text, segment)` applied to each text segment outside KB tags, sentence by
+    sentence (the sentence's own text, without tags, decides how it changes)."""
+    lines = []
+    for line in reply.split("\n"):
+        pieces = []
+        for piece in split_sentences(line):
+            bare = without_tags(piece)
+            pieces.append(_TAG_OR_TEXT_RE.sub(lambda m: m.group(1) or change(bare, m.group(2)), piece))
+        lines.append(" ".join(pieces))
+    return "\n".join(lines)
+
+
+def plain_kb_words(reply: str) -> tuple[str, int]:
+    """'the knowledge base' becomes 'our current service list' in a sentence about places and 'the information I have'
+    otherwise, outside KB tags (T13e: the customer never reads our office words). Returns (reply, changes)."""
+    count = 0
+
+    def change(sentence: str, segment: str) -> str:
+        def plain(match: re.Match) -> str:
+            nonlocal count
+            count += 1
+            text = "our current service list" if _PLACE_WORDS_RE.search(sentence) else "the information I have"
+            return text[0].upper() + text[1:] if match.group(0)[0].isupper() else text
+        return _KB_WORDS_RE.sub(plain, segment)
+
+    changed = _sentences_outside_tags(reply, change)
+    if count:
+        logger.warning("reply said 'knowledge base' to the customer; replaced", extra={"changed": count})
+    return (changed, count) if count else (reply, 0)
+
+
+def remove_kb_rules(reply: str) -> tuple[str, list[str]]:
+    """A clause that quotes a KB rule written for the assistant ("no universal duration should be assumed", "do not
+    assume 5 kW suits every household") is cut from its sentence; the fact clauses stay, with the sentence's KB tags at
+    its end. A sentence that is all rule goes (T13e). Questions are left alone. Returns (reply, the removed clauses)."""
+    removed: list[str] = []
+    lines = []
+    for line in reply.split("\n"):
+        kept = []
+        for piece in split_sentences(line):
+            text = without_tags(piece)
+            if not text or text.endswith("?") or not _KB_RULE_RE.search(text):
+                if piece.strip():
+                    kept.append(piece.strip())
+                continue
+            tags = " ".join(m.group(0).strip() for m in _LABEL_RE.finditer(piece))
+            parts = _CLAUSE_SPLIT_RE.split(text)
+            clauses, breaks = parts[0::2], [""] + parts[1::2]
+            fact = ""
+            for joint, clause in zip(breaks, clauses):
+                if _KB_RULE_RE.search(clause):
+                    removed.append(clause.strip(" .!"))
+                else:
+                    fact += (joint if fact else "") + clause
+            fact = fact.strip()
+            if not fact:
+                continue
+            end = text[-1] if text[-1] in ".!" else "."
+            fact = fact[0].upper() + fact[1:].rstrip(" .!")
+            kept.append(f"{fact} {tags}{end}" if tags else f"{fact}{end}")
+        indent = re.match(r"[ \t]*", line).group(0)
+        lines.append(indent + " ".join(kept) if kept else "")
+    if not removed:
+        return reply, []
+    logger.warning("reply quoted a KB rule meant for the assistant; removed", extra={"removed": len(removed)})
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip(), removed
 
 
 def tidy_citations(reply: str, chunks: list[RetrievedChunk]) -> str:

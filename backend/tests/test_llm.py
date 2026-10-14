@@ -170,7 +170,7 @@ def test_understand_candidates_are_main_then_fast_4_s_each_and_never_groq():
     [main], [fast] = (models_in(c.model) for c in candidates)
     assert (main.model, fast.model) == ("gemini-main", "gemini-fast")
     assert [c.key for c in candidates] == ["gemini:gemini-main", "gemini:gemini-fast"]
-    assert {(c.use, c.seconds) for c in candidates} == {("understand", 4)}
+    assert {(c.use, c.seconds) for c in candidates} == {("understand", 5)}  # T13e: 5 s, was 4 s
     for gemini in (main, fast):
         assert_our_http_rules(request_http(gemini))
     for candidate in candidates:  # structured output with the raw message kept
@@ -811,7 +811,7 @@ def test_offline_models_have_30_s_deadlines_and_the_chat_keeps_its_own():
     understand = understand_candidates(Answer, settings(), seconds=llm.OFFLINE_TIMEOUT_S)
     assert [c.seconds for c in understand] == [30, 30]
     assert [c.seconds for c in reason_candidates(settings(), seconds=llm.OFFLINE_TIMEOUT_S)] == [30]
-    assert [c.seconds for c in understand_candidates(Answer, settings())] == [4, 4]
+    assert [c.seconds for c in understand_candidates(Answer, settings())] == [5, 5]
     assert [c.seconds for c in reason_candidates(settings())] == [8]
 
 

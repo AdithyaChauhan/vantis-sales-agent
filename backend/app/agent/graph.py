@@ -15,6 +15,7 @@ ready lead the model didn't save and answers from this turn's KB chunks (app/age
 """
 import json
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
@@ -31,32 +32,35 @@ from app.agent import welcome
 from app.agent.fallback import fallback_reply
 from app.agent.leads import (
     LeadOps, add_saved_line, changed_fields, chat_intent, confirmed_city, drop_detail_questions,
-    drop_known_city_question, fix_callback_claims, is_clock_time, keep_one_question, lead_summary, merge_callback_time,
-    own_details_question, package_case, passing_place_kinds, pending_changes, place_type, remove_false_claims,
-    resolve_city, ruled_out_details, save_ready_lead, short_answer_details, skipped_asks, status_block,
+    drop_known_city_question, fix_callback_claims, is_clock_time, is_explorer, keep_one_question, lead_summary,
+    merge_callback_time, package_case, pending_changes, place_type, remove_false_claims, resolve_city,
+    ruled_out_details, save_ready_lead, short_answer_details, skipped_asks, status_block,
 )
-from app.agent.packages import SIZE_RE, add_all_packages, all_or_no_packages, reference_packages
+from app.agent.packages import (
+    SIZE_RE, add_all_packages, add_offerings_line, add_size_line, all_or_no_packages, reference_packages,
+)
+from app.agent.questions import ask_rules, asked_contact, fix_region_reply, made_offer, offers_made, previous_asked
 from app.agent.state import AgentState
 from app.agent.text_details import (
-    asks_to_be_called, asks_what_is_offered, details_from_text, is_go_ahead, is_what_if, reports_problem_now,
+    asks_to_be_called, asks_what_is_offered, details_from_text, reply_type_from_words, short_reply,
 )
-from app.agent.tools import make_tools, service_area_data, tool_step
+from app.agent.tools import make_tools, service_area_data, tool_step, unverified_area_data
 from app.agent.understand import KbHints, Understanding, load_kb_hints, understand
 from app.core.config import get_settings
 from app.core.db import get_engine
 from app.core.llm import LLMError, chat_llm, provider_of, query_embedder, reply_text, tokens_of, understand_llm
 from app.leads import service
 from app.core.prompts import load_prompt
-from app.leads.schemas import CUSTOMER_TYPE_OF, LeadData
+from app.leads.schemas import LeadData
 from app.rag.answer import (
-    add_missing_tag, normalize_citations, pick_sources, plain_service_area_words, rag_message, remove_free_claims,
-    remove_uncovered_policies, retrieve_step, soften_promises, strip_tool_citations, strip_unsourced_citations,
-    tidy_citations,
+    add_missing_tag, citation_label, normalize_citations, pick_sources, plain_kb_words, plain_service_area_words,
+    rag_message, remove_free_claims, remove_kb_rules, remove_uncovered_policies, retrieve_step, soften_promises,
+    strip_tool_citations, strip_unsourced_citations, tidy_citations,
 )
 from app.rag.chunker import CATALOG_SECTION, SERVICE_AREA_SECTION, SUMMARY_SECTIONS
 from app.rag.numbers import remove_unsupported_numbers
 from app.rag.retriever import RetrievedChunk, SearchResult, search
-from app.services.service_areas import ServiceAreas, get_service_areas, lookalike_place
+from app.services.service_areas import ServiceAreas, get_service_areas
 
 logger = logging.getLogger(__name__)
 
@@ -108,33 +112,99 @@ def add_table_summaries(chunks: list[dict], summaries: dict[int, dict]) -> list[
     return chunks + added
 
 
-def add_catalog_for_size(
-    chunks: list[dict], message: str, new_details: list[str], summaries: dict[int, dict]
-) -> list[dict]:
-    """When the customer mentions a system size this turn ("5kW", "3 kW"), add the KB Section 8 summary chunk (every
-    package with its kW, read from the KB) if it is not in the context yet, so a 5 kW question can name the 5 kW
-    package (T12b; T5 answered "How much does a 5kW system cost?" without naming HomePro 5)."""
-    summary = summaries.get(CATALOG_SECTION)
-    if not summary or not (SIZE_RE.search(message) or "system_size_kw" in new_details):
-        return chunks
-    if any(c["chunk_id"] == summary["chunk_id"] for c in chunks):
-        return chunks
-    return chunks + [summary]
+def _norm_words(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower().replace("&", " and ")).split())
 
 
-def check_named_cities(names: list[str], areas_fn: Callable[[], ServiceAreas]) -> list[dict]:
-    """The service-area result (the check_service_area tool's data) for every city named, once each, at most
-    MAX_CITY_CHECKS. Empty when the list can't be read; the model can still call the tool then."""
+def names_catalog(query: str | None, summary: dict | None) -> bool:
+    """True when the understand step's search query is about the KB Section 8 catalog: it names the section's title or
+    one of its offerings (KB data). The whole list then joins the context, so a "what do you offer" or a 5 kW answer can
+    name every package (T13d; T13e: read from the AI's query, not from the customer's words)."""
+    if not query or not summary:
+        return False
+    padded = f" {_norm_words(query)} "
+    rows = [line[2:].split(";")[0] for line in str(summary["content"]).split("\n") if line.startswith("- ")]
+    names = [_norm_words(summary["section_title"])] + [_norm_words(row) for row in rows]
+    names += [name.removeprefix("vantis ") for name in names]
+    return any(name and f" {name} " in padded for name in names)
+
+
+def place_rules(out: dict, areas: ServiceAreas | None, message: str = "") -> tuple[dict, list[str], set[str]]:
+    """The place a message names, as the understand step split it (T13e): the city alone by its official name, a finer
+    locality, and how the place relates to the city (place_relation). Code confirms only a place inside a listed city:
+    - a city the message uses only inside a KB region's name is that region (ServiceAreas.region_around: KB names
+      only, so it can stop a confirmation, never make one; in the live test the fallback model wrote "Delhi" for
+      "Delhi NCR");
+    - near: the place becomes "<locality, or 'the area'> near <city>", checked as unverified and saved so;
+    - unsure, or a place with no relation given: checked as unverified and never stored, so the city is asked again;
+    - a KB region in any field ("Delhi NCR"): checked as a region and never stored as the city; a place called a
+      region that is no KB region (or is a city) is unverified and never stored.
+    Returns (out, the places checked as unverified without a lookup, the lowercased names never stored as the city)."""
+    unverified: list[str] = []
+    not_stored: set[str] = set()
+
+    def is_region(name: str) -> bool:
+        try:
+            return areas is not None and areas.lookup(name).status == "region"
+        except Exception:  # the list can't be read: nothing is a region
+            return False
+
+    def regional(name):  # only ever turns a listed city into a region, never the other way
+        try:
+            if areas is None or not message or not name or areas.lookup(str(name)).status != "listed":
+                return name
+            return areas.region_around(message, str(name)) or name
+        except Exception:  # the list can't be read: the name stays as it is
+            return name
+
+    details, asked = dict(out["details"]), regional(out["asked_city"])
+    if details.get("city"):
+        details["city"] = regional(details["city"])
+    cities = [str(regional(c)) for c in out.get("cities", [])]
+    place = details.get("city") or asked
+    relation = out.get("place_relation") or "none"
+
+    if place and relation == "near":
+        near = f"{out.get('locality') or 'the area'} near {place}"
+        details = {**details, "city": near} if details.get("city") else details
+        asked = near if asked else asked
+        cities = [near if c.lower() == str(place).lower() else c for c in cities]
+        unverified.append(near)
+    elif place and relation != "inside" and not (relation == "region" and is_region(str(place))):
+        unverified.append(str(place))
+        not_stored.add(str(place).lower())
+    for name in [details.get("city"), asked, *cities]:
+        if name and is_region(str(name)):
+            not_stored.add(str(name).lower())
+    for value in (details.get("city"), asked):  # a place never stored is still checked
+        if value and str(value).lower() in not_stored and value not in cities:
+            cities.append(str(value))
+    if details.get("city") and str(details["city"]).lower() in not_stored:
+        details.pop("city")
+    if asked and str(asked).lower() in not_stored:
+        asked = None
+    return {**out, "details": details, "asked_city": asked, "cities": cities}, unverified, not_stored
+
+
+def check_named_cities(names: list[str], areas_fn: Callable[[], ServiceAreas],
+                       unverified: list[str] = ()) -> list[dict]:
+    """The service-area result (the check_service_area tool's data) for every place named, once each, at most
+    MAX_CITY_CHECKS. T13e: a place in `unverified` (only near a city, or unclear) is unverified without a lookup. Empty
+    when the list can't be read; the model can still call the tool then."""
     checks, seen = [], set()
+    unverified_keys = {name.lower() for name in unverified}
     for name in names:
         if name.lower() in seen:
             continue
         seen.add(name.lower())
-        try:
-            checks.append(service_area_data(areas_fn(), name))
-        except Exception as exc:  # DB down or not ingested
-            logger.warning("service-area check before the model unavailable: %s", type(exc).__name__)
-            break
+        if name.lower() in unverified_keys:
+            checks.append(unverified_area_data(name))
+        else:
+            try:
+                checks.append(service_area_data(areas_fn(), name))
+            except Exception as exc:  # DB down or not ingested
+                logger.warning("service-area check before the model unavailable: %s", type(exc).__name__)
+                break
         if len(checks) == MAX_CITY_CHECKS:
             break
     return checks
@@ -151,16 +221,17 @@ def package_guidance(case: str | None) -> str:
     return load_prompt("package_guidance_prompt").replace("{property}", case) if case else ""
 
 
-def tool_outcome_reply(scratch: list[BaseMessage], written: list[dict] = ()) -> str | None:
+def tool_outcome_reply(scratch: list[BaseMessage], written: list[dict] = (), exploring: bool = False) -> str | None:
     """What this turn wrote, in fixed words: the tools' results in `scratch` plus `written` (T13d: the code's own save in
     finalize, as artifacts of the same shape). For when the model fails after them (T12b: in the slow-Google drill Groq
     ran out of tokens on the call after a tool round, and "try again" after a saved lead is false) and for a lead the
-    code saved after the model answered. None when nothing was written."""
+    code saved after the model answered. None when nothing was written. T13e: for a customer only exploring, the saved
+    line says the team can help whenever they are ready and asks no callback time."""
     lines = []
     artifacts = [m.artifact for m in scratch if isinstance(m, ToolMessage) and isinstance(m.artifact, dict)]
     for artifact in artifacts + list(written):
         if artifact.get("kind") == "lead" and artifact.get("created"):
-            lines.append(welcome.SAVED_FALLBACK_TEXT)
+            lines.append(welcome.SAVED_EXPLORING_TEXT if exploring else welcome.SAVED_FALLBACK_TEXT)
         elif artifact.get("kind") == "callback":
             text = welcome.CALLBACK_UPDATED_TEXT if artifact.get("updated") else welcome.CALLBACK_LOGGED_TEXT
             lines.append(text.format(time=artifact["time"]))
@@ -202,7 +273,7 @@ def tool_area_checks(scratch: list[BaseMessage]) -> list[dict]:
                 data = json.loads(str(message.content).split("\n\n", 1)[0])
             except ValueError:
                 continue
-            if data.get("status") in ("listed", "unverified"):
+            if data.get("status") in ("listed", "unverified", "region"):
                 checks.append({**data, "by": "tool"})
     return checks
 
@@ -230,43 +301,46 @@ def build_graph(deps: AgentDeps):
         previous = state["messages"][-2] if len(state["messages"]) > 1 else None
         from_text: dict = {}
         try:
+            areas = deps.areas_fn()
+        except Exception:  # the list can't be read: the places are checked later by the model's tool, if at all
+            areas = None
+        try:
             out = understand(deps.understand_llm, deps.hints_fn(), message, history)
             degraded = False
         except LLMError as exc:
-            # T13d: the KB search always runs on the raw message (Hinglish questions rarely end in "?": "subsidy milti
-            # hai kya sarkar se"), and the details are read in code, so a failed turn keeps the phone, email, city, bill
-            # and size it was given (and the name, from clear patterns only)
+            # T13d: the KB search always runs on the raw message (Hinglish questions rarely end in "?"), and the details
+            # are read in code, so a failed turn keeps the phone, email, city, bill and size it was given. T13e: every
+            # reading of the customer's words in this node is the backup for this failed step only
             logger.warning("understand failed, using the raw message: %s", type(exc).__name__)
-            try:
-                areas = deps.areas_fn()
-            except Exception:  # the list can't be read: listed cities aren't found in the words
-                areas = None
             from_text = details_from_text(str(message), areas)
+            short_answer = short_answer_details(previous, str(message), from_text)  # "3500" after a bill question
             asks_call = asks_to_be_called(str(message))  # a request to be called is ready intent (T13d)
-            out = {"intents": ["question"] + (["gives_details"] if from_text else [])
-                   + (["contact_request"] if asks_call else []), "search_query": message,
+            bare = short_reply(str(message)) is not None  # "ok", "thanks", "no": a reply to us, nothing to search
+            out = {"intents": (["reply_to_assistant"] if bare else ["question"])
+                   + (["gives_details"] if from_text else []) + (["contact_request"] if asks_call else []),
+                   "search_query": None if bare else message,
                    "details": from_text, "asked_city": None, "cities": [], "callback_time": None, "issue": None,
-                   "project_details": None, "declines": False, "provider": None, "model": None, "latency_ms": None,
-                   "tokens": None}
+                   "project_details": None, "declines": False,
+                   "reply_type": reply_type_from_words(str(message), previous, {**from_text, **short_answer}),
+                   "ruled_out": ruled_out_details(str(message)), "locality": None,
+                   "place_relation": "inside" if from_text.get("city") else "none",
+                   "asks_offerings": asks_what_is_offered(str(message)), "problem_now": "no",
+                   "provider": None, "model": None, "latency_ms": None, "tokens": None}
             degraded = True
-        # T13d: a what-if ("agar inverter kharab ho jaye to kya karna padega") is a question, not a fault: only a problem
-        # the customer has now opens a support request
-        what_if = ("existing_customer_issue" in out["intents"] and is_what_if(str(message))
-                   and not reports_problem_now(str(message)))
-        if what_if:
+        # T13e: only a problem the customer's system has now starts the support flow (the understand step's
+        # problem_now): a what-if is a question, and an unclear one gets the general support answer and the question
+        # whether something is wrong now (Adithya's live test: "agar inverter kharab ho jaye…" opened a support case)
+        problem_now = out.get("problem_now") or "no"
+        if problem_now == "yes" and not (out.get("issue") or state.get("support", {}).get("issue")):
+            problem_now = "unsure"  # "yes" needs the problem itself: the AI's issue, from this message or an earlier one
+        if problem_now != "yes" and "existing_customer_issue" in out["intents"]:
             kept = [i for i in out["intents"] if i != "existing_customer_issue"]
-            out = {**out, "intents": kept + ([] if "question" in kept else ["question"]), "issue": None,
-                   "search_query": out["search_query"] or str(message)}
-        # T13d: a listed city used only inside another place's name or as a landmark ("Greater Noida", "Lucknow ke paas
-        # ek gaon") is that other place, never the listed city, whatever the extractor wrote
-        def place(name):
-            return (lookalike_place(str(message), str(name)) or name) if name else name
-
-        if out["details"].get("city") or out["asked_city"] or out.get("cities"):
-            out = {**out, "details": {**out["details"], **({"city": place(out["details"]["city"])}
-                                                          if out["details"].get("city") else {})},
-                   "asked_city": place(out["asked_city"]), "cities": [place(n) for n in out.get("cities", [])]}
-        short = short_answer_details(previous, str(message), out["details"])  # a bare "3500" or "yes" (T12a)
+            out = {**out, "intents": kept + ([] if "question" in kept else ["question"]), "issue": None}
+        elif problem_now == "yes" and "existing_customer_issue" not in out["intents"]:
+            out = {**out, "intents": [*out["intents"], "existing_customer_issue"]}
+        # T13e: the place as the understand step split it; code confirms only a place inside a listed city
+        out, unverified, not_stored = place_rules(out, areas, str(message))
+        short = short_answer_details(previous, str(message), out["details"]) if degraded else {}  # backup (T12a)
         data, errors = LeadData.from_raw({**out["details"], **short})
         clean = data.model_dump(exclude_none=True)
         # "4pm" is a time to call, never an installation timeline (T12a replay: the callback time was lost)
@@ -274,22 +348,14 @@ def build_graph(deps: AgentDeps):
         if clean.get("timeline") and is_clock_time(clean["timeline"]):
             callback_time = merge_callback_time(callback_time, clean.pop("timeline"))
             clean.pop("timeline_bucket", None)
-        if not out["callback_time"] and is_clock_time(str(message)):  # a message that is only "4pm"
+        if degraded and not out["callback_time"] and is_clock_time(str(message)):  # backup: a message only "4pm"
             callback_time = merge_callback_time(callback_time, str(message).strip().rstrip(".!"))
         intents_list, search_query, query_note = list(out["intents"]), out["search_query"], None
-        # T12b: "what else do you need?" is about their own details (no KB search); "what do I need for
-        # installation?" is a KB question, whatever intent the model gave it
-        if "asks_what_is_needed" in intents_list and not own_details_question(str(message)):
-            intents_list = [i for i in intents_list if i != "asks_what_is_needed"] or ["question"]
-            if "question" not in intents_list:
-                intents_list.append("question")
-            query_note = "not about their details: searches the KB"
         # A question always searches: with no query from the model, the raw message is the query (q13 in T12a)
         skip_raw = {"off_topic", "reply_to_assistant", "greeting", "thanks_or_bye"} | NO_SEARCH_TRIGGERS
         if "question" in intents_list and not search_query and not set(intents_list) & skip_raw:
             search_query = str(message)
-            query_note = query_note or "no query from the model: the message is the query"
-        out = {**out, "intents": intents_list, "search_query": search_query}
+            query_note = "no query from the model: the message is the query"
         intents = set(intents_list)
         support = dict(state.get("support", {}))
         for key in ("issue", "project_details"):
@@ -298,11 +364,13 @@ def build_graph(deps: AgentDeps):
         support_case = bool(state.get("support_case")) or "existing_customer_issue" in intents
         if "buying_interest" in intents and "existing_customer_issue" not in intents:
             support_case = False  # the customer moved on to buying: sales rules apply again
-        # T13a: a city the customer only asked about counts as theirs; two or more in question: none is guessed
+        # T13a: a city the customer only asked about counts as theirs; two or more in question: none is guessed. T13e: a
+        # region or an unclear place never counts as their city
         before = state.get("lead", {})
         asked = list(state.get("asked_cities", []))
         stated = clean.get("city") or confirmed_city(asked, previous, out)
-        named_now = [str(n) for n in [*out.get("cities", []), out["asked_city"]] if n]
+        named_now = [str(n) for n in [*out.get("cities", []), out["asked_city"]]
+                     if n and str(n).lower() not in not_stored]
         asks = [] if intents <= NO_CITY_CHECK_INTENTS or support_case else [
             n for n in named_now if not stated or n.lower() != str(stated).lower()]
         city, city_source, asked = resolve_city(
@@ -312,86 +380,97 @@ def build_graph(deps: AgentDeps):
             city = LeadData.from_raw({"city": city})[0].city  # an asked city is checked like a stated one
             if city:
                 clean["city"] = city
-        # T12b: every city named is checked in code; its step and the KB Section 10 summary (the source) go along
+        # T12b: every place named is checked in code; its step and the KB Section 10 summary (the source) go along
         named = [str(n) for n in [*out.get("cities", []), out["asked_city"], out["details"].get("city")] if n]
-        checks = [] if intents <= NO_CITY_CHECK_INTENTS else check_named_cities(named, deps.areas_fn)
+        checks = [] if intents <= NO_CITY_CHECK_INTENTS else check_named_cities(named, deps.areas_fn, unverified)
         area_steps = [{"node": "area_check", "detail": f"{c['city']}: {c['status']}", "data": {"by": "code"}}
                       for c in checks]
         summary = deps.hints_fn().summaries.get(SERVICE_AREA_SECTION) if checks else None
-        # T13c: the kind of place only with confidence (place_type). A new type from the extractor is dropped when this
-        # message names that kind of place only in passing ("I work from home") and no confident words: the bot asks
-        words = place_type(str(message), previous)
-        new_type, dropped = clean.get("customer_type"), []
-        if (new_type and new_type != before.get("customer_type") and not words
-                and new_type in passing_place_kinds(str(message))):
-            dropped = ["customer_type"] + (["property_type"] if CUSTOMER_TYPE_OF.get(clean.get("property_type"))
-                                           == new_type else [])
-            for name in dropped:
-                clean.pop(name)
-        # T13b: a home or a business named, with no customer type from the extractor or an earlier turn (C7 run 1:
-        # "it's for my home" stored nothing on the bill turn), like the T12a short answers
+        # T13b: a home or a business with no customer type yet. T13e: the understand step decides (its place rules);
+        # the place words of the message are read only when that step failed
+        words = place_type(str(message), previous) if degraded else {}
         kind = {} if clean.get("customer_type") or before.get("customer_type") else words
         clean.update(kind)
         # T13c: buying interest or a callback request counts as "interested" while the intent is unknown
         intent = chat_intent({**before, **clean}, intents, callback_time)
         clean.update(intent)
+        lead = {**before, **clean}
+        if not city and asked:  # two or more cities in question: none is guessed (T13a)
+            lead.pop("city", None)
+        new_details = changed_fields(before, lead)
+        # T13a: a monthly bill given this turn brings KB Section 9 (which reference package fits which need), once the
+        # property type is known (T13b; package_case)
+        packages = package_case({"lead": lead, "new_details": new_details, "support_case": support_case,
+                                 "contact_request": "contact_request" in intents})
+        guidance = deps.hints_fn().guidance if packages in ("home", "business") else []
+        # T13d, T13e: the KB Section 8 summary joins when a size is new this message, or when the understand step's own
+        # query is about the catalog (its title or an offering named), so a 5 kW or "what do you offer" answer can name
+        # every package; the message's words are read only when that step failed
+        catalog_chunk = deps.hints_fn().summaries.get(CATALOG_SECTION)
+        asks_offerings = bool(out.get("asks_offerings")) and not support_case  # T13e: the understand step's flag
+        if degraded:
+            wants_catalog = bool(SIZE_RE.search(str(message)) or asks_offerings)
+        else:
+            wants_catalog = ("system_size_kw" in new_details or asks_offerings
+                             or names_catalog(search_query, catalog_chunk))
+        catalog = [catalog_chunk] if catalog_chunk and wants_catalog and not support_case else []
+        # T13d, T13e: the questions and offers the customer skipped or declined in a row, from the understand step's
+        # reply_type and our own last reply (a clear no to an offer or to sharing details parks asks at once)
+        reply_type = out["reply_type"]
+        new_ruled = sorted(set(out["ruled_out"]) - set(state.get("ruled_out", [])))
+        new_callback = bool(callback_time and callback_time != state.get("callback_time"))
+        # naming a region (our own area check says so) answers a question about their city
+        reset = (reply_type in ("answers", "accepts", "goes_ahead") or new_callback
+                 or bool(intents & {"contact_request", "asks_what_is_needed"})
+                 or any(c.get("status") == "region" for c in checks))
+        parks = (reply_type == "declines" and (made_offer(previous) or asked_contact(previous))
+                 and not new_details and not new_ruled)
+        skipped = skipped_asks(state, previous_asked(state, previous), reply_type, reset, parks)
+        # T13e: the closing text only when nothing else in the message needs an answer ("closes" skips the model, so a
+        # question or a detail would be dropped); a thanks that also gives a detail or asks something goes to the model
+        says_bye = reply_type == "closes" or intents == {"thanks_or_bye"}
+        closes = (says_bye and not search_query and not new_details and not new_callback
+                  and intents <= {"thanks_or_bye", "reply_to_assistant", "greeting"})
+        if closes:
+            intents_list = ["thanks_or_bye"]
+        elif "thanks_or_bye" in intents_list:
+            intents_list = [i for i in intents_list if i != "thanks_or_bye"] or (
+                ["gives_details"] if new_details else ["question"] if search_query else ["reply_to_assistant"])
         step = {
             "node": "understand",
-            "detail": ("failed, raw message used" if degraded else "intents: " + ", ".join(out["intents"])),
+            "detail": ("failed, raw message used" if degraded else "intents: " + ", ".join(intents_list)),
             "data": {
-                "intents": out["intents"],
-                "search_query": out["search_query"],
+                "intents": intents_list,
+                "search_query": search_query,
                 "query_note": query_note,
+                "reply_type": reply_type,
+                "closes": closes,
+                "problem_now": problem_now,
+                "asks_offerings": asks_offerings,
+                "place_relation": out.get("place_relation"),
+                "locality": out.get("locality"),
                 "details": sorted(clean),
                 "invalid": sorted(errors),
                 "city_source": city_source,
                 "short_answer": sorted(short),
                 "from_words": sorted(kind),
-                "dropped": dropped,
                 "intent_from_chat": bool(intent),
                 "from_text": sorted(from_text),
-                "what_if": what_if,
+                "catalog": bool(catalog),
+                "skipped_asks": skipped,
                 "provider": out["provider"],
                 "model": out["model"],
                 "latency_ms": out["latency_ms"],
                 "tokens": out["tokens"],
             },
         }
-        lead = {**before, **clean}
-        if not city and asked:  # two or more cities in question: none is guessed (T13a)
-            lead.pop("city", None)
-        new_details = changed_fields(before, lead)
-        # T13a: a monthly bill given this turn brings KB Section 9 (which reference package fits which need), so the
-        # packages named have their source even on a turn without a KB search (in C7 and C7b the number guard had to
-        # remove "…fits nicely with our 3 kW residential reference package"). T13b: only once the property type is
-        # known, since the reply then names every package for a home or a business; with the type still unknown it
-        # asks for it first (package_case), and the type given after the bill brings them too
-        packages = package_case({"lead": lead, "new_details": new_details, "support_case": support_case,
-                                 "contact_request": "contact_request" in intents})
-        guidance = deps.hints_fn().guidance if packages in ("home", "business") else []
-        # T13d: a size stated this message brings the KB Section 8 summary even without a KB search ("I want a 5 kW
-        # system for my house" gives details only, so it never searched and the reply couldn't name HomePro 5); so does
-        # a question about what Vantis offers, with or without the understand step (on 13 Oct the raw search for "What
-        # solar systems do you provide?" found only Section 1)
-        summaries = deps.hints_fn().summaries
-        catalog = [] if support_case else add_catalog_for_size([], str(message), new_details, summaries)
-        offer = not support_case and not catalog and asks_what_is_offered(str(message))
-        if offer and summaries.get(CATALOG_SECTION):
-            catalog = [summaries[CATALOG_SECTION]]
-        # T13d: questions about their details the customer skipped in a row; a detail, a contact request, "what else do
-        # you need" or a clear buying signal lets the assistant ask again
-        invited = (bool(intents & {"contact_request", "asks_what_is_needed"}) or is_go_ahead(str(message))
-                   or (lead.get("intent_level") == "ready" and before.get("intent_level") != "ready"))
-        skipped = skipped_asks(state, previous, new_details, invited)
-        step["data"].update({"catalog_for_size": bool(catalog) and not offer, "catalog_for_offer": bool(catalog) and offer,
-                             "skipped_asks": skipped})
         return {
-            "intents": out["intents"],
-            "search_query": out["search_query"],
+            "intents": intents_list,
+            "search_query": search_query,
             "lead": lead,
             "new_details": new_details,
-            "declines": bool(out["declines"]),
-            "ruled_out": sorted(set(state.get("ruled_out", [])) | set(ruled_out_details(str(message)))),
+            "declines": bool(out["declines"]) or reply_type == "declines",
+            "ruled_out": sorted(set(state.get("ruled_out", [])) | set(out["ruled_out"])),
             "validation_errors": errors,
             "asked_cities": asked,
             "city_source": city_source,
@@ -402,9 +481,13 @@ def build_graph(deps: AgentDeps):
             "contact_request": "contact_request" in intents,
             "degraded": degraded,
             "area_checks": checks,
-            "chunks": ([summary] if summary else []) + guidance + catalog,
+            # T13e: for "what do you offer?" the catalog comes first, so the answer starts from the offerings
+            "chunks": (catalog + ([summary] if summary else []) + guidance if asks_offerings
+                       else ([summary] if summary else []) + guidance + catalog),
+            "asks_offerings": asks_offerings,
+            "problem_unclear": problem_now == "unsure" and not support_case,
             "skipped_asks": skipped,
-            "ever_declined": bool(state.get("ever_declined")) or bool(out["declines"]),
+            "ever_declined": bool(state.get("ever_declined")) or bool(out["declines"]) or reply_type == "declines",
             "call_requested": bool(state.get("call_requested")) or "contact_request" in intents,
             "steps": state["steps"] + [step] + area_steps,
         }
@@ -449,7 +532,7 @@ def build_graph(deps: AgentDeps):
         persisted = state["messages"][-AGENT_HISTORY:]
         current = persisted[-1]
         chunks = [RetrievedChunk(**c) for c in state["chunks"]]
-        lead_progress = status_block(state) if deps.ops is not None else ""
+        lead_progress = status_block(state, offers_made(state["messages"])) if deps.ops is not None else ""
         return [
             SystemMessage(load_prompt("system_prompt")),
             *persisted[:-1],
@@ -593,6 +676,19 @@ def build_graph(deps: AgentDeps):
         if plain:
             steps.append({"node": "guard", "detail": "'reference locations' became 'service areas'",
                           "data": {}})
+        # T13e: never "the knowledge base" to the customer, and never a KB rule written for the assistant
+        reply, kb_words = plain_kb_words(reply)
+        if kb_words:
+            steps.append({"node": "guard", "detail": "'the knowledge base' became plain words", "data": {}})
+        reply, rules = remove_kb_rules(reply)
+        if rules:
+            steps.append({"node": "guard", "detail": "removed a KB rule quoted to the customer",
+                          "data": {"removed": rules}})
+        # T13e: a region is never confirmed: its listed cities, then which city
+        reply, region = fix_region_reply(reply, state, chunks)
+        if region:
+            steps.append({"node": "guard", "detail": "a region is not a city: its cities, then which city",
+                          "data": {"changed": region}})
         reply, city_asks = drop_known_city_question(reply, state)
         if city_asks:  # the removed sentences are kept in the step, so each removal can be checked (T13a)
             steps.append({"node": "guard", "detail": "removed a question about a city it already has",
@@ -601,12 +697,39 @@ def build_graph(deps: AgentDeps):
         if parked:  # T13d: the customer skipped two questions about their details in a row
             steps.append({"node": "guard", "detail": "removed a question for details after two skipped ones",
                           "data": {"removed": parked}})
+        # T13e: no repeated question, each offer once per chat, none while parked, no callback ask for an explorer,
+        # no contact ask on an info-only turn, one detail per question
+        reply, asked = ask_rules(reply, state)
+        if asked:
+            steps.append({"node": "guard", "detail": "question rules: " + "; ".join(a["why"] for a in asked),
+                          "data": {"changed": asked}})
         reply, trimmed = keep_one_question(reply, state)
         if trimmed:
             steps.append({"node": "guard", "detail": "kept one question", "data": {}})
+        # T13e: "what do you offer?" (the understand step's flag) always names the KB Section 8 offerings: a reply that
+        # names none of them gets the list from the KB, with its tag (the assignment's first example question)
+        if state.get("asks_offerings"):
+            catalog = next((c for c in chunks if c.section_no == CATALOG_SECTION and c.chunk_type == "table_summary"),
+                           None)
+            if catalog is not None:
+                reply, listed = add_offerings_line(reply, catalog.content, welcome.OFFERINGS_INTRO,
+                                                   citation_label(catalog))
+                if listed:
+                    steps.append({"node": "guard", "detail": "added the KB Section 8 offerings the reply left out",
+                                  "data": {}})
+        # T13e: naming the package for a stated size says a site assessment confirms the final size (KB Section 9)
+        message = str(state["messages"][-1].content)
+        if "system_size_kw" in state.get("new_details", []) or SIZE_RE.search(message):
+            catalog = next((c for c in chunks if c.section_no == CATALOG_SECTION), None)
+            reply, sized = add_size_line(reply, reference_packages(deps.hints_fn().guidance),
+                                         welcome.SIZE_ASSESSMENT_TEXT, citation_label(catalog) if catalog else "")
+            if sized:
+                steps.append({"node": "guard", "detail": "added that a site assessment confirms the final size",
+                              "data": {}})
         # T13d: a reply that used this turn's chunks without citing any gets the best-matching chunk's tag, so its
         # source chip shows (Groq often leaves the tag out); never on the fixed lines the guards put in
-        fixed_lines = (welcome.UNCOVERED_TEXT, welcome.NUMBERS_CONFIRM_TEXT, welcome.PACKAGES_FIT_TEXT)
+        fixed_lines = (welcome.UNCOVERED_TEXT, welcome.NUMBERS_CONFIRM_TEXT, welcome.PACKAGES_FIT_TEXT,
+                       welcome.EXPLORER_READY_TEXT, welcome.SIZE_ASSESSMENT_TEXT)
         reply, tag = add_missing_tag(reply, chunks, skip=fixed_lines)
         if tag:
             steps.append({"node": "guard", "detail": "added the KB tag the reply left out", "data": {"tag": tag}})
@@ -644,7 +767,7 @@ def build_graph(deps: AgentDeps):
                         + _tool_chunks(scratch, "search_knowledge_base"))
         chunks = [RetrievedChunk(**c) for c in found]
         degraded = state["degraded"]
-        outcome = tool_outcome_reply(scratch, written)
+        outcome = tool_outcome_reply(scratch, written, exploring=is_explorer(view))
 
         def safety_net() -> tuple[str, str]:
             """T13d: no model answered: the KB sentences, the city checks, what was saved and one question, instead of
@@ -739,7 +862,7 @@ def build_agent(
     ops = LeadOps(engine=leads_engine or engine, areas_fn=get_service_areas, reason_now=False)
     tools = make_tools(search_fn, get_service_areas, hints_fn, ops)
     deps = AgentDeps(
-        understand_llm=understand_llm(Understanding),  # main, Groq, fast: 4 s each (T12a)
+        understand_llm=understand_llm(Understanding),  # main, then fast: 5 s each (T13e)
         agent_llm=chat_llm(main_model, tools=tools),
         agent_llm_without_create=chat_llm(main_model, tools=[t for t in tools if t.name != "create_lead"]),
         final_llm=chat_llm(main_model),

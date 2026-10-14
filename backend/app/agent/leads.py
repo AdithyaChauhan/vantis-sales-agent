@@ -40,7 +40,15 @@ SAVED_WITH_TIME_LINE = ("Next: call schedule_callback for the time they gave, th
 CALLBACK_NOW_LINE = ("Next: confirm what the tools did in this turn (the callback request logged or updated for "
                      "their time, the team will confirm it; and the details saved, if create_lead ran). Do not ask "
                      "for more details in this reply.")
-ASKED_WHAT_LINE = "The customer asked what else you need: ask now for {detail}, in everyday words. One question."
+ASKED_WHAT_LINE = ("The customer asked what else you need: if they asked about one of their details, say whether it "
+                   "would still help and ask for it; otherwise ask now for {detail}, in everyday words. One question.")
+# T13e: a customer only exploring or researching is never asked for a callback time (KB Section 17)
+SAVED_EXPLORING_LINE = ("Next: say the details are saved and that the Vantis team can help whenever they are ready. Do "
+                        "not ask for a callback time or for more details, and offer nothing.")
+# T13e: the understand step's problem_now is "unsure": no support flow yet, the general answer and one question
+PROBLEM_UNCLEAR_LINE = ("The customer mentioned their installed system, but it isn't clear whether something is wrong "
+                        "with it now: give the general support answer from the context, then ask whether something is "
+                        "wrong with it right now. Do not ask for their details yet.")
 INTEREST_LINE = "Next: after answering anything they asked, ask gently for {detail}. One question."
 NOTHING_LEFT_LINE = ("The customer asked what else you need: nothing else is needed for now (they ruled out the rest); "
                      "say so and offer one next step.")
@@ -48,11 +56,13 @@ SAVED_INFO_LINE = ("The customer only asked for information or said no: answer a
                    "it; do not ask for these details.")
 NOTHING_MORE_LINE = "Nothing more is needed for the lead: answer and offer one next step."
 # T13d: after one skipped question about their details the assistant may ask once more; after two it stops asking
-# until they give a detail, ask to be contacted, ask what is needed or show a clear new buying signal (Adithya's live
-# chat: the city was asked 4 times while the customer kept asking other things)
+# until they answer, ask to be contacted, ask what is needed or want to go ahead (Adithya's live chat: the city was
+# asked 4 times while the customer kept asking other things). T13e: offers count too, and a clear no parks at once
 MAX_SKIPPED_ASKS = 2
-SKIPPED_LINE = ("The customer skipped your last two questions about their details: answer what they ask and offer one "
-                "next step related to it; do not ask for any of their details now.")
+SKIPPED_LINE = ("The customer declined or skipped your recent questions or offers: answer what they ask, with no "
+                "question about their details and no offer.")
+# T13e: name and phone may be asked in one question; every other question asks for one detail (KB Section 14)
+CONTACT_PAIR = ["name", "phone or email"]
 # T13a: a city the customer only asked about counts as theirs
 ASKED_CITY_LINE = "City: the one they asked about counts as theirs; never ask for it or confirm it again."
 MAX_CITY_CANDIDATES = 3
@@ -147,10 +157,6 @@ _DETAIL_WORDS = {
     "phone number": ("phone", "mobile", "number"),
 }
 _DETAIL_OF_WORD = {word: detail for detail, words in _DETAIL_WORDS.items() for word in words}
-# "What else do you need?" is about the customer's own details only together with a need-from-me phrase (T12b):
-# "what else do I need for installation?" and "anything else besides panels?" are KB questions
-_ELSE_RE = re.compile(r"\b(?:else|other|more|anything|still|apart from)\b", re.I)
-_FROM_ME_RE = re.compile(r"\b(?:you\s+need|u\s+need|need\s+from\s+me|info|information|details?)\b", re.I)
 # The words of each still-missing item, to find the question that asks for it (keep_one_question, T12b)
 _ITEM_WORDS = {
     "city": ("city", "where", "location", "town"),
@@ -223,23 +229,56 @@ def asked_items(text: str, items: list[str]) -> list[str]:
             if any(re.search(rf"\b{w}\b", q, re.I) for q in questions for w in _ITEM_WORDS.get(item, ()))]
 
 
-def skipped_asks(state: dict, previous: object, new_details: list[str], invited: bool) -> int:
-    """The count of questions about their details the customer skipped in a row, after this message (T13d): +1 when
-    the assistant's last reply asked for a detail it still needed and this message gave none; back to 0 when the
-    message gives a detail or invites asks (a contact request, "what else do you need?", a clear buying signal)."""
-    if new_details or invited:
+def skipped_asks(state: dict, previous_asked: bool, reply_type: str, reset: bool, parks: bool) -> int:
+    """The count of questions and offers the customer skipped or declined in a row, after this message (T13d). T13e:
+    read from the understand step's reply_type and our own last reply, never from the customer's words:
+    - parks: a clear no to an offer or to sharing details: MAX_SKIPPED_ASKS at once (no asks, no offers);
+    - reset: an answer, a yes, going ahead, a contact request, "what else do you need", a new callback time: 0. A
+      "declines" that doesn't park (a no that answered a question, or one detail refused) counts as an answer;
+    - otherwise (skips, asks something new, closes) +1 when our last reply asked for a detail or made an offer."""
+    if parks:
+        return MAX_SKIPPED_ASKS
+    if reset or reply_type == "declines":
         return 0
-    asked = asked_items(str(previous.content), ask_targets(state)) if isinstance(previous, AIMessage) else []
-    return state.get("skipped_asks", 0) + (1 if asked else 0)
+    return state.get("skipped_asks", 0) + (1 if previous_asked else 0)
 
 
 def shows_interest(state: dict) -> bool:
     """The customer wants solar for their own place: a buying or contact intent (or asking what else is needed)
-    this turn, a city they asked about, or any detail about themselves in the draft (intent_level alone is the
-    extractor's guess)."""
-    if set(state.get("intents", [])) & BUYING_INTENTS or state.get("asked_cities"):
+    this turn, or any detail about themselves in the draft (intent_level alone is the extractor's guess). T13e: a city
+    they only asked about ("Do you provide installation in <city>?") is an information question, not interest."""
+    if set(state.get("intents", [])) & BUYING_INTENTS:
         return True
-    return any(name != "intent_level" for name in state.get("lead", {}))
+    asked_city = state.get("city_source") == "asked"
+    return any(name != "intent_level" and not (name == "city" and asked_city) for name in state.get("lead", {}))
+
+
+def is_explorer(state: dict) -> bool:
+    """T13e: the customer said they are only exploring or researching (the understand step's intent_level) and asked for
+    no call: they are never asked for a callback time; the team can help whenever they are ready."""
+    return (state.get("lead", {}).get("intent_level") == "exploring" and not state.get("call_requested")
+            and not state.get("callback_time"))
+
+
+def region_turn(state: dict) -> bool:
+    """T13e: this turn named a KB region ("Delhi NCR") and the city is still unknown: the next ask is which city."""
+    return not state.get("lead", {}).get("city") and any(
+        c.get("status") == "region" for c in state.get("area_checks", []))
+
+
+def ask_text(item: str, state: dict) -> str | None:
+    """The fixed one-detail question for a missing item (T13e: a ruled-out phone asks for the email, and back)."""
+    ruled_out = set(state.get("ruled_out", []))
+    if item == "phone or email" and "phone number" in ruled_out:
+        return welcome.NEXT_QUESTION["email"]
+    if item == "phone or email" and "email" in ruled_out:
+        return welcome.NEXT_QUESTION["phone number"]
+    return welcome.NEXT_QUESTION.get(item)
+
+
+def ask_items(missing: list[str]) -> list[str]:
+    """What one question may ask for (T13e, KB Section 14): the first missing item, or name and phone together."""
+    return missing[:2] if missing[:2] == CONTACT_PAIR else missing[:1]
 
 
 def pending_changes(lead: dict, saved: dict) -> dict:
@@ -308,9 +347,9 @@ def resolve_city(
 
 
 def short_answer_details(previous: object, message: str, details: dict) -> dict:
-    """A detail the customer gave as a bare answer to the assistant's last question, when the extractor missed
-    it (T12a): an amount after a question only about the monthly bill, yes or no after a question only about
-    roof space. So a detail that was given is never asked for again. Values are validated later as usual."""
+    """Backup only (T13e: the understand step's short-answer rule decides; this runs when that step failed): a detail
+    the customer gave as a bare answer to the assistant's last question (T12a): an amount after a question only about
+    the monthly bill, yes or no after a question only about roof space. Values are validated later as usual."""
     topics = {_TOPIC_OF[word.lower()] for word in _TOPIC_RE.findall(final_question(previous))}
     if topics == {"bill"} and "monthly_bill_inr" not in details and _BARE_AMOUNT_RE.match(message):
         return {"monthly_bill_inr": message.strip().rstrip(".!")}
@@ -329,15 +368,16 @@ def _kinds(words: list[str]) -> set[str]:
 
 
 def passing_place_kinds(message: str) -> set[str]:
-    """The kinds of place a message names only in passing ("I work from home" -> {"residential"})."""
+    """Backup only (see place_type): the kinds of place a message names only in passing ("I work from home" ->
+    {"residential"})."""
     return _kinds([w for m in _PASSING_RE.finditer(message) for w in _HOME_RE.findall(m.group(0))
                    + _BUSINESS_RE.findall(m.group(0))])
 
 
 def place_type(message: str, previous: object) -> dict:
-    """The customer type from the words of a message, only with confidence (T13c; replaces T13b's word check, which
-    needed the extractor's intents, so it stored nothing when the understand step failed: chat 1's "house", "home",
-    "home" after "house or small business?"). Home words -> residential, shop, office, store or business -> commercial:
+    """Backup only (T13e: the understand step's place rules decide; this runs when that step failed). The customer type
+    from the words of a message, only with confidence (T13c). Home words -> residential, shop, office, store or
+    business -> commercial:
     - (a) a short answer to the assistant's own home-or-business question ("house", "a shop", "ghar"), or
     - (b) a phrase about their own place: "the house is in Kanpur", "it's for my home", "my flat", "it's a shop",
       "solar lagwana hai ghar par".
@@ -388,31 +428,15 @@ def merge_callback_time(old: str | None, new: str | None) -> str | None:
 
 def is_clock_time(text: str) -> bool:
     """True for a time of day alone ("4pm", "around 6 pm", "evening"): a time to call, never an installation
-    timeline. In the T12a replay "4pm" (meant for the callback) was saved as the timeline and the callback was lost."""
+    timeline. In the T12a replay "4pm" (meant for the callback) was saved as the timeline and the callback was lost.
+    T13e: run on the extractor's timeline value (a check on the AI's output), and on the raw message only as the backup
+    when the understand step failed."""
     return bool(_CLOCK_ONLY_RE.match(text))
 
 
-def details_named(text: str) -> list[str]:
-    """The lead details a text names, in order: "is rooftop availability info needed?" -> ["rooftop availability"]."""
-    found: list[str] = []
-    for word in re.findall(r"[a-z]+", text.lower()):
-        detail = _DETAIL_OF_WORD.get(word)
-        if detail and detail not in found:
-            found.append(detail)
-    return found
-
-
-def own_details_question(message: str) -> bool:
-    """True if a "what is needed" message is about the customer's own lead details (T12b): it names one ("is my
-    bill needed?") or asks what else the assistant needs ("what else do you need from me?"). A question about
-    what an installation or a quote requires is not, so it searches the KB."""
-    if details_named(message):
-        return True
-    return bool(_ELSE_RE.search(message) and _FROM_ME_RE.search(message))
-
-
 def ruled_out_details(message: str) -> list[str]:
-    """Details the customer rules out in a message: "anything else apart from timing?" -> ["timeline"]."""
+    """Backup only (T13e: the understand step's ruled_out field decides; this runs when that step failed): details
+    the customer rules out in a message by their words: "anything else apart from timing?" -> ["timeline"]."""
     return [_DETAIL_OF_WORD[word.lower()] for word in _EXCEPT_RE.findall(message) if word.lower() in _DETAIL_OF_WORD]
 
 
@@ -435,14 +459,10 @@ def package_case(state: dict) -> str | None:
 
 
 def next_detail(state: dict, useful: list[str]) -> str | None:
-    """The one detail to ask for next (T12a): the one the customer just asked about, else the most useful one they
-    have not ruled out in this conversation. Chosen in code, so the reply never asks for something already given
-    or ruled out ("apart from timing" got a timeline question in the replay)."""
-    messages = state.get("messages") or []
-    message = str(messages[-1].content) if messages else ""
-    asked = [d for d in details_named(_EXCEPT_RE.sub(" ", message)) if d in useful]
-    if asked:
-        return asked[0]
+    """The one detail to ask for next (T12a): the most useful one the customer has not ruled out in this conversation,
+    so the reply never asks for something already given or ruled out ("apart from timing" got a timeline question in
+    the replay). T13e: a detail the customer asks about by name is the model's call (it reads the message and
+    ASKED_WHAT_LINE); no word list picks it."""
     ruled_out = set(state.get("ruled_out", []))
     return next((d for d in useful if d not in ruled_out), None)
 
@@ -486,13 +506,21 @@ def fix_callback_claims(reply: str, state: dict) -> tuple[str, bool]:
     if not changed:
         return reply, False
     text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-    if not status and "?" not in text:
+    if not status and "?" not in text and not is_explorer(state):  # T13e: an explorer is never asked for a time
         text = f"{text} {welcome.CALLBACK_TIME_ASK}".strip()
     return text, True
 
 
+def _customer_words(item: str, state: dict) -> str:
+    """A missing item in everyday words (T13e: a ruled-out phone asks for the email, and the reverse)."""
+    if item == "phone or email" and "phone number" in state.get("ruled_out", []):
+        return "email address"
+    return welcome.CUSTOMER_WORDS[item]
+
+
 def _still_needed_ask(state: dict) -> str:
-    """The honest question that replaces a false "saved" claim: what the lead (or support request) still needs."""
+    """The honest question that replaces a false "saved" claim: what the lead (or support request) still needs, one
+    detail at a time (T13e; only name and phone may go together)."""
     lead = state.get("lead", {})
     if state.get("support_case"):
         missing = support_missing(lead, state.get("support", {}))
@@ -502,7 +530,7 @@ def _still_needed_ask(state: dict) -> str:
         template = welcome.STILL_NEEDED_ASK
     if not missing:
         return welcome.READY_TO_PASS_ASK
-    return template.format(items=" and ".join(welcome.CUSTOMER_WORDS[item] for item in missing[:2]))
+    return template.format(items=" and ".join(_customer_words(item, state) for item in ask_items(missing)))
 
 
 def remove_false_claims(reply: str, state: dict) -> tuple[str, bool]:
@@ -670,6 +698,8 @@ def _wanted_item(state: dict) -> str | None:
         return "property type"
     if asks_parked(state):  # T13d: they skipped two questions in a row
         return None
+    if region_turn(state) and not state.get("support_case"):  # T13e: a region named; which city is needed to answer
+        return "city"
     if state.get("support_case") and not state.get("support_request_id"):
         missing = support_missing(lead, state.get("support", {}))
         return missing[0] if missing else None
@@ -721,7 +751,9 @@ def _saved_lead_next(state: dict, useful: list[str]) -> str:
     if state.get("callback_now"):
         return CALLBACK_NOW_LINE
     if state.get("lead_created_now"):
-        return SAVED_WITH_TIME_LINE if state.get("callback_time") else SAVED_NOW_LINE
+        if state.get("callback_time"):
+            return SAVED_WITH_TIME_LINE
+        return SAVED_EXPLORING_LINE if is_explorer(state) else SAVED_NOW_LINE
     if not useful:
         return NOTHING_MORE_LINE
     if state.get("declines"):
@@ -734,9 +766,10 @@ def _saved_lead_next(state: dict, useful: list[str]) -> str:
     return SAVED_INFO_LINE
 
 
-def status_block(state: dict) -> str:
+def status_block(state: dict, offers_made: list[str] = ()) -> str:
     """The lead status the agent reads each turn: field names and plain messages, never values,
-    never a score or a status."""
+    never a score or a status. T13e: `offers_made` are the kinds of next step the assistant already offered in this
+    chat (app/agent/questions.py), never to be offered again."""
     lead = state.get("lead", {})
     lines = []
     if state.get("support_case"):
@@ -777,8 +810,12 @@ def status_block(state: dict) -> str:
                 lines.append("Lead saved: no. Ready to save: call create_lead now (sharing a phone number "
                              "or email counts as wanting follow-up).")
     if state.get("contact_request") and not state.get("lead_id"):
-        lines.append("The customer asked to be contacted: ask for what is still needed (name and phone first); "
-                     "do not answer earlier questions again.")
+        lines.append("The customer asked to be contacted: ask for what is still needed (name and phone first, in one "
+                     "question); do not answer earlier questions again.")
+    if offers_made:
+        lines.append("Offers already made in this chat: " + ", ".join(offers_made) + ". Do not make them again.")
+    if state.get("problem_unclear") and not state.get("support_case"):
+        lines.append(PROBLEM_UNCLEAR_LINE)
     for name, message in sorted(state.get("validation_errors", {}).items()):
         lines.append(f"Looked wrong, ask again: {name.replace('_', ' ')}: {message}")
     if not state.get("support_case"):

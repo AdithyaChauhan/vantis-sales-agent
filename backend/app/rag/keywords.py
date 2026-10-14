@@ -14,6 +14,7 @@ MATCH_WORDS = {
     "emi": "financing", "loan": "financing", "finance": "financing", "guarantee": "warranty",
     "lagwana": "install", "lagwane": "install", "lagana": "install", "kharab": "issue", "problem": "issue",
     "panel": "panel", "maintain": "maintenance", "servicing": "maintenance",
+    "clean": "maintenance", "cleaning": "maintenance", "safai": "maintenance", "saaf": "maintenance",  # T13e
 }
 # Words that say nothing about the topic (English, Hinglish, and words in almost every KB line)
 STOP_WORDS = {

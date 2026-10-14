@@ -13,9 +13,9 @@ When no sentence matches, it says plainly that the information doesn't cover it;
 import re
 
 from app.agent import welcome
-from app.agent.leads import _wanted_item
+from app.agent.leads import _wanted_item, ask_text, region_turn
 from app.agent.packages import SIZE_RE
-from app.agent.text_details import asks_what_is_offered
+from app.agent.questions import offers_made, previous_reply, question_sentences, region_line, repeats
 from app.rag.answer import citation_label, split_sentences
 from app.rag.keywords import key_words
 from app.rag.chunker import CATALOG_SECTION, PACKAGE_GUIDANCE_SECTION, SERVICE_AREA_SECTION
@@ -153,22 +153,39 @@ def city_lines(area_checks: list[dict], chunks: list[dict], message: str) -> lis
     for check in [c for c in area_checks if c.get("by") == "tool" or str(c["city"]).lower() in message.lower()]:
         if check["status"] == "listed":
             lines.append(welcome.AREA_LISTED_TEXT.format(city=check.get("matched_city") or check["city"]) + tag)
+        elif check["status"] == "region":  # T13e: a region's listed cities, never "covers <region>"
+            lines.append(region_line(check, tag.strip()))
         else:
             lines.append(welcome.AREA_UNVERIFIED_TEXT.format(city=check["city"]) + tag)
     return lines
 
 
-def closing_question(state: dict) -> tuple[str, dict]:
-    """The one question: the next missing detail; for a customer who only asked questions the fixed offer, once per
-    chat and never after a skipped question or a no; otherwise "Anything else you'd like to know?". Returns (question,
-    state update)."""
+def closing_question(state: dict) -> tuple[str | None, dict]:
+    """The one question: which city after a region (T13e), else the next missing detail; for a customer who only asked
+    questions the fixed offer, once per chat and never after a skipped question, a no or an earlier sales-team offer;
+    otherwise "Anything else you'd like to know?". T13e: never the question the previous reply asked, so it can be None.
+    Returns (question, state update)."""
+    previous = previous_reply(state.get("messages", []))
+    earlier = question_sentences(str(previous.content)) if previous is not None else []
+    if state.get("problem_unclear") and not repeats(welcome.PROBLEM_NOW_ASK, earlier):  # T13e
+        return welcome.PROBLEM_NOW_ASK, {}
     item = _wanted_item(state)
-    if item and item in welcome.NEXT_QUESTION:
-        return welcome.NEXT_QUESTION[item], {}
+    if item == "city" and region_turn(state):
+        check = next(c for c in state.get("area_checks", []) if c.get("status") == "region")
+        region = (check.get("regions") or [check["city"]])[0]
+        ask = welcome.REGION_CITY_ASK.format(region=region)
+    else:
+        ask = ask_text(item, state) if item else None
+    if ask and not repeats(ask, earlier):
+        return ask, {}
     if (not state.get("lead_id") and not state.get("support_case") and not state.get("fallback_offered")
-            and not state.get("ever_declined") and not state.get("skipped_asks")):
+            and not state.get("ever_declined") and not state.get("skipped_asks")
+            and "sales team" not in offers_made(state.get("messages", []))
+            and not repeats(welcome.FALLBACK_OFFER, earlier)):
         return welcome.FALLBACK_OFFER, {"fallback_offered": True}
-    return welcome.ANYTHING_ELSE_ASK, {}
+    if not repeats(welcome.ANYTHING_ELSE_ASK, earlier):
+        return welcome.ANYTHING_ELSE_ASK, {}
+    return None, {}
 
 
 def fallback_reply(state: dict, chunks: list[dict], outcome: str | None) -> tuple[str, dict, list[int]]:
@@ -184,7 +201,7 @@ def fallback_reply(state: dict, chunks: list[dict], outcome: str | None) -> tupl
     statements = city_lines(state.get("area_checks", []), chunks, message)
     quotable = [c for c in chunks if not (statements and c["section_no"] == SERVICE_AREA_SECTION)]  # said already
     # KB sentences only for a message that asks something (or states a size): a details-only message gets none
-    offer = asks_what_is_offered(message)
+    offer = bool(state.get("asks_offerings"))  # T13e: the understand step's flag (its word-list backup when it failed)
     picked = kb_sentences(quotable, question, size, offer) if state.get("search_query") or size_match or offer else []
     if picked:
         statements.append(_tagged(picked))
@@ -200,6 +217,7 @@ def fallback_reply(state: dict, chunks: list[dict], outcome: str | None) -> tupl
             else:
                 statements.append(welcome.CONTINUE_TEXT)
         ask, update = closing_question(state)
-        statements.append(ask)
+        if ask:
+            statements.append(ask)
     sections = list(dict.fromkeys(chunk["section_no"] for _, chunk in picked))
     return "\n\n".join(statements), update, sections

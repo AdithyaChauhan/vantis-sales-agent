@@ -6,7 +6,7 @@ documents are "title: ... | text: ...", queries are "task: question answering | 
 Chat models: Gemini (langchain-google-genai) and Groq (langchain-groq). Every chat call goes through
 model_chain (T12a): it tries its models in order, one attempt each with a wall-clock deadline, and passes
 over a model that failed recently (SKIPS), so a slow Google day costs seconds, not half a minute.
-- understand_llm(): main, then fast; 4 s each (T13d: Groq is kept for answers)
+- understand_llm(): main, then fast; 5 s each (T13d: Groq is kept for answers; T13e: 5 s, was 4 s)
 - chat_llm(): the answer step; Gemini 8 s, then Groq 10 s, then the second Groq model 10 s (T13d, if set), then the
   fast model 8 s (last resort), plus one last try (chain.last_try) the agent uses when all of them failed
 - reason_llm(): the lead reason; the fast model only, 8 s (T13d: off the main model's quota; the caller falls back to
@@ -528,9 +528,11 @@ GEMINI_CHAT_HTTP = types.HttpOptions(
 # graph's ToolNode stays the only thing that runs tools.
 AFC_OFF = types.AutomaticFunctionCallingConfig(disable=True)
 # Wall-clock deadlines per use (T12a). Understand is a small call (the main model answered it in at most 1.9 s in
-# T10b, so 4 s is twice that); an answer is longer and may call tools. Groq is the answer's last resort, so it gets
-# more room. The reason runs after the reply (or offline), so it can wait longer (T13d: 8 s, was 4 s on main).
-UNDERSTAND_TIMEOUT_S = 4
+# T10b, so 4 s was twice that; T13e: 5 s, since its output grew by four fields and the T13e live run's main-model
+# understand call came back at 4.3 s, so the weaker fast model read that turn); an answer is longer and may call
+# tools. Groq is the answer's last resort, so it gets more room. The reason runs after the reply (or offline), so it
+# can wait longer (T13d: 8 s, was 4 s on main).
+UNDERSTAND_TIMEOUT_S = 5
 ANSWER_TIMEOUT_S = 8
 GROQ_ANSWER_TIMEOUT_S = 10
 REASON_TIMEOUT_S = 8
@@ -884,10 +886,10 @@ def understand_candidates(
     schema: type, settings: Settings | None = None, seconds: float = UNDERSTAND_TIMEOUT_S
 ) -> list[Candidate]:
     """The understand step's models in order (T13d): main Gemini, then fast Gemini, each one attempt cut off after
-    4 s, with structured output and the raw message kept. Groq is kept for answers: its 8K tokens a minute carry about
-    one turn, and an understand call used a third of it (Render logs of 13 Oct: Groq's 429 came on an answer after
-    two understand calls). When both fail, the understand node uses the raw message and reads details in code.
-    Unconfigured ones are left out."""
+    UNDERSTAND_TIMEOUT_S (5 s), with structured output and the raw message kept. Groq is kept for answers: its 8K
+    tokens a minute carry about one turn, and an understand call used a third of it (Render logs of 13 Oct: Groq's 429
+    came on an answer after two understand calls). When both fail, the understand node uses the raw message and reads
+    details in code. Unconfigured ones are left out."""
     settings = settings or get_settings()
 
     def make() -> list[Candidate]:
