@@ -12,7 +12,7 @@ Built for the Pradrix AI Engineer Round 2 assignment.
 | Sales dashboard | <https://vantis-sales-agent.vercel.app/leads> (needs the sales key: [The sales key](#the-sales-key)) |
 | API docs (OpenAPI) | <https://vantis-sales-agent-api.onrender.com/docs> |
 | API health | <https://vantis-sales-agent-api.onrender.com/api/health> |
-| Demo video | *(link added after recording)* |
+| Demo video | <https://drive.google.com/file/d/1My07Q9Dw26JAKZSTPgM41kEIMHxFgAWR/view?usp=sharing> |
 
 > **The first request can be slow.** The API runs on Render's free plan. It sleeps after 15 idle minutes, and the first request after that took 32.5 s when measured. The page shows "Waking up the server. The first reply can take up to a minute." while it waits. During the review, a GitHub Actions job pings the API every 10 minutes from 08:00 to 23:00 IST to keep it awake.
 
