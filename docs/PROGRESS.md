@@ -256,3 +256,13 @@ Adithya pastes the newest entry to the reviewer (Claude chat) after every task.
 - Decisions: the day limit is a 24-hour window from each IP's first message (not midnight); counts live in memory, so a redeploy, restart or sleep resets them (stated in the README)
 - Open issues: the four reply gaps above and F11 stay open; as in T14, run `seed_demo_leads --reset` on the test branch (this pytest emptied it)
 - Next: Adithya pushes; then the T14 steps: Neon reset + `seed_demo_leads --main`, video, `git archive` ZIP
+
+## T14c: frontend look and responsiveness (2026-10-15)
+- Status: done
+- Changed: frontend styles.css (photo reaches the window's left edge; `--frame-max` cap 100rem for both pages, was 88rem; 30rem sales card from 1600 px; scroll-driven top fade on the transcript; tab row below 1100 px), dashboard.css (the cap token, current-section icon as an outline, phone tab gap), ChatPage.jsx (scroll to the end again when the web font loads), docs/PLAN.md 3.14 and 3.15
+- Tests: `cd backend && python -m pytest -q` → 1247 passed, 0 failed (13 live deselected); `cd frontend && npm test` → 260 passed; `npm run build` ok
+- Also ran: Playwright 1.64 (scratchpad only, not in package.json) on `vite preview` with the API mocked, 53 shots a run at 1920×1080, 1536×864, 1366×768, 1280×720, 1024×768, 768×1024 and 390×844, in Chromium 156 and the installed Chrome 138, before and after. The "half circle" was the bottom curve of a scrolled-off customer bubble under the chat card's top edge; the photo was a 130 px strip 168 px in from the edge; no nav below 1100 px; a restored chat stopped 26 px short of its end on a cold font load. After: no sideways scroll, composer visible, photo at x=0 from 1280 px up, phones never load the photo, the chat ends at its padding every run
+- Prompt changes: none
+- Decisions: Adithya: cap 100rem on both pages, bubbles keep 34rem. Mine: sales card 30rem from 1600 px (dashboard detail stays 22rem); tab row only while the Sales view is on; the ChatPage.jsx scroll fix went beyond the CSS-only plan (presentation only)
+- Open issues: Firefox has no scroll-driven animations, so it keeps the short 1.1rem fade; the 330×700 photo is upscaled on screens much wider than 1920 px; run `seed_demo_leads --reset` (this pytest emptied the test branch)
+- Next: Adithya pushes; then the T14 steps (Neon reset + `seed_demo_leads --main`, video, `git archive` ZIP)

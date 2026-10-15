@@ -12,7 +12,7 @@
   grid-template-columns: var(--dash-sidebar-w) minmax(0, 1fr);
   grid-template-areas: "side main";
   width: 100%;
-  max-width: 88rem;
+  max-width: var(--frame-max); /* styles.css */
   height: 100dvh;
   margin: 0 auto;
 }
@@ -72,6 +72,12 @@
 .sidebar-wide .nav-item[aria-current="page"],
 .tabs .nav-item[aria-current="page"] {
   background: var(--chip-on);
+}
+
+/* T14c: its icon is an orange outline here; filled, the headset of "Support requests" became a solid blob */
+.sidebar-wide .nav-item[aria-current="page"] .nav-icon,
+.tabs .nav-item[aria-current="page"] .nav-icon {
+  fill: none;
 }
 
 .dash-main {
@@ -1033,8 +1039,9 @@
     white-space: nowrap;
   }
 
+  /* the bottom margin keeps the support list off the tabs (on /leads it merges with the count cards' margin) */
   .dash-main > nav {
-    margin: 0.75rem 0.75rem 0;
+    margin: 0.75rem;
   }
 
   /* One row of tabs; on very narrow screens it scrolls sideways rather than wrapping */

@@ -168,7 +168,11 @@ export default function ChatPage() {
   }, [chat.pending, lastReply]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView?.({ block: "end", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+    const toEnd = () => endRef.current?.scrollIntoView?.({ block: "end", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+    toEnd();
+    // T14c: a chat restored on page load is first laid out in a fallback font; when the web font arrives the
+    // messages wrap differently and grow, which left the newest one cut off at the bottom. Scroll again then.
+    document.fonts?.ready.then(toEnd);
   }, [chat.messages.length, chat.pending, welcome.status]);
 
   const busy = chat.pending || chat.waitLeft > 0;

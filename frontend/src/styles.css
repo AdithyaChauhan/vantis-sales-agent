@@ -1,7 +1,7 @@
 /* Vantis chat page (T10c), after docs/design/chat-design.png.
    Warm off-white page with a peach glow, white cards, navy text, an orange accent and a blue for the
    customer. Plus Jakarta Sans. Every size is in rem: the root grows from 16 px (up to 1280 px wide) to
-   18 px at 1920 px and no bigger, so the whole page scales together. The layout is capped at 88rem.
+   18 px at 1920 px and no bigger, so the whole page scales together. The layout is capped at --frame-max.
 
    Colours (version B, chosen by Adithya): the image's palette with every text and icon pair at WCAG AA
    or better: navy text on the bright orange, a deeper customer blue, darker muted text and badge
@@ -76,6 +76,7 @@
   --next-border: #f6dcbd;
   --chip-on: #fde4c8; /* the active filter chip and the dashboard's current section */
 
+  --frame-max: 100rem; /* the widest the page gets (1800 px at 1920 px wide), on the chat page and the dashboard */
   --sidebar-w: 7.25rem;
   --sales-w: 27.5rem;
   --gap: 0.75rem;
@@ -251,7 +252,7 @@ textarea {
   flex: 1;
   min-height: 0;
   width: 100%;
-  max-width: 88rem;
+  max-width: var(--frame-max);
   margin: 0 auto;
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--sales-w);
@@ -517,8 +518,12 @@ textarea {
   background: var(--nav-hover);
 }
 
+/* T14c: on screens wider than the frame (--frame-max, e.g. 1920 px), the frame sits in the middle with empty space on
+   each side; the negative margin stretches the photo over that space to the window's left edge, so it fills the
+   bottom-left corner as in the reference image (the dashboard's frame has the same cap, so this serves both pages) */
 .sidebar-photo {
   margin-top: auto;
+  margin-left: calc(-1 * max(0px, (100vw - var(--frame-max)) / 2));
   height: min(52%, 24rem);
   background: url("./assets/solar-rooftop.webp") 35% 100% / cover no-repeat;
   filter: var(--photo-filter);
@@ -552,8 +557,41 @@ textarea {
   gap: 1.15rem;
   padding: 1.3rem 1.75rem 1.25rem;
   /* scrolled messages fade out at the top edge (only the padding is faded when not scrolled) */
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.1rem);
-  mask-image: linear-gradient(to bottom, transparent 0, #000 1.1rem);
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent calc(var(--scrolled, 0) * 1rem),
+    #000 calc((1.1 + var(--scrolled, 0) * 1.9) * 1rem)
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent calc(var(--scrolled, 0) * 1rem),
+    #000 calc((1.1 + var(--scrolled, 0) * 1.9) * 1rem)
+  );
+}
+
+/* T14c: --scrolled goes from 0 (the list at its top) to 1 (scrolled 3rem or more). At 0 the mask is as before:
+   a fade over the 1.1rem padding. At 1 the top 1rem is clear and the fade runs to 3rem, so a message cut off by
+   the top edge disappears instead of leaving a sliver (in Chrome at 1920x1080 the bottom curve of a blue bubble
+   showed there as a "half circle"). It follows the scroll position (a scroll-driven animation: no motion of its
+   own); browsers without one keep 0. */
+@property --scrolled {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
+@supports (animation-timeline: scroll()) {
+  .transcript {
+    animation: top-fade auto linear both;
+    animation-timeline: scroll(self);
+    animation-range: 0 3rem;
+  }
+}
+
+@keyframes top-fade {
+  to {
+    --scrolled: 1;
+  }
 }
 
 /* ---------- Messages ---------- */
@@ -1384,28 +1422,67 @@ textarea {
   }
 }
 
-/* ---------- Wide screens: the frame is capped, so the photo also fades on its left edge ---------- */
+/* ---------- Wide screens: a wider sales card ----------
+   With the frame at --frame-max the chat column gets most of the extra width; the sales card grows a little
+   too (495 to 540 px at 1920 px). Chat bubbles keep their 34rem limit, so lines stay readable. */
 
 @media (min-width: 1600px) {
-  .sidebar-photo {
-    -webkit-mask-image:
-      linear-gradient(to bottom, transparent 0%, #000 40%),
-      linear-gradient(to right, transparent 0%, #000 45%);
-    -webkit-mask-composite: source-in;
-    mask-image:
-      linear-gradient(to bottom, transparent 0%, #000 40%),
-      linear-gradient(to right, transparent 0%, #000 45%);
-    mask-composite: intersect;
+  :root {
+    --sales-w: 30rem;
   }
 }
 
-/* ---------- Medium screens: no sidebar ---------- */
+/* ---------- Below 1100 px: the sidebar becomes a row of tabs under the header (T14c) ----------
+   The same element as the sidebar (one nav for screen readers and the tests), without the photo, so phones
+   still never download it. With the Sales view off it would only say "Chat", so it is hidden: customers see
+   no sections at all, as before. */
+
+@media (max-width: 1099px) {
+  .frame .sidebar {
+    margin-bottom: 0;
+    padding: 0 0 0.6rem 0.25rem;
+  }
+
+  .frame-no-sales .sidebar,
+  .frame .sidebar-photo {
+    display: none;
+  }
+
+  .frame .nav {
+    display: flex;
+    gap: 0.4rem;
+    padding: 0;
+    overflow-x: auto; /* on very narrow screens the tabs scroll, never the page */
+    scrollbar-width: none;
+  }
+
+  .frame .nav-item {
+    min-height: 2.2rem;
+    padding: 0 0.85rem;
+    font-size: 0.85rem;
+    white-space: nowrap;
+  }
+
+  /* the peach of the sidebar's marker almost vanishes on a card, so the stronger one, as on the dashboard */
+  .frame .nav-item[aria-current="page"] {
+    background: var(--chip-on);
+  }
+
+  .frame .nav-icon {
+    width: 1.05rem;
+    height: 1.05rem;
+  }
+}
+
+/* ---------- Medium screens: header, tabs, then chat and sales card ---------- */
 
 @media (min-width: 900px) and (max-width: 1099px) {
   .frame {
     grid-template-columns: minmax(0, 1fr) var(--sales-w);
+    grid-template-rows: auto auto minmax(0, 1fr);
     grid-template-areas:
       "header header"
+      "side side"
       "chat sales";
     padding-left: var(--gap);
   }
@@ -1414,11 +1491,8 @@ textarea {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
       "header"
+      "side"
       "chat";
-  }
-
-  .sidebar {
-    display: none;
   }
 
   .topbar {
@@ -1463,16 +1537,26 @@ textarea {
   .frame,
   .frame-no-sales {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto auto minmax(0, 1fr);
+    grid-template-rows: auto auto auto minmax(0, 1fr);
     grid-template-areas:
       "header"
+      "side"
       "strip"
       "chat";
     padding: 0;
   }
 
-  .sidebar {
-    display: none;
+  /* the tabs as a bar under the header, like the header and the sales strip */
+  .frame .sidebar {
+    padding: 0.45rem 0.75rem;
+    border-bottom: 1px solid var(--card-border);
+    background: var(--card);
+  }
+
+  .frame .nav-item {
+    gap: 0.4rem;
+    padding: 0 0.65rem;
+    font-size: 0.8rem;
   }
 
   .topbar {
